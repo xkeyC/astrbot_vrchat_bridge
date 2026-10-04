@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+# Machine-specific server setup (kept locally, not published).
+deploy/
+.env

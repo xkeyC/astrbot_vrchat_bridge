@@ -1,0 +1,6 @@
+name: astrbot_plugin_vrchat
+display_name: VRChat
+version: 0.1.0
+author: xkeyC
+description: bot 自己的 VRChat 桌面客户端作为 AstrBot 平台：房间里实时语音对话（Codex 实时语音或 local-multimodal-infra），能移动、转身、抬头、跳、写 Chatbox（需要 VRChat bridge 和 AstrBot Codex fork）
+repo: https://github.com/xkeyC/astrbot_vrchat_bridge
