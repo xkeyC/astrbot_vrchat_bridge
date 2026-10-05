@@ -28,6 +28,12 @@
 //! Glances turn only the head: the stick is split into ahead and aside
 //! (VRChat walks relative to the head), so the walk keeps its way.
 //!
+//! Heights go by the avatar's eyes (its OSCQuery eye height), not by fixed
+//! numbers: a wall reaches over them; whatever is lower is jumped first.
+//! What the avatar carries (a bag, a cup at its side) is in view near it:
+//! nearer than 1.1 m a low thing counts only across the way (a ledge, a
+//! sofa), not at one side (a prop).
+//!
 //! Lost, the bot stands and the eyes look around one view at a time,
 //! a full turn one way, starting where the target was last seen; the first
 //! view that finds them ends the search and the legs go that way. A turn
@@ -76,7 +82,7 @@ const SEARCH: [f32; 6] = [0.0, 60.0, 120.0, 180.0, 240.0, 300.0];
 /// A search that found nobody: walk toward where they were this long.
 const SEEK_FOR: Duration = Duration::from_secs(4);
 /// Following a wall without seeing the target this long: stop and search.
-const WALL_UNSEEN: Duration = Duration::from_secs(10);
+const WALL_UNSEEN: Duration = Duration::from_secs(25);
 /// A whole search found nothing: wait this long before the next.
 const SEARCH_PAUSE: Duration = Duration::from_secs(2);
 
@@ -95,32 +101,37 @@ const MIN_SPEED: f32 = 0.3;
 const BACK_AXIS: f32 = -0.3;
 /// The head turns to the target at most this fast (degrees per second).
 const TURN_RATE: f32 = 200.0;
+/// The stick waits while the way to go is more than this off the facing.
+const TURN_FIRST_DEG: f32 = 60.0;
 /// Fixes predict the target's motion at most this far ahead.
 const PREDICT_S: f32 = 1.0;
 const ODOMETRY_KEPT: Duration = Duration::from_secs(4);
 /// Obstacles: standing more than STEP_M over the ground before them (lower
 /// ones are walked up), with BIN_POINTS points in a 10 cm bin and
 /// OBSTACLE_POINTS in it and the next two, spanning MIN_SPAN_M of height
-/// (NEAR_POINTS nearer than 0.9 m): stray points of stereo come alone, a
+/// (NEAR_POINTS nearer than 1.1 m): stray points of stereo come alone, a
 /// wall met at a slant spreads thin over several bins (25 points a bin
 /// missed such walls); reaching
-/// within EYE_MARGIN_M of the eyes, walked round, else jumped first, this
+/// the eyes (within EYE_MARGIN_M: the line of sight, whatever the avatar's
+/// height), walked round, else jumped first (a ledge, a platform), this
 /// far before them, after a run-up at least RUN_UP_SPEED fast.
 const STEP_M: f32 = 0.3;
 const BIN_POINTS: usize = 3;
 const OBSTACLE_POINTS: usize = 12;
 const NEAR_POINTS: usize = 12;
 const MIN_SPAN_M: f32 = 0.05;
-const EYE_MARGIN_M: f32 = 0.25;
+const EYE_MARGIN_M: f32 = 0.05;
 const JUMP_AT_M: f32 = 0.5;
 /// A jump that left the same obstacle (within this) in the way failed:
 /// walk round it for a while.
 const SAME_PLACE_M: f32 = 0.7;
-const NO_JUMP_FOR: Duration = Duration::from_secs(10);
+const NO_JUMP_FOR: Duration = Duration::from_secs(30);
 const RUN_UP_SPEED: f32 = 1.6;
 const JUMP_EVERY: Duration = Duration::from_millis(1500);
 /// After a jump the run goes on this long (in the air, over it).
 const JUMP_CARRY: Duration = Duration::from_millis(900);
+/// A jump not past its obstacle this long after failed (seen or not).
+const JUMP_JUDGED: Duration = Duration::from_millis(1500);
 /// A heading chosen by a view is followed this long after it.
 const DETOUR_FOR: Duration = Duration::from_millis(1200);
 /// Stuck: pushing (stick past STUCK_AXIS) yet slower than STUCK_SPEED for STUCK_FOR.
@@ -128,6 +139,8 @@ const STUCK_AXIS: f32 = 0.25;
 const STUCK_SPEED: f32 = 0.15;
 const STUCK_FOR: Duration = Duration::from_millis(600);
 const ESCAPE_FOR: Duration = Duration::from_millis(500);
+/// Stuck twice at a place within this: it is in the way, not jumped again.
+const STUCK_KEPT: Duration = Duration::from_secs(20);
 /// Views judge only ways within this of where they look (degrees).
 const VIEW_HALF_DEG: f32 = 40.0;
 const STEREO_THREADS: usize = 6;
@@ -141,9 +154,17 @@ const WALL_STEP_DEG: f32 = 15.0;
 const WALL_STEPS: i32 = 3;
 const FREE_M: f32 = 1.2;
 const WALL_FOR: Duration = Duration::from_secs(40);
+/// A wall is left when the straight way was open this many views in a
+/// row, and no place a jump did not get past lies within LEAVE_CLEAR_M of
+/// it (SAME_PLACE_M to take one).
+const OPEN_VIEWS: u8 = 2;
+const LEAVE_CLEAR_M: f32 = 1.2;
+/// Going round: out this far, then back within CIRCLE_BACK_M of the start.
+const CIRCLE_OUT_M: f32 = 2.5;
+const CIRCLE_BACK_M: f32 = 1.0;
 const WALL_SPEED: f32 = 1.4;
 const GLANCE_EVERY: Duration = Duration::from_millis(1500);
-const SAME_SIDE_FOR: Duration = Duration::from_secs(8);
+const SAME_SIDE_FOR: Duration = Duration::from_secs(15);
 
 #[derive(Default)]
 pub struct Follower {
@@ -193,8 +214,9 @@ struct Track {
     obstacle: Option<Obstacle>,
     /// A way round it: (until when, heading).
     detour: Option<(Instant, f32)>,
-    /// The last jump: when, and where the obstacle stood (odometry).
-    jumped: Option<(Instant, [f32; 2])>,
+    /// The last jump: when, where the obstacle stood (odometry), and the
+    /// way it was jumped (degrees).
+    jumped: Option<(Instant, [f32; 2], f32)>,
     /// Obstacles a jump did not get past (odometry), until when.
     no_jump: Vec<([f32; 2], Instant)>,
     /// Following a wall round to the target.
@@ -211,6 +233,14 @@ struct Track {
 struct Wall {
     side: f32,
     since: Instant,
+    /// Views in a row that found the straight way open.
+    open: u8,
+    /// Where it was taken (odometry), and the farthest it went from there:
+    /// back there after going round, it went in a circle.
+    start: [f32; 2],
+    far: f32,
+    /// Sides tried (a circle on one side tries the other).
+    flips: u8,
 }
 
 /// Something in the way (world metres).
@@ -254,33 +284,44 @@ struct Blocker {
     tall: bool,
 }
 
+/// Where everything over a step counts (nearer, what reaches over the eyes,
+/// or a low thing across the way): past where props reach.
+const FROM_ANYWAY: f32 = 1.1;
+
 /// The first thing in the way along `yaw` from `eye`, in a corridor half a
 /// metre wide out to 4 m; `None` when the way is clear. The ground is
 /// followed along the corridor (slopes, steps), so a raised floor is not in
 /// the way; something stands in the way when it rises more than a step
-/// over the ground before it. Nearer than 0.9 m the bot's own body is in
-/// view too (arms swinging forward, a gesture, props such as a weapon on the
-/// back that reaches over the shoulder, all below about 1.1 m): there only
-/// points from NEAR_UP of the eye height up count, so a wall (which reaches
-/// that high) is seen however near; a low thing that near was seen from
-/// farther, and the odometry counts down to it.
-fn corridor(points: &[[f32; 3]], eye: [f32; 3], yaw: f32, metres: f32, floor: f32) -> Option<Blocker> {
+/// over the ground before it. Nearer than `from` the bot's own body is in
+/// view too (arms swinging forward, a gesture, props it carries: a weapon on
+/// the back, a cup at its side reaching 1 m out), whatever the avatar: there
+/// only points over the eyes count, so a wall (which reaches that high) is
+/// seen however near, and a body, a prop or a ledge (jumped) is not; a low
+/// thing that near was seen from farther, and the odometry counts down to
+/// it.
+fn corridor(points: &[[f32; 3]], eye: [f32; 3], yaw: f32, metres: f32, floor: f32, from: f32) -> Option<Blocker> {
     const BIN: f32 = 0.1;
-    const FROM: f32 = 0.9;
-    const NEAR_FROM: f32 = 0.35;
-    const NEAR_UP: f32 = 0.85;
-    const BINS: usize = 31;
+    // Nearer, the head's own (hair, ears) is in view.
+    const NEAR_FROM: f32 = 0.5;
+    // Off the middle by this much counts as a side.
+    const SIDE: f32 = 0.08;
+    let from = from.clamp(NEAR_FROM + BIN, FROM_ANYWAY);
+    // From NEAR_FROM out to 4 m; nearer than `from` a low thing counts only
+    // across the way (both sides: a ledge, not a prop at one side), and the
+    // ground is followed (a slope already rising there).
+    const BINS: usize = 36;
+    let first = ((from - NEAR_FROM) / BIN).round() as usize;
     let (s, c) = yaw.to_radians().sin_cos();
     let eye_m = (eye[1] - floor) * metres;
     // Per 10 cm along the way: the heights of the points in it.
-    let mut bins: Vec<Vec<(f32, f32)>> = vec![Vec::new(); BINS];
+    let mut bins: Vec<Vec<(f32, f32, f32)>> = vec![Vec::new(); BINS];
     for p in points {
         let (dx, dz) = (p[0] - eye[0], p[2] - eye[2]);
         let (ahead, side, up) = ((dx * s - dz * c) * metres, (dx * c + dz * s) * metres, (p[1] - floor) * metres);
-        if ahead > FROM && side.abs() < 0.25 && up < eye_m + 0.3 {
-            let i = ((ahead - FROM) / BIN) as usize;
+        if ahead > NEAR_FROM && side.abs() < 0.25 && up < eye_m + 0.3 {
+            let i = ((ahead - NEAR_FROM) / BIN) as usize;
             if i < BINS {
-                bins[i].push((ahead, up));
+                bins[i].push((ahead, up, side));
             }
         }
     }
@@ -290,7 +331,7 @@ fn corridor(points: &[[f32; 3]], eye: [f32; 3], yaw: f32, metres: f32, floor: f3
         .filter_map(|p| {
             let (dx, dz) = (p[0] - eye[0], p[2] - eye[2]);
             let (ahead, side, up) = ((dx * s - dz * c) * metres, (dx * c + dz * s) * metres, (p[1] - floor) * metres);
-            (ahead > NEAR_FROM && ahead <= FROM && side.abs() < 0.25 && up > NEAR_UP * eye_m && up < eye_m + 0.3).then_some(ahead)
+            (ahead > NEAR_FROM && ahead <= from && side.abs() < 0.25 && up > eye_m && up < eye_m + 0.3).then_some(ahead)
         })
         .collect();
     if near.len() >= NEAR_POINTS {
@@ -302,13 +343,19 @@ fn corridor(points: &[[f32; 3]], eye: [f32; 3], yaw: f32, metres: f32, floor: f3
         if bin.is_empty() {
             continue;
         }
-        let above: Vec<(f32, f32)> = bin.iter().copied().filter(|&(_, up)| up > ground + STEP_M).collect();
+        let above: Vec<(f32, f32, f32)> = bin.iter().copied().filter(|a| a.1 > ground + STEP_M).collect();
         // A wall met at a slant spreads over several bins, a few points
         // each; stray points come alone: count this bin and the next two,
         // and want some height to them.
-        let window: Vec<f32> = bins[i..(i + 3).min(BINS)].iter().flatten().filter(|a| a.1 > ground + STEP_M).map(|a| a.1).collect();
-        let span = window.iter().copied().fold(f32::NEG_INFINITY, f32::max) - window.iter().copied().fold(f32::INFINITY, f32::min);
-        if above.len() >= BIN_POINTS && window.len() >= OBSTACLE_POINTS && span >= MIN_SPAN_M {
+        let window: Vec<(f32, f32, f32)> = bins[i..(i + 3).min(BINS)].iter().flatten().copied().filter(|a| a.1 > ground + STEP_M).collect();
+        let span = window.iter().map(|a| a.1).fold(f32::NEG_INFINITY, f32::max) - window.iter().map(|a| a.1).fold(f32::INFINITY, f32::min);
+        let across = || {
+            let left = window.iter().filter(|a| a.2 < -SIDE).count();
+            let right = window.iter().filter(|a| a.2 > SIDE).count();
+            left >= OBSTACLE_POINTS / 2 && right >= OBSTACLE_POINTS / 2
+        };
+        let stands = above.len() >= BIN_POINTS && window.len() >= OBSTACLE_POINTS && span >= MIN_SPAN_M;
+        if stands && (i >= first || across()) {
             let distance = above.iter().map(|a| a.0).fold(f32::INFINITY, f32::min);
             // Its top: the highest point within half a metre past the front.
             let upto = (i + 6).min(BINS);
@@ -512,9 +559,12 @@ impl Follower {
             let lost = {
                 let mut t = track.lk();
                 let unseen = t.target.map_or(Duration::MAX, |f| f.at.elapsed());
-                if t.wall.is_some() && unseen > WALL_UNSEEN {
-                    t.wall = None; // round a wall long out of sight: look for them
+                if let Some(w) = t.wall.filter(|_| unseen > WALL_UNSEEN) {
+                    // Round a wall long out of sight: look for them; going
+                    // round again, the other way (not the same circle).
+                    t.wall = None;
                     t.detour = None;
+                    t.last_side = Some((-w.side, Instant::now()));
                 }
                 let seeking = t.seek.is_some_and(|until| Instant::now() < until);
                 t.wall.is_none() && !seeking && unseen > LOST_AFTER
@@ -658,6 +708,7 @@ impl Follower {
         let hit = seen.iter().filter(|s| match_score(&s.name, target) >= 0.6).max_by(|a, b| a.score.total_cmp(&b.score));
         let mut t = track.lk();
         let then = t.pos_at(at);
+        let from = FROM_ANYWAY;
         let found = if let Some(hit) = hit {
             let rel = [(hit.feet[0] - eye[0]) * metres, (hit.feet[2] - eye[2]) * metres];
             t.add_fix(at, [then[0] + rel[0], then[1] + rel[1]]);
@@ -672,7 +723,9 @@ impl Follower {
         };
         // The way to them, as far as this view shows it (following a wall,
         // where they were).
-        let goal = if t.wall.is_some() { t.target_now() } else { t.target.filter(|f| f.at.elapsed() < LOST_AFTER).and_then(|_| t.target_now()) };
+        // (Seeking where they were, the way there is minded too.)
+        let seeking = t.seek.is_some_and(|until| at < until);
+        let goal = if t.wall.is_some() || seeking { t.target_now() } else { t.target.filter(|f| f.at.elapsed() < LOST_AFTER).and_then(|_| t.target_now()) };
         let Some(goal) = goal else {
             return Ok(found);
         };
@@ -680,8 +733,11 @@ impl Follower {
         let gap = (goal[0] - then[0]).hypot(goal[1] - then[1]);
         let in_view = angle_diff(direct, yaw).abs() <= VIEW_HALF_DEG;
         // Their own body (within half a metre of their feet) is not in the way.
-        let blocked = if in_view { corridor(&points, eye, direct, metres, floor).filter(|b| b.distance < gap - 0.5 && b.distance < 3.0) } else { None };
-        let free = |h: f32| corridor(&points, eye, h, metres, floor).is_none_or(|b| b.distance > FREE_M);
+        let blocked = if in_view { corridor(&points, eye, direct, metres, floor, from).filter(|b| b.distance < gap - 0.5 && b.distance < 3.0) } else { None };
+        // A heading is free when nothing stands within FREE_M along it, nor
+        // a place it got stuck at or a jump did not get over (unseen, it
+        // may be too near or too low to be seen).
+        let open_way = |h: f32| corridor(&points, eye, h, metres, floor, from).is_none_or(|b| b.distance > FREE_M);
         let mut guard = self.inner_for(stop);
         let mut scratch = State::default(); // a stopped follow's: not kept
         let s: &mut State = match guard.as_deref_mut() {
@@ -689,17 +745,89 @@ impl Follower {
             None => &mut scratch,
         };
         s.obstacle = blocked.map_or(f32::INFINITY, |b| b.distance);
+        // A jump that did not take it past its obstacle failed, whether the
+        // view still shows the obstacle or not (pressed up to it, it does
+        // not): not jumped again, walked round.
+        if let Some((when, q, way)) = t.jumped {
+            if at.saturating_duration_since(when) > JUMP_JUDGED {
+                let (js, jc) = way.to_radians().sin_cos();
+                let past = (then[0] - q[0]) * js - (then[1] - q[1]) * jc > -0.2;
+                if !past {
+                    t.no_jump.push((q, at + NO_JUMP_FOR));
+                }
+                t.jumped = None;
+            }
+        }
+        t.no_jump.retain(|&(_, until)| at < until);
+        let failed_places: Vec<[f32; 2]> = t.no_jump.iter().map(|&(n, _)| n).collect();
+        let free = |h: f32| {
+            let (hs, hc) = h.to_radians().sin_cos();
+            let failed_there = failed_places.iter().any(|n| {
+                let (along, off) = ((n[0] - then[0]) * hs - (n[1] - then[1]) * hc, (n[0] - then[0]) * hc + (n[1] - then[1]) * hs);
+                along > -0.2 && along < FREE_M && off.abs() < 0.45
+            });
+            !failed_there && open_way(h)
+        };
+        let (ds, dc) = direct.to_radians().sin_cos();
+        // A place a jump did not get past (or the bot got stuck at) on the
+        // straight way: round, though it may be too near to be seen now.
+        // Wider to leave a wall than to take one: no zigzag between them.
+        let crossed_within = |wide: f32| {
+            t.no_jump.iter().any(|&(n, _)| {
+                let (along, off) = ((n[0] - then[0]) * ds - (n[1] - then[1]) * dc, (n[0] - then[0]) * dc + (n[1] - then[1]) * ds);
+                along > -0.3 && along < gap && off.abs() < wide
+            })
+        };
+        let crossed = crossed_within(SAME_PLACE_M);
+        // Which side to go round: the one with a free heading nearest the
+        // way to them, keeping the wall on the other side (the side of a
+        // wall just left, again).
+        let side_round = |last_side: Option<(f32, Instant)>| {
+            let again = last_side.filter(|&(_, when)| at - when < SAME_SIDE_FOR).map(|(side, _)| side);
+            again.unwrap_or_else(|| {
+                (1..=4)
+                    .find_map(|k| {
+                        let (r, l) = (wrap(direct + k as f32 * WALL_STEP_DEG), wrap(direct - k as f32 * WALL_STEP_DEG));
+                        if free(r) {
+                            Some(-1.0) // round to the right: the wall on the left
+                        } else if free(l) {
+                            Some(1.0)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(1.0)
+            })
+        };
         if let Some(w) = t.wall {
             // Nothing up to the eyes the straight way, nor a low thing a
             // jump did not clear (one not yet tried is jumped, below):
             // leave the wall for them.
-            let (ds, dc) = direct.to_radians().sin_cos();
             let failed = |b: &Blocker| {
                 let q = [then[0] + ds * b.distance, then[1] - dc * b.distance];
-                t.no_jump.iter().any(|&(n, until)| at < until && (n[0] - q[0]).hypot(n[1] - q[1]) < SAME_PLACE_M)
+                t.no_jump.iter().any(|&(n, _)| (n[0] - q[0]).hypot(n[1] - q[1]) < SAME_PLACE_M)
             };
-            let open = in_view && blocked.is_none_or(|b| !b.tall && !failed(&b));
-            if open || at - w.since > WALL_FOR {
+            let open = in_view && !crossed_within(LEAVE_CLEAR_M) && blocked.is_none_or(|b| !b.tall && !failed(&b));
+            // Open in OPEN_VIEWS views in a row (a glance's counts too).
+            let opens = if open { w.open.saturating_add(1) } else { 0 };
+            if let Some(w) = t.wall.as_mut() {
+                w.open = opens;
+            }
+            // Back where it took the wall after going round: a circle. Go
+            // round the other way; a circle that way too, leave the wall.
+            let from_start = (then[0] - w.start[0]).hypot(then[1] - w.start[1]);
+            let circled = w.far > CIRCLE_OUT_M && from_start < CIRCLE_BACK_M;
+            if let Some(w) = t.wall.as_mut() {
+                w.far = w.far.max(from_start);
+                if circled && w.flips == 0 {
+                    w.side = -w.side;
+                    w.start = then;
+                    w.far = 0.0;
+                    w.flips = 1;
+                    w.since = at;
+                }
+            }
+            if opens >= OPEN_VIEWS || at - w.since > WALL_FOR || (circled && w.flips > 0) {
                 t.wall = None;
                 t.detour = None;
                 t.last_side = Some((w.side, at));
@@ -711,11 +839,23 @@ impl Follower {
                 // (a corner: 30 degrees or more its way free), keep the way
                 // while it is free, else the free heading nearest the wall.
                 let at_side = |k: i32| wrap(yaw + w.side * k as f32 * WALL_STEP_DEG);
-                let opening = (2..=WALL_STEPS).rev().map(at_side).find(|&h| free(h));
+                // An opening is wide (30 and 45 degrees its way both free):
+                // one free heading between blocked ones is a gap or noise,
+                // and turning into it only turns back next view (swaying).
+                let opening = Some(at_side(2)).filter(|_| (2..=WALL_STEPS).all(|k| free(at_side(k))));
                 let keep = Some(yaw).filter(|&h| free(h));
-                let away = (-WALL_STEPS..=1).rev().map(at_side).find(|&h| free(h));
-                let heading = opening.or(keep).or(away).unwrap_or_else(|| wrap(yaw - w.side * 70.0)); // boxed in: turn away
+                // Away from it as far as a right angle (a corner).
+                let away = (-2 * WALL_STEPS..=1).rev().map(at_side).find(|&h| free(h));
+                let heading = opening.or(keep).or(away).unwrap_or_else(|| wrap(yaw - w.side * 120.0)); // boxed in: turn away
                 t.detour = Some((at + DETOUR_FOR, heading));
+                tracing::info!(
+                    yaw = yaw.round(),
+                    side = w.side,
+                    heading = heading.round(),
+                    pick = if opening.is_some() { "opening" } else if keep.is_some() { "keep" } else if away.is_some() { "away" } else { "boxed" },
+                    free = %(-6..=3).map(|k| if free(at_side(k)) { '.' } else { '#' }).collect::<String>(),
+                    "follow: wall"
+                );
                 s.avoiding = "wall";
                 return Ok(found);
             }
@@ -726,21 +866,18 @@ impl Follower {
         let Some(b) = blocked else {
             t.obstacle = None;
             t.detour = None;
-            s.avoiding = "";
+            if crossed {
+                // Too near to see what a jump did not get over: round it.
+                t.wall = Some(Wall { side: side_round(t.last_side), since: at, open: 0, start: then, far: 0.0, flips: 0 });
+                s.avoiding = "wall";
+            } else {
+                s.avoiding = "";
+            }
             return Ok(found);
         };
         let mut obstacle = Obstacle { yaw: direct, then, distance: b.distance, jump: false };
         let place = obstacle.place();
         let near = |q: [f32; 2]| (q[0] - place[0]).hypot(q[1] - place[1]) < SAME_PLACE_M;
-        // Still there after a jump at it: that jump failed.
-        if let Some((when, q)) = t.jumped {
-            let since = at.saturating_duration_since(when);
-            if since > Duration::from_millis(600) && since < Duration::from_secs(4) && near(q) {
-                t.no_jump.push((q, at + NO_JUMP_FOR));
-                t.jumped = None;
-            }
-        }
-        t.no_jump.retain(|&(_, until)| at < until);
         // Not up to the eyes, and not failed yet: over it, first.
         obstacle.jump = !b.tall && !t.no_jump.iter().any(|&(q, _)| near(q));
         if obstacle.jump {
@@ -749,23 +886,9 @@ impl Follower {
             s.avoiding = "jump";
             return Ok(found);
         }
-        // Else round it, following it: go the side with a free heading
-        // nearest the way to them, keeping the wall on the other side.
+        // Else round it, following it.
         t.obstacle = None;
-        let again = t.last_side.filter(|&(_, when)| at - when < SAME_SIDE_FOR).map(|(side, _)| side);
-        let side = again.unwrap_or_else(|| (1..=4)
-            .find_map(|k| {
-                let (r, l) = (wrap(direct + k as f32 * WALL_STEP_DEG), wrap(direct - k as f32 * WALL_STEP_DEG));
-                if free(r) {
-                    Some(-1.0) // round to the right: the wall on the left
-                } else if free(l) {
-                    Some(1.0)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(1.0));
-        t.wall = Some(Wall { side, since: at });
+        t.wall = Some(Wall { side: side_round(t.last_side), since: at, open: 0, start: then, far: 0.0, flips: 0 });
         t.detour = None;
         s.avoiding = "wall";
         Ok(found)
@@ -781,7 +904,8 @@ impl Follower {
         let mut slow_since: Option<Instant> = None;
         let mut pushed_since: Option<Instant> = None;
         let mut escape: Option<Instant> = None;
-        let mut aside = 1.0f32;
+        // Where it got stuck lately (odometry), and when.
+        let mut stuck_at: Vec<([f32; 2], Instant)> = Vec::new();
         let mut link: Option<vrc_vr::remote::HmdLink> = None;
         let mut strafe = 0.0f32;
         while !stop.load(Ordering::SeqCst) {
@@ -844,10 +968,14 @@ impl Follower {
                     // next view (one may take longer than DETOUR_FOR): never
                     // straight at them through the wall meanwhile.
                     let detour = t.detour.filter(|d| now < d.0 || walling).map(|d| d.1);
+                    // A big turn is made standing (pushing on while turning
+                    // presses into a corner).
+                    let mut turning = false;
                     if gap > 0.3 || detour.is_some() {
                         let to = detour.unwrap_or_else(|| bearing(pos, goal));
                         let step = angle_diff(to, t.facing).clamp(-TURN_RATE * dt, TURN_RATE * dt);
                         t.facing = wrap(t.facing + step);
+                        turning = angle_diff(to, t.facing).abs() > TURN_FIRST_DEG;
                     }
                     let speed = vz.max(0.0);
                     let left = gap - stand - speed * LAG_S;
@@ -864,11 +992,11 @@ impl Follower {
                     if let Some((o, d)) = over.filter(|_| !airborne) {
                         jump = d < JUMP_AT_M + speed * 0.1;
                         if jump {
-                            t.jumped = Some((now, o.place()));
+                            t.jumped = Some((now, o.place(), o.yaw));
                         }
                     }
                     let start = if axis > 0.0 { 0.05 } else { WALK_MARGIN };
-                    if gap - stand > start && !blocked {
+                    if gap - stand > start && !blocked && !turning {
                         let mut v = (2.0 * BRAKE * left.max(0.0)).sqrt().min(MAX_SPEED);
                         if over.is_some() {
                             v = v.max(RUN_UP_SPEED); // a run-up
@@ -892,13 +1020,26 @@ impl Follower {
                 if now - pushed > Duration::from_millis(500) && vx.hypot(vz) < STUCK_SPEED {
                     if now - *slow_since.get_or_insert(now) > STUCK_FOR {
                         slow_since = None;
-                        if last_jump.is_none_or(|j| now - j > Duration::from_secs(3)) {
+                        // Stuck at a place for the first time: one jump.
+                        // Stuck there again (pushing on after backing off,
+                        // or after the jump): back off a moment, and it is
+                        // walked round (the eyes take it as a jump that
+                        // failed).
+                        let (fs, fc) = t.facing.to_radians().sin_cos();
+                        let here = [pos[0] + fs * 0.5, pos[1] - fc * 0.5];
+                        stuck_at.retain(|&(_, when)| now - when < STUCK_KEPT);
+                        let again = stuck_at.iter().any(|&(q, _)| (q[0] - here[0]).hypot(q[1] - here[1]) < SAME_PLACE_M);
+                        stuck_at.push((here, now));
+                        tracing::info!(again, facing = t.facing.round(), wall = t.wall.is_some(), "follow: stuck");
+                        if !again && last_jump.is_none_or(|j| now - j > Duration::from_secs(3)) {
                             jump = true;
                         } else {
                             escape = Some(now + ESCAPE_FOR);
-                            aside = -aside;
-                            let yaw = wrap(t.facing + aside * 60.0);
-                            t.detour = Some((now + ESCAPE_FOR + DETOUR_FOR, yaw));
+                            t.no_jump.push((here, now + NO_JUMP_FOR));
+                            if let Some(w) = t.wall {
+                                // In a corner along a wall: turn away from it.
+                                t.detour = Some((now + ESCAPE_FOR + DETOUR_FOR, wrap(t.facing - w.side * 90.0)));
+                            }
                             if let Some(mut s) = self.inner_for(stop) {
                                 s.avoiding = "stuck";
                             }
@@ -1029,7 +1170,7 @@ pub fn corridor_report(frame: &EyeFrame, yaw: Option<f32>, metres: f32) -> anyho
         "yaw": yaw.round(),
         "eye_m": r((eye[1] - FLOOR_Y) * metres),
         "points": points.len(),
-        "blocker": corridor(&points, eye, yaw, metres, FLOOR_Y).map(|b| json!({"distance": r(b.distance), "top": r(b.top), "tall": b.tall})),
+        "blocker": corridor(&points, eye, yaw, metres, FLOOR_Y, FROM_ANYWAY).map(|b| json!({"distance": r(b.distance), "top": r(b.top), "tall": b.tall})),
         "bins": bins.iter().enumerate().filter(|(_, b)| b.0 > 0).map(|(i, b)| json!([r(0.3 + 0.1 * i as f32), b.0, r(b.1), r(b.2)])).collect::<Vec<_>>(),
     }))
 }
@@ -1052,6 +1193,29 @@ fn wrap(deg: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_ledge_lower_than_the_eyes_is_jumped_however_tall_the_avatar() {
+        // A short avatar (eyes 1.17 m) before a 1 m ledge 1.5 m ahead.
+        let eye = [0.0, 1.17, 0.0];
+        let mut pts = Vec::new();
+        for i in 0..30 {
+            for z in -4..=4 {
+                let x = 1.5 + i as f32 * 0.05;
+                for y in 0..=10 {
+                    if i == 0 || y == 10 {
+                        pts.push([x, y as f32 * 0.1, z as f32 * 0.05]);
+                    }
+                }
+            }
+        }
+        let b = corridor(&pts, eye, 90.0, 1.0, 0.0, FROM_ANYWAY).expect("the ledge");
+        assert!(!b.tall, "{b:?}");
+        // Pressed up to it (0.7 m): it is across the way, so seen.
+        let near: Vec<[f32; 3]> = pts.iter().map(|p| [p[0] - 0.8, p[1], p[2]]).collect();
+        let b = corridor(&near, eye, 90.0, 1.0, 0.0, FROM_ANYWAY).expect("the ledge, near");
+        assert!(!b.tall && (b.distance - 0.7).abs() < 0.05, "{b:?}");
+    }
 
     #[test]
     fn odometry_interpolates() {
@@ -1091,17 +1255,17 @@ mod tests {
                 z += 0.05;
             }
         };
-        // Floor, then a box 0.4 m high from 1.0 m ahead (-z).
+        // Floor, then a box 0.4 m high from 1.3 m ahead (-z).
         let mut points = Vec::new();
-        floor_to(&mut points, 0.4, 1.0, 0.0);
+        floor_to(&mut points, 0.4, 1.3, 0.0);
         // Its face, as densely as stereo samples it (2 cm).
         for j in 0..21 {
             for i in 0..20 {
-                points.push([-0.2 + 0.02 * i as f32, 0.02 * j as f32, -1.0]);
+                points.push([-0.2 + 0.02 * i as f32, 0.02 * j as f32, -1.3]);
             }
         }
-        let b = corridor(&points, eye, 0.0, 1.0, 0.0).unwrap();
-        assert!((b.distance - 1.0).abs() < 0.05 && (b.top - 0.4).abs() < 0.05 && !b.tall, "{b:?}");
+        let b = corridor(&points, eye, 0.0, 1.0, 0.0, FROM_ANYWAY).unwrap();
+        assert!((b.distance - 1.3).abs() < 0.05 && (b.top - 0.4).abs() < 0.05 && !b.tall, "{b:?}");
         // A wall up past the eyes, 1.5 m to the right: tall.
         let mut wall = Vec::new();
         floor_to(&mut wall, 0.4, 1.5, 0.0);
@@ -1112,9 +1276,9 @@ mod tests {
                 wall.push([1.5, 0.05 * j as f32, -0.2 + 0.1 * i as f32]);
             }
         }
-        let b = corridor(&wall, eye, 90.0, 1.0, 0.0).unwrap();
+        let b = corridor(&wall, eye, 90.0, 1.0, 0.0, FROM_ANYWAY).unwrap();
         assert!((b.distance - 1.5).abs() < 0.05 && b.tall, "{b:?}");
-        assert!(corridor(&wall, eye, -90.0, 1.0, 0.0).is_none());
+        assert!(corridor(&wall, eye, -90.0, 1.0, 0.0, FROM_ANYWAY).is_none());
         // A ramp rising 0.15 m per 0.3 m: followed, not in the way.
         let mut ramp = Vec::new();
         let mut z = 0.4;
@@ -1124,22 +1288,31 @@ mod tests {
             }
             z += 0.05;
         }
-        assert!(corridor(&ramp, eye, 0.0, 1.0, 0.0).is_none());
-        // Near: the bot's own weapon at 0.6 m (up to 1.1 m high) is not in
-        // the way; a wall there (up past the eyes) is.
+        assert!(corridor(&ramp, eye, 0.0, 1.0, 0.0, FROM_ANYWAY).is_none());
+        // Near: a prop at the bot's side at 0.6 m (up to 1.1 m high) is not
+        // in the way; a ledge across it is; a wall there (up past the
+        // eyes) is.
         let mut prop = Vec::new();
         for j in 0..10 {
             for i in 0..5 {
-                prop.push([-0.2 + 0.1 * i as f32, 0.6 + 0.05 * j as f32, -0.6]);
+                prop.push([0.12 + 0.03 * i as f32, 0.6 + 0.05 * j as f32, -0.6]);
             }
         }
-        assert!(corridor(&prop, eye, 0.0, 1.0, 0.0).is_none());
-        for j in 0..34 {
+        assert!(corridor(&prop, eye, 0.0, 1.0, 0.0, FROM_ANYWAY).is_none());
+        let mut ledge = Vec::new();
+        for j in 0..12 {
+            for i in 0..9 {
+                ledge.push([-0.2 + 0.05 * i as f32, 0.05 * j as f32, -0.7]);
+            }
+        }
+        let b = corridor(&ledge, eye, 0.0, 1.0, 0.0, FROM_ANYWAY).expect("a ledge across the way");
+        assert!((b.distance - 0.7).abs() < 0.05 && !b.tall, "{b:?}");
+        for j in 0..38 {
             for i in 0..10 {
                 prop.push([-0.2 + 0.05 * i as f32, 0.05 * j as f32, -0.7]);
             }
         }
-        let b = corridor(&prop, eye, 0.0, 1.0, 0.0).unwrap();
+        let b = corridor(&prop, eye, 0.0, 1.0, 0.0, FROM_ANYWAY).unwrap();
         assert!((b.distance - 0.7).abs() < 0.05 && b.tall, "{b:?}");
         // Walking up to an obstacle along its heading brings it nearer; another way, it is not ahead.
         let o = Obstacle { yaw: 0.0, then: [0.0, 0.0], distance: 1.0, jump: true };
