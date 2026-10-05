@@ -138,9 +138,9 @@ FOLLOW_CHANGES = ("closer", "farther", "stay", "resume")
 
 ROOM_PROMPT = """Your name is {name}.
 
-You are in VRChat, a social virtual world, as an avatar in a room with other players. You hear the voices of the players near you; most of what you hear is them talking to each other, not to you.
+You are in VRChat, a social virtual world, as an avatar in a room with other players. You hear the voices of the players near you; most of the talk around you is them talking to each other, not to you.
 
-The one rule that matters most: speak ONLY when the speaker says your name{aliases} to you in that utterance, or is directly continuing an exchange with you from a few seconds ago. In every other case produce no audio and no text at all - complete silence. Do not acknowledge, do not react, do not say "mm", do not comment, do not delegate.
+{rule}
 
 When you are addressed, answer briefly in the speaker's language, like a person in the room. You cannot see by yourself and cannot move by yourself: delegate to the backend whatever needs your body or eyes (come here, follow, turn around, jump, look at something, write in the chatbox, who is here) and real tasks (anything needing facts, lookups or work), and tell the speaker the result briefly."""
 
@@ -288,7 +288,7 @@ def survey_words(data: dict) -> str:
 
 def goto_words(data: dict) -> str:
     legs = data.get("legs", [])
-    blocked = sum(1 for l in legs if l.get("blocked"))
+    blocked = sum(1 for leg in legs if leg.get("blocked"))
     bumps = f", bumped into something {blocked} time(s)" if blocked else ""
     if data.get("arrived"):
         return f"You are there ({data['remaining_m']:.1f} m off, {data['took_s']:.0f} s{bumps})."
@@ -330,14 +330,29 @@ def vr_goto_body(a: dict) -> dict:
     raise RuntimeError("give a place number, or a bearing")
 
 
+# When the voice model speaks, for an AstrBot without ``group_rule``.
+OLD_RULE = """The one rule that matters most: speak ONLY when the speaker says your name{aliases} to you in that utterance, or is directly continuing an exchange with you from a few seconds ago. In every other case produce no audio and no text at all - complete silence. Do not acknowledge, do not react, do not say "mm", do not comment, do not delegate."""
+
+
 def room_prompt(name: str, aliases: list[str], tools: bool) -> str:
-    others = [a for a in aliases if a and a != name]
-    alias_text = (
-        f' ("{name}"' + "".join(f', "{a}"' for a in others) + ")"
-        if others
-        else f' "{name}"'
-    )
-    prompt = ROOM_PROMPT.format(name=name, aliases=alias_text)
+    """The room's prompt. ``tools``: the voice model runs the room's tools
+    (the local_infra backend), whose voice server passes on only what calls
+    the bot by name (everything to one other player)."""
+    try:
+        from astrbot.core.voice.session import VoiceOptions, group_rule
+    except ImportError:
+        group_rule = None
+    if group_rule is not None:
+        rule = group_rule(VoiceOptions(name=name, aliases=aliases), gated=tools)
+    else:
+        others = [a for a in aliases if a and a != name]
+        alias_text = (
+            f' ("{name}"' + "".join(f', "{a}"' for a in others) + ")"
+            if others
+            else f' "{name}"'
+        )
+        rule = OLD_RULE.format(aliases=alias_text)
+    prompt = ROOM_PROMPT.format(name=name, rule=rule)
     if tools:
         prompt = prompt[: prompt.rindex("When you are addressed")] + ROOM_TOOLS_PROMPT
     # The session adds the voice persona (or the platform's extra prompt) and the time.
@@ -510,10 +525,23 @@ class VRChatPlatformAdapter(Platform):
             if joined:
                 logger.info("VRChat: %s joined %s", ", ".join(joined), self.state.get("world"))
             self._refresh_context()
+            if set(new) != old:
+                self._people_changed()
         elif kind in ("alert", "auth_required", "join_failed"):
             logger.warning("VRChat bridge: %s", data)
         elif kind in ("invite", "request_invite", "joining", "follow"):
             logger.info("VRChat bridge: %s", data)
+
+    def _people_changed(self) -> None:
+        """Players came or went: the voice session hears accordingly (all
+        that one other player says, else only what calls the bot)."""
+        session = self.session
+        if session is not None and hasattr(session, "set_people"):
+            task = asyncio.get_running_loop().create_task(
+                session.set_people(len(self.players()))
+            )
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
 
     def _refresh_context(self) -> None:
         """Gives the voice session the room context when it changed (people
@@ -807,6 +835,8 @@ class VRChatPlatformAdapter(Platform):
             **extra,
         )
         self.session = session
+        # Before the launch: the session starts with it.
+        self._people_changed()
         if hasattr(session, "set_context"):
             # Before the launch: the conversation starts with it.
             self._room_context = room_context(self.state)
