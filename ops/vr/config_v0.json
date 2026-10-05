@@ -1,0 +1,12 @@
+{
+  "active": "remote",
+  "remote": {
+    "version": 0,
+    "port": 4242,
+    "view_count": 2,
+    "w_pixels": 1920,
+    "h_pixels": 1080,
+    "w_meters": 0.13,
+    "h_meters": 0.07
+  }
+}

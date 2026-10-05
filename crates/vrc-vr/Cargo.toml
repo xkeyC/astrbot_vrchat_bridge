@@ -1,0 +1,11 @@
+[package]
+name = "vrc-vr"
+version = "0.1.0"
+description = "The virtual headset of the VRChat bot: Monado's remote driver (head, eyes, controllers) and the null compositor's eye tap"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+memmap2.workspace = true

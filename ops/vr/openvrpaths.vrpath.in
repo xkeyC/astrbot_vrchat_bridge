@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "jsonid": "vrpathreg",
+  "runtime": ["@VR_ROOT@/xrizer/target/release"],
+  "config": ["@HOME@/.local/share/Steam/config"],
+  "log": ["@HOME@/.local/share/Steam/logs"]
+}

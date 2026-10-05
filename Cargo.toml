@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/vrc-vr", "crates/vr-probe"]
+
+[workspace.package]
+edition = "2021"
+license = "AGPL-3.0-only"
+repository = "https://github.com/xkeyC/astrbot_vrchat_bridge"
+
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+memmap2 = "0.9"
+png = "0.17"
+vrc-vr = { path = "crates/vrc-vr" }

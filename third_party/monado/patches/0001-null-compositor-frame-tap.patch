@@ -1,0 +1,442 @@
+diff -ruN a/src/xrt/compositor/null/CMakeLists.txt b/src/xrt/compositor/null/CMakeLists.txt
+--- a/src/xrt/compositor/null/CMakeLists.txt
++++ b/src/xrt/compositor/null/CMakeLists.txt
+@@ -2,7 +2,7 @@
+ # Copyright 2025, NVIDIA CORPORATION.
+ # SPDX-License-Identifier: BSL-1.0
+ 
+-add_library(comp_null STATIC null_compositor.c null_compositor.h)
++add_library(comp_null STATIC null_compositor.c null_compositor.h null_tap.c null_tap.h)
+ target_link_libraries(
+ 	comp_null
+ 	PUBLIC xrt-interfaces comp_includes
+diff -ruN a/src/xrt/compositor/null/null_compositor.c b/src/xrt/compositor/null/null_compositor.c
+--- a/src/xrt/compositor/null/null_compositor.c
++++ b/src/xrt/compositor/null/null_compositor.c
+@@ -15,6 +15,7 @@
+ 
+ #include "null_compositor.h"
+ #include "null_interfaces.h"
++#include "null_tap.h"
+ 
+ #include "os/os_time.h"
+ 
+@@ -501,6 +502,8 @@
+ 	// can just unref the sync handle. Otherwise please use it.
+ 	u_graphics_sync_unref(&sync_handle);
+ 
++	null_tap_layers(c->tap, &c->base, frame_id);
++
+ 	/*
+ 	 * Time keeping needed to keep the pacer happy.
+ 	 */
+@@ -537,6 +540,8 @@
+ 	// Make sure we don't have anything to destroy.
+ 	comp_swapchain_shared_garbage_collect(&c->base.cscs);
+ 
++	null_tap_destroy(&c->tap, vk);
++
+ 	// Must be destroyed before Vulkan.
+ 	comp_swapchain_shared_destroy(&c->base.cscs, vk);
+ 
+@@ -656,6 +661,8 @@
+ 	}
+ 
+ 
++	c->tap = null_tap_create(get_vk(c));
++
+ 	NULL_DEBUG(c, "Done %p", (void *)c);
+ 
+ 	// Standard app pacer.
+diff -ruN a/src/xrt/compositor/null/null_compositor.h b/src/xrt/compositor/null/null_compositor.h
+--- a/src/xrt/compositor/null/null_compositor.h
++++ b/src/xrt/compositor/null/null_compositor.h
+@@ -101,7 +101,8 @@
+ 	// Kept here for convenience.
+ 	struct xrt_system_compositor_info sys_info;
+ 
+-	//! @todo Insert your own required members here
++	//! The frame tap (XRT_NULL_TAP), NULL when off.
++	struct null_tap *tap;
+ 
+ 	struct
+ 	{
+diff -ruN a/src/xrt/compositor/null/null_tap.c b/src/xrt/compositor/null/null_tap.c
+--- a/src/xrt/compositor/null/null_tap.c
++++ b/src/xrt/compositor/null/null_tap.c
+@@ -0,0 +1,335 @@
++// Copyright 2026, xkeyC.
++// SPDX-License-Identifier: BSL-1.0
++/*!
++ * @file
++ * @brief  Frame tap of the null compositor: the eyes an app submits, to shared memory.
++ *
++ * The file XRT_NULL_TAP holds a 512 byte header and then both eyes' pixels,
++ * rows tightly packed, left eye first, as the app's swapchain format has them:
++ *
++ *     0   char[8]   magic "MNDTAP01"
++ *     8   u64       seq: odd while a frame is being written (a seqlock)
++ *     16  i64       frame_id
++ *     24  i64       display_time_ns (the time the app rendered for)
++ *     32  i64       capture_ns (CLOCK_MONOTONIC)
++ *     40  u32       width, u32 height (of one eye)
++ *     48  u32       VkFormat, u32 bytes per pixel
++ *     56  2 x view: f32 fov[4] (left, right, up, down; radians),
++ *                   f32 pose[7] (orientation xyzw, position xyz) as rendered
++ *     144 u32       array index of each eye in the swapchain (diagnostics)
++ *     152 u32       layer type
++ *
++ * Eyes of different sizes, formats the tap does not know and non-projection
++ * frames are skipped.
++ *
++ * @ingroup comp_null
++ */
++
++#include "null_tap.h"
++
++#include "os/os_time.h"
++#include "util/u_debug.h"
++#include "util/u_logging.h"
++#include "util/u_misc.h"
++#include "util/u_time.h"
++#include "util/comp_swapchain.h"
++#include "util/comp_layer_accum.h"
++#include "vk/vk_helpers.h"
++#include "vk/vk_cmd_pool.h"
++
++#include <fcntl.h>
++#include <stdatomic.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <unistd.h>
++
++DEBUG_GET_ONCE_OPTION(tap_path, "XRT_NULL_TAP", NULL)
++DEBUG_GET_ONCE_NUM_OPTION(tap_fps, "XRT_NULL_TAP_FPS", 10)
++
++#define TAP_HEADER_SIZE 512
++
++struct tap_view
++{
++	float fov[4];
++	float pose[7];
++};
++
++struct tap_header
++{
++	char magic[8];
++	_Atomic uint64_t seq;
++	int64_t frame_id;
++	int64_t display_time_ns;
++	int64_t capture_ns;
++	uint32_t width;
++	uint32_t height;
++	uint32_t format;
++	uint32_t bytes_per_pixel;
++	struct tap_view views[2];
++	uint32_t array_index[2];
++	uint32_t layer_type;
++};
++
++_Static_assert(sizeof(struct tap_header) <= TAP_HEADER_SIZE, "tap header too big");
++
++struct null_tap
++{
++	int fd;
++	uint8_t *map;
++	size_t map_size;
++
++	VkBuffer buffer;
++	VkDeviceMemory memory;
++	void *buffer_ptr;
++	VkDeviceSize buffer_size;
++
++	int64_t interval_ns;
++	int64_t last_ns;
++	bool warned;
++};
++
++static uint32_t
++bytes_per_pixel(VkFormat format)
++{
++	switch (format) {
++	case VK_FORMAT_R8G8B8A8_UNORM:
++	case VK_FORMAT_R8G8B8A8_SRGB:
++	case VK_FORMAT_B8G8R8A8_UNORM:
++	case VK_FORMAT_B8G8R8A8_SRGB:
++	case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
++	case VK_FORMAT_A2R10G10B10_UNORM_PACK32: return 4;
++	case VK_FORMAT_R16G16B16A16_SFLOAT:
++	case VK_FORMAT_R16G16B16A16_UNORM: return 8;
++	default: return 0;
++	}
++}
++
++struct null_tap *
++null_tap_create(struct vk_bundle *vk)
++{
++	const char *path = debug_get_option_tap_path();
++	if (path == NULL || path[0] == '\0') {
++		return NULL;
++	}
++	int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
++	if (fd < 0) {
++		U_LOG_E("null tap: cannot open '%s'", path);
++		return NULL;
++	}
++	struct null_tap *tap = U_TYPED_CALLOC(struct null_tap);
++	tap->fd = fd;
++	int64_t fps = debug_get_num_option_tap_fps();
++	tap->interval_ns = fps > 0 ? U_TIME_1S_IN_NS / fps : 0;
++	U_LOG_I("null tap: eyes to '%s' at up to %d fps", path, (int)fps);
++	return tap;
++}
++
++static bool
++ensure_map(struct null_tap *tap, size_t size)
++{
++	if (tap->map_size == size) {
++		return true;
++	}
++	if (tap->map != NULL) {
++		munmap(tap->map, tap->map_size);
++		tap->map = NULL;
++		tap->map_size = 0;
++	}
++	if (ftruncate(tap->fd, (off_t)size) != 0) {
++		return false;
++	}
++	void *map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, tap->fd, 0);
++	if (map == MAP_FAILED) {
++		return false;
++	}
++	tap->map = map;
++	tap->map_size = size;
++	memcpy(tap->map, "MNDTAP01", 8);
++	return true;
++}
++
++static bool
++ensure_buffer(struct null_tap *tap, struct vk_bundle *vk, VkDeviceSize size)
++{
++	if (tap->buffer_size >= size) {
++		return true;
++	}
++	if (tap->buffer != VK_NULL_HANDLE) {
++		vk->vkUnmapMemory(vk->device, tap->memory);
++		vk->vkDestroyBuffer(vk->device, tap->buffer, NULL);
++		vk->vkFreeMemory(vk->device, tap->memory, NULL);
++		tap->buffer = VK_NULL_HANDLE;
++		tap->buffer_size = 0;
++	}
++	if (!vk_buffer_init(vk, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++	                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
++	                        VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
++	                    &tap->buffer, &tap->memory) &&
++	    !vk_buffer_init(vk, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++	                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &tap->buffer,
++	                    &tap->memory)) {
++		return false;
++	}
++	if (vk->vkMapMemory(vk->device, tap->memory, 0, VK_WHOLE_SIZE, 0, &tap->buffer_ptr) != VK_SUCCESS) {
++		return false;
++	}
++	tap->buffer_size = size;
++	return true;
++}
++
++static void
++put_view(struct tap_view *out, const struct xrt_layer_projection_view_data *v)
++{
++	out->fov[0] = v->fov.angle_left;
++	out->fov[1] = v->fov.angle_right;
++	out->fov[2] = v->fov.angle_up;
++	out->fov[3] = v->fov.angle_down;
++	out->pose[0] = v->pose.orientation.x;
++	out->pose[1] = v->pose.orientation.y;
++	out->pose[2] = v->pose.orientation.z;
++	out->pose[3] = v->pose.orientation.w;
++	out->pose[4] = v->pose.position.x;
++	out->pose[5] = v->pose.position.y;
++	out->pose[6] = v->pose.position.z;
++}
++
++void
++null_tap_layers(struct null_tap *tap, struct comp_base *base, int64_t frame_id)
++{
++	if (tap == NULL) {
++		return;
++	}
++	int64_t now_ns = os_monotonic_get_ns();
++	if (tap->last_ns != 0 && now_ns - tap->last_ns < tap->interval_ns) {
++		return;
++	}
++
++	struct comp_layer_accum *accum = &base->layer_accum;
++	const struct comp_layer *layer = NULL;
++	for (uint32_t i = 0; i < accum->layer_count; i++) {
++		enum xrt_layer_type type = accum->layers[i].data.type;
++		if (type == XRT_LAYER_PROJECTION || type == XRT_LAYER_PROJECTION_DEPTH) {
++			layer = &accum->layers[i];
++			break;
++		}
++	}
++	if (layer == NULL || layer->data.view_count < 2) {
++		return;
++	}
++	// proj and depth layers start with the same per view data.
++	const struct xrt_layer_projection_view_data *views = layer->data.proj.v;
++	struct comp_swapchain *scs[2];
++	for (uint32_t i = 0; i < 2; i++) {
++		scs[i] = (struct comp_swapchain *)comp_layer_get_swapchain(layer, i);
++		if (scs[i] == NULL) {
++			return;
++		}
++	}
++	VkFormat format = (VkFormat)scs[0]->vkic.info.format;
++	uint32_t bpp = bytes_per_pixel(format);
++	uint32_t w = (uint32_t)views[0].sub.rect.extent.w;
++	uint32_t h = (uint32_t)views[0].sub.rect.extent.h;
++	if (bpp == 0 || (VkFormat)scs[1]->vkic.info.format != format || (uint32_t)views[1].sub.rect.extent.w != w ||
++	    (uint32_t)views[1].sub.rect.extent.h != h || w == 0 || h == 0) {
++		if (!tap->warned) {
++			U_LOG_W("null tap: skipping frames (format %d, %ux%u)", (int)format, w, h);
++			tap->warned = true;
++		}
++		return;
++	}
++	if ((scs[0]->vkic.info.bits & XRT_SWAPCHAIN_USAGE_TRANSFER_SRC) == 0) {
++		if (!tap->warned) {
++			U_LOG_W("null tap: the app's swapchain has no transfer src usage");
++			tap->warned = true;
++		}
++		return;
++	}
++
++	struct vk_bundle *vk = &base->vk;
++	VkDeviceSize eye_bytes = (VkDeviceSize)w * h * bpp;
++	if (!ensure_buffer(tap, vk, eye_bytes * 2) || !ensure_map(tap, TAP_HEADER_SIZE + (size_t)eye_bytes * 2)) {
++		return;
++	}
++
++	struct vk_cmd_pool *pool = &base->cscs.pool;
++	VkCommandBuffer cmd = VK_NULL_HANDLE;
++	vk_cmd_pool_lock(pool);
++	VkResult ret = vk_cmd_pool_create_and_begin_cmd_buffer_locked(vk, pool, 0, &cmd);
++	if (ret != VK_SUCCESS) {
++		vk_cmd_pool_unlock(pool);
++		return;
++	}
++	for (uint32_t i = 0; i < 2; i++) {
++		VkImage image = scs[i]->vkic.images[views[i].sub.image_index].handle;
++		VkImageSubresourceRange range = {
++		    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++		    .baseMipLevel = 0,
++		    .levelCount = 1,
++		    .baseArrayLayer = views[i].sub.array_index,
++		    .layerCount = 1,
++		};
++		vk_cmd_image_barrier_gpu_locked(vk, cmd, image, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
++		                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
++		                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, range);
++		VkBufferImageCopy region = {
++		    .bufferOffset = eye_bytes * i,
++		    .imageSubresource =
++		        {
++		            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++		            .mipLevel = 0,
++		            .baseArrayLayer = views[i].sub.array_index,
++		            .layerCount = 1,
++		        },
++		    .imageOffset = {views[i].sub.rect.offset.w, views[i].sub.rect.offset.h, 0},
++		    .imageExtent = {w, h, 1},
++		};
++		vk->vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, tap->buffer, 1, &region);
++		vk_cmd_image_barrier_gpu_locked(vk, cmd, image, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
++		                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++		                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, range);
++	}
++	ret = vk_cmd_pool_end_submit_wait_and_free_cmd_buffer_locked(vk, pool, cmd);
++	vk_cmd_pool_unlock(pool);
++	if (ret != VK_SUCCESS) {
++		return;
++	}
++
++	struct tap_header *hdr = (struct tap_header *)tap->map;
++	uint64_t seq = atomic_load(&hdr->seq) & ~(uint64_t)1;
++	atomic_store(&hdr->seq, seq + 1);
++	hdr->frame_id = frame_id;
++	hdr->display_time_ns = accum->data.display_time_ns;
++	hdr->capture_ns = now_ns;
++	hdr->width = w;
++	hdr->height = h;
++	hdr->format = (uint32_t)format;
++	hdr->bytes_per_pixel = bpp;
++	for (uint32_t i = 0; i < 2; i++) {
++		put_view(&hdr->views[i], &views[i]);
++		hdr->array_index[i] = views[i].sub.array_index;
++	}
++	hdr->layer_type = (uint32_t)layer->data.type;
++	memcpy(tap->map + TAP_HEADER_SIZE, tap->buffer_ptr, (size_t)eye_bytes * 2);
++	atomic_store(&hdr->seq, seq + 2);
++	tap->last_ns = now_ns;
++}
++
++void
++null_tap_destroy(struct null_tap **tap_ptr, struct vk_bundle *vk)
++{
++	struct null_tap *tap = *tap_ptr;
++	if (tap == NULL) {
++		return;
++	}
++	if (tap->buffer != VK_NULL_HANDLE) {
++		vk->vkUnmapMemory(vk->device, tap->memory);
++		vk->vkDestroyBuffer(vk->device, tap->buffer, NULL);
++		vk->vkFreeMemory(vk->device, tap->memory, NULL);
++	}
++	if (tap->map != NULL) {
++		munmap(tap->map, tap->map_size);
++	}
++	close(tap->fd);
++	free(tap);
++	*tap_ptr = NULL;
++}
+diff -ruN a/src/xrt/compositor/null/null_tap.h b/src/xrt/compositor/null/null_tap.h
+--- a/src/xrt/compositor/null/null_tap.h
++++ b/src/xrt/compositor/null/null_tap.h
+@@ -0,0 +1,36 @@
++// Copyright 2026, xkeyC.
++// SPDX-License-Identifier: BSL-1.0
++/*!
++ * @file
++ * @brief  Frame tap of the null compositor: the eyes an app submits, to shared memory.
++ *
++ * Enabled by XRT_NULL_TAP (a file path, e.g. /dev/shm/monado-eyes); at most
++ * XRT_NULL_TAP_FPS (default 10) frames a second. Layout in null_tap.c.
++ *
++ * @ingroup comp_null
++ */
++
++#pragma once
++
++#include "util/comp_base.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++struct null_tap;
++
++//! A tap if XRT_NULL_TAP is set, else NULL.
++struct null_tap *
++null_tap_create(struct vk_bundle *vk);
++
++//! Copies the first projection layer of the frame being committed, when one is due.
++void
++null_tap_layers(struct null_tap *tap, struct comp_base *base, int64_t frame_id);
++
++void
++null_tap_destroy(struct null_tap **tap_ptr, struct vk_bundle *vk);
++
++#ifdef __cplusplus
++}
++#endif

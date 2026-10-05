@@ -1,0 +1,33 @@
+# 部署记录（脱敏）
+
+主机名、地址、端口映射、凭据、用户名一律略去；路径里的构建根目录记作 `<VR_ROOT>`。
+
+## 2026-10-05
+
+| 时间 | 操作 | 结果 |
+|---|---|---|
+| 19:21 | 只读检查 GPU | 713 MiB / 12 GB，没有运行 VRChat |
+| 19:29 | 停用 AstrBot `vrchat` 平台和插件（先备份配置和数据库），停止 `vrc-bridge` 并禁用开机启动，重启 AstrBot | AstrBot 正常运行，日志里显示 "Plugin astrbot_plugin_vrchat is disabled" |
+| 19:3x | 第一次装构建依赖：本地包数据库过期，镜像返回 404 | 失败。改用户目录装工具和 Docker 构建两个方案都被否决 |
+| 19:4x | `pacman -Syu` 并安装 cmake、ninja、eigen、vulkan-headers、openxr | 成功，36 个包，内核和驱动未变，没有重启 |
+| 19:45 | 编译 Monado（上游快照 cfa6078b，未打补丁） | 成功：`monado-service`、`openxr_monado.json` |
+| 19:4x | rustup 下载工具链时连接卡住（镜像走 IPv6 没有数据），中断后改走代理 | 工具链状态损坏（"missing manifest"），卸载后重装成功 |
+| 19:50 | 编译 xrizer 0989a7fa：缺 libclang，补装 clang | 成功：`vrclient.so` |
+| 19:53 | 写 Monado 配置（remote 驱动）、`openvrpaths.vrpath`；停 Steam，改 VRChat 启动参数为包装脚本（`localconfig.vdf` 备份为 `.pre-vr`）；用 systemd-run 启动 `monado-service` | 第一次失败：`epoll_ctl(stdin) failed`，因为 systemd 下没有可轮询的标准输入。加 `XRT_NO_STDIN=1` 后正常 |
+| 19:55 | 启动 VRChat（VR 模式） | Monado 日志：会话建立；xrizer：SYNCHRONIZED → VISIBLE → FOCUSED。显存：VRChat 1090 MiB，monado 72 MiB |
+| 19:56 | 截桌面镜像窗口 | 能看到 VR 视角（镜子本身被设成了低清晰度，所以模糊） |
+| 20:00 | Monado 打抓帧补丁，xrizer 加 `TRANSFER_SRC`，重新编译，重启 Monado（`XRT_NULL_TAP=/dev/shm/vrc-eyes`，10 fps）和 VRChat | 加载期间抓到黑帧，进入世界后正常：每只眼 960x1080 RGBA8 sRGB，基线 0.063 m |
+| 20:02 | 用 remote 驱动转头：0°、右 60°、低头 35°、左 90° 抬头 10° | 画面和抓到的位姿都与设定一致 |
+| 20:03 | OSC 移动和转向测试 | VR 模式下有效 |
+| 20:03 | 显存 | VRChat 1122 MiB，monado 72 MiB，整卡 1980 MiB，GPU 利用率约 12% |
+| 20:07 | 在服务器上编译本仓库的 `vr-probe`，执行 `sweep --yaws=-90,0,90 --pitch=-15` | 三个方向都等到了按新姿态渲染的帧并存图；内参 fx 523.8、fy 547.2、cx 480、cy 540 |
+
+### 当前服务器状态
+
+- VRChat 以 VR 模式运行，`monado-service` 是临时单元（systemd-run），抓帧已开启。
+- AstrBot 的 `vrchat` 平台和插件已停用，bridge 已停止。
+- 切回桌面模式的步骤：
+  1. `echo desktop > ~/.config/vrc-mode`；
+  2. 重启 VRChat；
+  3. 在 WebUI 里重新启用插件和平台；
+  4. `systemctl --user enable --now vrc-bridge`。

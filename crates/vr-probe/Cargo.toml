@@ -1,0 +1,13 @@
+[package]
+name = "vr-probe"
+version = "0.1.0"
+description = "Pokes the bot's virtual headset by hand: set the head, grab the eyes"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+png.workspace = true
+vrc-vr.workspace = true

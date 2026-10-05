@@ -1,0 +1,15 @@
+diff --git a/src/graphics_backends/vulkan.rs b/src/graphics_backends/vulkan.rs
+index 16f69ad..2cd7157 100644
+--- a/src/graphics_backends/vulkan.rs
++++ b/src/graphics_backends/vulkan.rs
+@@ -143,7 +143,9 @@ impl GraphicsBackend for VulkanData {
+         xr::SwapchainCreateInfo {
+             create_flags: xr::SwapchainCreateFlags::EMPTY,
+             usage_flags: xr::SwapchainUsageFlags::COLOR_ATTACHMENT
+-                | xr::SwapchainUsageFlags::TRANSFER_DST,
++                | xr::SwapchainUsageFlags::TRANSFER_DST
++                // vrc fork: lets the runtime copy the eyes out (Monado null tap)
++                | xr::SwapchainUsageFlags::TRANSFER_SRC,
+             format: get_colorspace_corrected_format(
+                 vk::Format::from_raw(texture.m_nFormat as _),
+                 color_space,

@@ -2,10 +2,12 @@
 
 让一个 VRChat 桌面客户端成为 AstrBot 的一个平台：bot 以自己的 VRChat 账号待在房间里，用实时语音和房间里的人对话，能做动作、写 Chatbox，能按头顶名牌找到并跟随某位玩家，能看画面（当前截图、最后一次看到某位白名单好友时的截图），还能按白名单接受邀请、跨房间跟随好友。
 
+> **分支 `feat/full_vr`**：正在改为 VR 模式运行（虚拟头显：Monado + xrizer，程序设定头部与双眼，取得双目画面与精确位姿），主语言改为 Rust。目录结构、起始点、修改点、决策和部署记录见 [docs/full-vr/](docs/full-vr/README.md)。本分支里插件在 `astrbot_plugin/`，桌面模式的 Python bridge 在 `legacy/bridge/`；下文描述的是桌面模式。
+
 本仓库包含两部分：
 
-- **AstrBot 插件**（仓库根目录：`main.py`、`vrchat_adapter.py`、`metadata.yaml`）：注册 `vrchat` 平台。房间语音交给 AstrBot 的实时语音会话；插件提供语音工具（动作、跟随、看画面）、LLM 工具和管理员命令 `/vrc status|start|stop|restart`。
-- **bridge**（`bridge/`）：与 VRChat 客户端运行在同一台机器上的 Python 服务（aiohttp）。它负责：
+- **AstrBot 插件**（`astrbot_plugin/`：`main.py`、`vrchat_adapter.py`、`metadata.yaml`）：注册 `vrchat` 平台。房间语音交给 AstrBot 的实时语音会话；插件提供语音工具（动作、跟随、看画面）、LLM 工具和管理员命令 `/vrc status|start|stop|restart`。
+- **bridge**（`legacy/bridge/`）：与 VRChat 客户端运行在同一台机器上的 Python 服务（aiohttp）。它负责：
   - 采集游戏声音、把 bot 的语音写进虚拟麦克风（按住按键说话）；
   - 通过 OSC 控制移动、转身、表情和 Chatbox；
   - 跟踪 VRChat 日志，得到所在房间和其中的玩家；
@@ -39,7 +41,7 @@
 
 ## 安装 bridge
 
-在游戏机器上，以 root 身份在 `bridge/` 目录下运行 `sh install.sh`（bot 用户默认是 `vrcbot`，可用 `VRC_USER` 指定）。它会：
+在游戏机器上，以 root 身份在 `legacy/bridge/` 目录下运行 `sh install.sh`（bot 用户默认是 `vrcbot`，可用 `VRC_USER` 指定）。它会：
 
 - 把 bridge 安装到 `~vrcbot/vrc-bridge/`；
 - 生成访问 token：`~vrcbot/.config/vrc-bridge/token`；

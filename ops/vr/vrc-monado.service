@@ -1,0 +1,18 @@
+# User unit of the bot user: ~/.config/systemd/user/vrc-monado.service
+# Headless Monado: remote driver (config_v0.json), null compositor (no display),
+# eye tap to shared memory for vrc-vr.
+[Unit]
+Description=Monado (headless, remote driver) for the VRChat bot
+
+[Service]
+Environment=VR_ROOT=%h/vr
+Environment=XRT_NO_STDIN=1
+Environment=XRT_COMPOSITOR_NULL=1
+Environment=XRT_COMPOSITOR_NULL_FPS=30
+Environment=XRT_NULL_TAP=/dev/shm/vrc-eyes
+Environment=XRT_NULL_TAP_FPS=10
+ExecStart=/bin/sh -c 'exec "$VR_ROOT/prefix/bin/monado-service"'
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

@@ -3,3 +3,6 @@ __pycache__/
 # Machine-specific server setup (kept locally, not published).
 deploy/
 .env
+
+# Rust
+/target/
