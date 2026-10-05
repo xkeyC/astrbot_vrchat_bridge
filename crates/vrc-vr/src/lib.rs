@@ -9,8 +9,12 @@
 //!   view of each, from the frame tap our Monado patch adds to its null
 //!   compositor (shared memory).
 //!
+//! - [`anim`] gives the hands (and a little of the head) life: idle sway,
+//!   arm swing when walking, gestures when talking.
+//!
 //! See `docs/full-vr/` for how the pieces fit and why.
 
+pub mod anim;
 pub mod fps;
 pub mod osc;
 pub mod pose;

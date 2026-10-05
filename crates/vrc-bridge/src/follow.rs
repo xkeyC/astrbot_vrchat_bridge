@@ -336,15 +336,18 @@ impl Follower {
         let whitelist = bridge.social.whitelist_names();
         let (frame, ocr) = {
             let mut vr = bridge.vr.lock().unwrap();
-            if let Some(yaw) = aim {
-                vr.face(yaw, PITCH)?;
-                track.lock().unwrap().facing = yaw;
-            }
-            let rig = vr.rig(&whitelist)?;
             let frame = match aim {
-                Some(yaw) => scan::rendered_at(&mut rig.tap, yaw, PITCH, Duration::from_secs(1))?,
-                None => rig.tap.read()?.ok_or_else(|| anyhow::anyhow!("no frame yet"))?,
+                Some(yaw) => {
+                    // Exactly that way: the animation's sway would miss it.
+                    vr.rig(&whitelist)?.hmd.hold_still(true)?;
+                    let frame = vr.face(yaw, PITCH).and_then(|()| scan::rendered_at(&mut vr.rig(&whitelist)?.tap, yaw, PITCH, Duration::from_secs(1)));
+                    vr.rig(&whitelist)?.hmd.hold_still(false)?;
+                    track.lock().unwrap().facing = yaw;
+                    frame?
+                }
+                None => vr.rig(&whitelist)?.tap.read()?.ok_or_else(|| anyhow::anyhow!("no frame yet"))?,
             };
+            let rig = vr.rig(&whitelist)?;
             let ocr = rig.ocr.clone().ok_or_else(|| anyhow::anyhow!("following needs OCR"))?;
             (frame, ocr)
         };
@@ -378,7 +381,8 @@ impl Follower {
             let (dx, dz) = (p[0] - eye[0], p[2] - eye[2]);
             let ahead = dx * fs - dz * fc;
             let side = dx * fc + dz * fs;
-            if ahead > 0.0 && side.abs() * metres < 0.25 && p[1] > floor + 0.4 / metres && p[1] < eye[1] {
+            // Nearer than 0.35 m is the bot's own arm (a gesture).
+            if ahead * metres > 0.35 && side.abs() * metres < 0.25 && p[1] > floor + 0.4 / metres && p[1] < eye[1] {
                 nearest = nearest.min(ahead * metres);
             }
         }

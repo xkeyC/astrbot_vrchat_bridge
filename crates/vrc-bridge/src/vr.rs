@@ -66,6 +66,11 @@ impl VrCore {
         Ok(rig)
     }
 
+    /// The headset connection's animator handle, once the rig is up.
+    pub fn link(&self) -> Option<vrc_vr::remote::HmdLink> {
+        self.rig.as_ref().map(|r| r.hmd.link())
+    }
+
     /// Drops the rig: the next use connects again.
     pub fn reset(&mut self) {
         self.rig = None;
@@ -178,10 +183,13 @@ impl VrCore {
     /// The first frame with the head tilted to `pitch` (degrees, + up).
     pub fn frame_looking(&mut self, pitch: f32) -> Result<EyeFrame> {
         let yaw = self.yaw;
-        self.aim(yaw, pitch)?;
-        let pitch = self.pitch;
-        let rig = self.rig(&[])?;
-        scan::rendered_at(&mut rig.tap, yaw, pitch, Duration::from_secs(1))
+        self.rig(&[])?.hmd.hold_still(true)?;
+        let frame = self.aim(yaw, pitch).and_then(|()| {
+            let pitch = self.pitch;
+            scan::rendered_at(&mut self.rig(&[])?.tap, yaw, pitch, Duration::from_secs(1))
+        });
+        self.rig(&[])?.hmd.hold_still(false)?;
+        frame
     }
 
     /// The latest frame of the eyes.

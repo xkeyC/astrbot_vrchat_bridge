@@ -1,0 +1,161 @@
+//! The avatar's procedural motion (`vrc_vr::anim`), run 45 times a second
+//! on the headset connection's animator handle: the owner (surveys, walks,
+//! the follower) keeps the head and the body's facing; this adds the hands'
+//! and the head's motion on top, and stands aside while a scan holds still.
+//!
+//! Inputs: the avatar's speed (OSCQuery `VelocityZ`), the loudness of the
+//! bot's own voice as it plays (`heard_bot`), and whether anything else is
+//! driving the head (glances only when not). Parameters are tunable at run
+//! time (`/v1/anim`) and kept in `anim.json` next to the token.
+
+use std::collections::VecDeque;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use serde_json::Value;
+use vrc_vr::anim::{AnimInput, AnimParams, Animator};
+use vrc_vr::osc::Osc;
+use vrc_vr::remote::HmdLink;
+
+use crate::bridge::{Bridge, SAMPLE_RATE};
+
+const TICK: Duration = Duration::from_millis(22);
+/// The speed is read every few ticks (an HTTP request each).
+const SPEED_EVERY: u32 = 3;
+/// Loudness is measured over windows this long.
+const WINDOW: Duration = Duration::from_millis(30);
+
+pub struct Anim {
+    params: Mutex<AnimParams>,
+    path: PathBuf,
+    /// The bot's voice: (when it plays, loudness 0..1) per window.
+    voice: Mutex<VecDeque<(Instant, f32)>>,
+}
+
+impl Anim {
+    pub fn new(path: PathBuf) -> Anim {
+        let params = std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).map_err(|e| tracing::warn!("{}: {e}", path.display())).ok())
+            .unwrap_or_default();
+        Anim { params: Mutex::new(params), path, voice: Mutex::new(VecDeque::new()) }
+    }
+
+    pub fn params(&self) -> AnimParams {
+        self.params.lock().unwrap().clone()
+    }
+
+    /// Merges `patch` into the parameters (and keeps them).
+    pub fn tune(&self, patch: &Value) -> anyhow::Result<AnimParams> {
+        let mut p = self.params.lock().unwrap();
+        let mut v = serde_json::to_value(&*p)?;
+        let (Some(dst), Some(src)) = (v.as_object_mut(), patch.as_object()) else {
+            anyhow::bail!("expected a JSON object of parameters");
+        };
+        if patch.get("reset").and_then(Value::as_bool) == Some(true) {
+            *p = AnimParams::default();
+        } else {
+            for (k, val) in src {
+                if !dst.contains_key(k) {
+                    anyhow::bail!("no parameter {k}");
+                }
+                dst.insert(k.clone(), val.clone());
+            }
+            *p = serde_json::from_value(v)?;
+        }
+        std::fs::write(&self.path, serde_json::to_vec_pretty(&*p)?)?;
+        Ok(p.clone())
+    }
+
+    /// The bot's voice `pcm` (s16le mono), playing from `at`.
+    pub fn heard_bot(&self, pcm: &[u8], at: Instant) {
+        let per_window = (SAMPLE_RATE as f64 * WINDOW.as_secs_f64()) as usize * 2;
+        let mut voice = self.voice.lock().unwrap();
+        for (i, chunk) in pcm.chunks(per_window).enumerate() {
+            let n = chunk.len() / 2;
+            if n == 0 {
+                continue;
+            }
+            let sum: f64 = chunk.chunks_exact(2).map(|s| (i16::from_le_bytes([s[0], s[1]]) as f64).powi(2)).sum();
+            let rms = (sum / n as f64).sqrt() / 32768.0;
+            // Speech runs 0.05-0.2 RMS: about 0.2-0.8.
+            voice.push_back((at + WINDOW * i as u32, (rms * 4.0).min(1.0) as f32));
+        }
+        // Long queues of speech are fine; a stale tail is not.
+        while voice.len() > 4000 {
+            voice.pop_front();
+        }
+    }
+
+    /// The bot's voice now: `None` while silent.
+    fn voice_now(&self, now: Instant) -> Option<f32> {
+        let mut voice = self.voice.lock().unwrap();
+        while voice.len() > 1 && voice[1].0 <= now {
+            voice.pop_front();
+        }
+        match voice.front() {
+            Some(&(at, level)) if at <= now && now < at + WINDOW => Some(level),
+            Some(&(at, _)) if at + WINDOW <= now => {
+                voice.pop_front();
+                None
+            }
+            _ => None,
+        }
+    }
+
+    pub fn run(self: Arc<Self>, bridge: Arc<Bridge>) {
+        let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1);
+        let mut animator = Animator::new(self.params(), seed);
+        let mut link: Option<HmdLink> = None;
+        let mut osc: Option<Osc> = None;
+        let mut speed = 0.0f32;
+        let mut tick = 0u32;
+        let mut last = Instant::now();
+        let mut off_sent = false;
+        loop {
+            std::thread::sleep(TICK);
+            tick = tick.wrapping_add(1);
+            let now = Instant::now();
+            let dt = (now - last).as_secs_f32();
+            last = now;
+            // The headset connection, once the rig is up (and again after a reset).
+            let owner = link.as_ref().and_then(HmdLink::owner);
+            let Some(owner) = owner else {
+                link = bridge.vr.try_lock().ok().and_then(|vr| vr.link());
+                off_sent = false;
+                continue;
+            };
+            if tick.is_multiple_of(SPEED_EVERY) {
+                if osc.is_none() {
+                    osc = bridge.osc_query().ok();
+                }
+                match osc.as_ref().map(|o| o.query("/avatar/parameters/VelocityZ")) {
+                    Some(Ok(v)) => speed = v as f32,
+                    _ => {
+                        osc = None;
+                        speed = 0.0;
+                    }
+                }
+            }
+            animator.params = self.params();
+            let enabled = animator.params.enabled;
+            // Glances only when nobody else is using the head.
+            let idle = bridge.follower.is_idle() && bridge.vr.try_lock().is_ok();
+            let overlay = animator.update(&AnimInput { dt, owner: owner.state, speed, voice: self.voice_now(now), idle });
+            let link = link.as_ref().unwrap();
+            let sent = if enabled {
+                off_sent = false;
+                link.set_overlay(Some(overlay))
+            } else if !off_sent {
+                off_sent = true;
+                link.set_overlay(None)
+            } else {
+                Ok(())
+            };
+            if let Err(e) = sent {
+                tracing::debug!("animation: {e:#}");
+            }
+        }
+    }
+}

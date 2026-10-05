@@ -18,6 +18,7 @@
 //! drive, nav, goto, look_around, map, note, autopilot, camera_y) are gone:
 //! the head's look around and the walks replace them.
 
+mod anim;
 mod api;
 mod bridge;
 mod follow;
@@ -127,6 +128,10 @@ async fn main() -> Result<()> {
     tokio::spawn(bridge.clone().chatbox_sender(chat_rx));
     tokio::spawn(bridge.social.clone().run(bridge.clone()));
     tokio::spawn(bridge.sightings.clone().run(bridge.clone()));
+    {
+        let (anim, b) = (bridge.anim.clone(), bridge.clone());
+        std::thread::spawn(move || anim.run(b));
+    }
 
     let app = Router::new()
         .route("/v1/stream", get(stream))
@@ -140,6 +145,7 @@ async fn main() -> Result<()> {
         .route("/v1/social", get(social_status))
         .route("/v1/social/config", post(social_config))
         .route("/v1/screenshot", get(screenshot))
+        .route("/v1/anim", get(anim_params).post(anim_tune))
         .route("/v1/sightings", get(sightings_list))
         .route("/v1/sightings/image", get(sighting_image))
         .route("/v1/game/start", post(game_start))
@@ -400,6 +406,15 @@ async fn social_status(State(b): State<App>) -> Json<Value> {
 async fn social_config(State(b): State<App>, Body(body): Body) -> Reply {
     b.social.set_config(&b, &body)?;
     Ok(Json(b.social.status()))
+}
+
+async fn anim_params(State(b): State<App>) -> Json<Value> {
+    Json(serde_json::to_value(b.anim.params()).unwrap_or_default())
+}
+
+async fn anim_tune(State(b): State<App>, Body(body): Body) -> Reply {
+    let p = b.anim.tune(&body)?;
+    Ok(Json(serde_json::to_value(p)?))
 }
 
 async fn screenshot(State(b): State<App>, Query(q): Query<std::collections::HashMap<String, String>>) -> std::result::Result<Response, Fail> {

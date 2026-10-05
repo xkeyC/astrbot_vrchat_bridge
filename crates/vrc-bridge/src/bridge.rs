@@ -12,6 +12,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use vrc_vr::osc::{Arg, Osc};
 
+use crate::anim::Anim;
 use crate::follow::Follower;
 use crate::game::{self, GameState, LogTail};
 use crate::sightings::Sightings;
@@ -52,6 +53,7 @@ pub struct Bridge {
     pub vr: Arc<Mutex<VrCore>>,
     pub follower: Arc<Follower>,
     pub sightings: Arc<Sightings>,
+    pub anim: Arc<Anim>,
 }
 
 #[derive(Default)]
@@ -84,6 +86,7 @@ impl Bridge {
             vr,
             follower: Arc::new(Follower::default()),
             sightings: Arc::new(Sightings::default()),
+            anim: Arc::new(Anim::new(config_dir.join("anim.json"))),
             args,
         });
         (bridge, chat_rx)
@@ -258,6 +261,8 @@ impl Bridge {
         }
         let now = Instant::now();
         let len = Duration::from_secs_f64(pcm.len() as f64 / (SAMPLE_RATE as f64 * 2.0));
+        let starts = p.speech_until.filter(|t| *t > now).unwrap_or(now);
+        self.anim.heard_bot(pcm, starts + Duration::from_millis(PLAYBACK_LATENCY_MS));
         p.speech_until = Some(p.speech_until.filter(|t| *t > now).unwrap_or(now) + len);
         if !p.release_pending {
             p.release_pending = true;

@@ -34,10 +34,12 @@ pub fn ring(count: usize, pitch: f32) -> Vec<(f32, f32)> {
 /// tracking space) and returns the first frame rendered looking at each; the
 /// head goes back to where it was at the end. The hands stay where the
 /// caller put them: down at the sides ([`crate::remote::State::hands_at_rest`])
-/// keeps the arms out of the views.
+/// keeps the arms out of the views. An animator's overlay is held off
+/// meanwhile (`RemoteHmd::hold_still`).
 pub fn scan(hmd: &mut RemoteHmd, tap: &mut EyeTap, views: &[(f32, f32)], timeout: Duration) -> Result<Vec<Shot>> {
     let home = hmd.state.head;
     let mut shots = Vec::with_capacity(views.len());
+    hmd.hold_still(true)?;
     let result = (|| {
         for &(yaw, pitch) in views {
             let started = Instant::now();
@@ -48,6 +50,7 @@ pub fn scan(hmd: &mut RemoteHmd, tap: &mut EyeTap, views: &[(f32, f32)], timeout
         Ok(())
     })();
     hmd.set_head(home)?;
+    hmd.hold_still(false)?;
     result.map(|()| shots)
 }
 
@@ -66,6 +69,7 @@ pub fn scan_pipelined(
     let home = hmd.state.head;
     let started = Instant::now();
     let mut got: Vec<Option<Shot>> = views.iter().map(|_| None).collect();
+    hmd.hold_still(true)?;
     let result = (|| {
         let mut next = 0usize;
         let mut switch_at = started;
@@ -116,6 +120,7 @@ pub fn scan_pipelined(
         Ok(())
     })();
     hmd.set_head(home)?;
+    hmd.hold_still(false)?;
     result.map(|()| got.into_iter().flatten().collect())
 }
 

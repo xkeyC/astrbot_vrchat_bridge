@@ -24,6 +24,8 @@
 | `ops/vr/` | 构建脚本（Monado、xrizer）、安装脚本、`vrc-launch.sh`（按 `~/.config/vrc-mode` 切换桌面/VR）、Monado 配置、`openvrpaths.vrpath` 模板、`vrc-monado.service` 用户单元 |
 | `crates/vrc-vr` 的 `remote` | 静止时双手的姿势跟着身体朝向放，握持姿态按 OpenXR 规范，手指放松（D21） |
 | `crates/vrc-bridge` 的 `follow` | 重写：看和走拆成两个线程，靠自身速度推算距离，刹车平滑；找人时逐个方向看（D22）。`/v1/screenshot` 加 `pitch` 参数 |
+| `crates/vrc-vr` 的 `anim`、`remote` | 程序化动画（待机、走路摆臂、说话手势）；`HmdLink` 叠加动画、`hold_still` 扫描时保持静止（D23） |
+| `crates/vrc-bridge` 的 `anim` | 动画线程（45 Hz）、bot 语音响度、`/v1/anim` 调参接口 |
 | `docs/full-vr/` | 本文档集 |
 
 ## 其他项目

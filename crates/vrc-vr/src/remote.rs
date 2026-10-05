@@ -8,13 +8,22 @@
 //! The wire format is `struct r_remote_data` of `r_interface.h` (protocol
 //! "mndrmt3"), little endian, 376 bytes; on connect the driver first sends
 //! its reset state and its latest state.
+//!
+//! Two may drive one connection: the owner (`RemoteHmd`: where the head
+//! looks, the body faces) and an animator (an [`HmdLink`]: an [`Overlay`] of
+//! the hands' motion and a little of the head's, see [`crate::anim`]). What
+//! is sent is the owner's state with the overlay on top, except while the
+//! owner holds still (scans: the views must be exactly where asked, and
+//! the arms out of them).
 
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{Shutdown, TcpStream, ToSocketAddrs};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
+use crate::anim::{self, AnimParams};
 use crate::pose::{quat_axis, quat_mul, Fov, Pose};
 
 /// Size of `struct r_remote_data`.
@@ -30,12 +39,6 @@ const RIGHT_AT: usize = 256;
 /// The eyes' height above VRChat's floor in the tracking space (VRChat
 /// scales the world so; measured by stereo, see `docs/full-vr` D13).
 pub const EYE_HEIGHT: f32 = 1.93;
-/// The relaxed hand: tipped down and turned palm-back (degrees), fingers
-/// curled (little, ring, middle, index, thumb; 0..1).
-const REST_TIP_DEG: f32 = 20.0;
-const REST_TURN_DEG: f32 = 20.0;
-const REST_CURL: [f32; 5] = [0.40, 0.35, 0.30, 0.25, 0.25];
-
 /// One eye as the driver reports it: its field of view, and its pose
 /// relative to the head.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -82,6 +85,9 @@ pub struct State {
     pub views: Option<[View; 2]>,
     pub left: Controller,
     pub right: Controller,
+    /// Where the body faces (degrees), as [`State::hands_at_rest`] last
+    /// placed the hands for. Not sent.
+    pub body_yaw: f32,
 }
 
 impl State {
@@ -92,27 +98,14 @@ impl State {
     /// not turn). The body is where the hands say: VRChat turns it to keep
     /// them at its sides, so placing them for a new facing turns the body.
     ///
-    /// The pose is OpenXR's grip pose, whose identity (in the body's frame)
-    /// is a fist hanging at the side: palm in, thumb ahead (-z runs from the
-    /// little finger to the thumb). Relaxed, the hand tips down a little and
-    /// turns the palm a little back. Pointing the grip's -z down instead
-    /// (the old pose) made the arm bend the wrist and cross the body.
+    /// The pose is OpenXR's grip pose; see [`crate::anim::hand_pose`] for
+    /// the rest pose and its defaults.
     pub fn hands_at_rest(&mut self, head: [f32; 3], body_yaw_deg: f32) {
-        let body = Pose::looking(body_yaw_deg, 0.0, head);
-        let (tip, turn) = (REST_TIP_DEG.to_radians(), REST_TURN_DEG.to_radians());
+        self.body_yaw = body_yaw_deg;
+        let p = AnimParams::default();
         for (hand, side) in [(&mut self.left, -1.0f32), (&mut self.right, 1.0)] {
-            let relaxed = quat_mul(quat_axis([0.0, 1.0, 0.0], side * turn), quat_axis([1.0, 0.0, 0.0], -tip));
-            // Body frame: +x right, -z ahead; in eye heights.
-            let offset = body.rotate([side * 0.125 * EYE_HEIGHT, -0.49 * EYE_HEIGHT, 0.04 * EYE_HEIGHT]);
-            hand.active = true;
-            hand.pose = Pose {
-                orientation: quat_mul(body.orientation, relaxed),
-                position: [head[0] + offset[0], head[1] + offset[1], head[2] + offset[2]],
-            };
-            // Fingers loosely curled (little, ring, middle, index, thumb):
-            // xrizer passes them on as the skeleton (XR_EXT_hand_tracking).
-            hand.hand_tracking_active = true;
-            hand.hand_curl = REST_CURL;
+            let pose = anim::hand_pose(&p, head, body_yaw_deg, side, [0.0; 3], [0.0, 0.0, 0.0, 1.0]);
+            *hand = anim::hand(&p, pose, p.curl);
         }
     }
 
@@ -167,17 +160,106 @@ impl State {
         r.at = LEFT_AT;
         let left = r.controller();
         let right = r.controller();
-        Ok(State { head, views: per_view.then_some(views), left, right })
+        Ok(State { head, views: per_view.then_some(views), left, right, body_yaw: 0.0 })
     }
 }
 
 /// A connection to the remote driver.
 pub struct RemoteHmd {
-    stream: TcpStream,
+    link: Arc<Mutex<Link>>,
     /// What the driver resets to (as it sent it on connect).
     pub reset: State,
-    /// The state last sent (or the driver's latest on connect).
+    /// The owner's state, as last sent (or the driver's latest on connect).
     pub state: State,
+}
+
+/// The connection, shared by the owner and an animator.
+struct Link {
+    stream: TcpStream,
+    /// The owner's state, as last sent.
+    base: State,
+    overlay: Option<Overlay>,
+    still: bool,
+    closed: bool,
+}
+
+/// An animator's part: both hands as they are now, and a small offset of
+/// the head; and the hands at rest, sent while the owner holds still.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Overlay {
+    pub left: Controller,
+    pub right: Controller,
+    pub rest: [Controller; 2],
+    pub head: HeadOffset,
+}
+
+/// A small motion of the head on top of where the owner points it: turned
+/// (degrees: yaw + right, pitch + up, roll + clockwise as seen from behind)
+/// and moved (tracking space).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct HeadOffset {
+    pub yaw: f32,
+    pub pitch: f32,
+    pub roll: f32,
+    pub position: [f32; 3],
+}
+
+impl HeadOffset {
+    pub fn apply(&self, head: Pose) -> Pose {
+        let turn = quat_axis([0.0, 1.0, 0.0], -self.yaw.to_radians());
+        let tilt = quat_mul(quat_axis([1.0, 0.0, 0.0], self.pitch.to_radians()), quat_axis([0.0, 0.0, 1.0], -self.roll.to_radians()));
+        Pose {
+            orientation: quat_mul(quat_mul(turn, head.orientation), tilt),
+            position: [head.position[0] + self.position[0], head.position[1] + self.position[1], head.position[2] + self.position[2]],
+        }
+    }
+}
+
+impl Link {
+    fn send(&mut self) -> Result<()> {
+        let mut s = self.base;
+        match (self.overlay, self.still) {
+            (Some(o), false) => {
+                s.left = o.left;
+                s.right = o.right;
+                s.head = o.head.apply(s.head);
+            }
+            (Some(o), true) => [s.left, s.right] = o.rest,
+            (None, _) => {}
+        }
+        self.stream.write_all(&s.encode()).context("sending to the remote driver")
+    }
+}
+
+/// An animator's handle on a [`RemoteHmd`]'s connection.
+#[derive(Clone)]
+pub struct HmdLink(Arc<Mutex<Link>>);
+
+/// What an animator sees of the owner.
+#[derive(Clone, Copy, Debug)]
+pub struct Owner {
+    pub state: State,
+    /// Holding still (a scan): the overlay is not sent.
+    pub still: bool,
+}
+
+impl HmdLink {
+    /// The owner's state; `None` once the connection is gone (the owner
+    /// dropped it).
+    pub fn owner(&self) -> Option<Owner> {
+        let l = self.0.lock().unwrap();
+        (!l.closed).then_some(Owner { state: l.base, still: l.still })
+    }
+
+    /// Sets the overlay (`None`: the owner's state alone) and sends.
+    pub fn set_overlay(&self, overlay: Option<Overlay>) -> Result<()> {
+        let mut l = self.0.lock().unwrap();
+        if l.closed {
+            bail!("the headset connection is closed");
+        }
+        l.overlay = overlay;
+        l.send()
+    }
 }
 
 impl RemoteHmd {
@@ -189,19 +271,48 @@ impl RemoteHmd {
         stream.read_exact(&mut buf).context("reading the reset state")?;
         let reset = State::decode(&buf)?;
         stream.read_exact(&mut buf).context("reading the latest state")?;
-        let state = State::decode(&buf)?;
-        Ok(RemoteHmd { stream, reset, state })
+        let mut state = State::decode(&buf)?;
+        state.body_yaw = state.head.yaw_pitch().0;
+        let link = Link { stream, base: state, overlay: None, still: false, closed: false };
+        Ok(RemoteHmd { link: Arc::new(Mutex::new(link)), reset, state })
     }
 
-    /// Sends [`RemoteHmd::state`].
+    /// Sends [`RemoteHmd::state`] (with an animator's overlay, if any).
     pub fn send(&mut self) -> Result<()> {
-        self.stream.write_all(&self.state.encode()).context("sending to the remote driver")
+        let mut l = self.link.lock().unwrap();
+        l.base = self.state;
+        l.send()
+    }
+
+    /// A handle for an animator.
+    pub fn link(&self) -> HmdLink {
+        HmdLink(self.link.clone())
+    }
+
+    /// Holds still (`true`): only [`RemoteHmd::state`] is sent, no overlay,
+    /// until released.
+    pub fn hold_still(&mut self, still: bool) -> Result<()> {
+        let mut l = self.link.lock().unwrap();
+        if l.still != still {
+            l.still = still;
+            l.base = self.state;
+            l.send()?;
+        }
+        Ok(())
     }
 
     /// Sets the head and sends.
     pub fn set_head(&mut self, head: Pose) -> Result<()> {
         self.state.head = head;
         self.send()
+    }
+}
+
+impl Drop for RemoteHmd {
+    fn drop(&mut self) {
+        let mut l = self.link.lock().unwrap();
+        l.closed = true;
+        let _ = l.stream.shutdown(Shutdown::Both);
     }
 }
 
@@ -330,13 +441,10 @@ mod tests {
     fn hands_rest_at_the_sides() {
         let mut s = State::default();
         s.hands_at_rest([0.0, 1.93, 0.0], 0.0);
-        let q = s.right.pose.orientation;
-        for (a, b) in q.iter().zip([-0.1710, 0.1710, 0.0302, 0.9698]) {
-            assert!((a - b).abs() < 1e-3, "{q:?}");
-        }
-        // The grip's -z (little finger to thumb): ahead, a little down and in.
-        let tube = s.right.pose.rotate([0.0, 0.0, -1.0]);
-        assert!(tube[2] < -0.8 && tube[1] < 0.0 && tube[0] < 0.0, "{tube:?}");
+        // Fingers (the grip's -z, as Monado simulates the hand) down.
+        let fingers = s.right.pose.rotate([0.0, 0.0, -1.0]);
+        assert!(fingers[1] < -0.95, "{fingers:?}");
+        assert!(s.right.hand_tracking_active && s.right.hand_curl[2] > 0.0);
         assert!(s.left.pose.position[0] < 0.0 && s.right.pose.position[0] > 0.0);
         // Facing right (+x): the right hand is behind (+z), the left ahead.
         s.hands_at_rest([0.0, 1.93, 0.0], 90.0);
