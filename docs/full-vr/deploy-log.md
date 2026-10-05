@@ -25,10 +25,11 @@
 | 21:xx | 在服务器上编译 `vrc-stereo` 和 `vr-probe`；`look --pitch -20` 后执行 `depth` | 640x640 用时 157 ms（16 核），69% 的像素有深度；中心 5.66 m，下方中心 2.15 m；地面在眼睛下方 1.918 m，倾斜 0.04°。镜面显示的是镜中世界的深度 |
 | 21:xx | 通过 OSCQuery 读取眼高（`/avatar/eyeheight` 为 1.405，缩放未被禁止），再通过 OSC 写入 1.6 和 1.0，最后恢复为 1.405；每次都用双目重新量地面 | 读写都生效（`EyeHeightAsMeters`、`ScaleFactor` 跟着变）；双目测得的眼睛到地面距离始终在 1.913–1.929 之间，说明世界缩放时两眼间距也一起缩放。已恢复原眼高 |
 | 21:xx | Monado 改为每帧都抓（`XRT_NULL_TAP_FPS=0`），合成器先后用 30 fps 和 60 fps 重启（VRChat 跟着重启）；执行 `vr-probe scan --count 5 --pitch -10 --down` | 30 fps：6 个方向 480 ms；60 fps：6 个方向 283 ms，GPU 利用率约 28%。全景覆盖 71%，360° 高度图约 190 万个点，耗时约 1 s。刚重启时 VRChat 还在加载，抓到的帧不随头部姿态变化，扫描会超时，等进入世界后再扫就正常 |
+| 22:xx | Monado 打补丁 0003（运行中改帧率，`XRT_NULL_FPS_FILE=/dev/shm/vrc-fps`），抓帧改为 8 槽环形缓冲区；对比逐个方向和流水线扫描、30–120 fps | 改帧率生效，30→90 用时 4–32 ms，VRChat 提交帧率跟随到 119。扫描最快的仍是 30 fps 逐个方向：6 个方向 199–209 ms；90 fps 下约 290–310 ms；流水线方式会漏帧。启动时上报 90 Hz、运行时压到 30 也没有改善。最后恢复为启动 30 fps |
 
 ### 当前服务器状态
 
-- VRChat 以 VR 模式运行，`monado-service` 是临时单元（systemd-run）：合成器 60 fps，每帧都抓，视场 100°。
+- VRChat 以 VR 模式运行，`monado-service` 是临时单元（systemd-run）：合成器 30 fps（可通过 `/dev/shm/vrc-fps` 临时调整），每帧都抓（8 槽环形缓冲区），视场 100°。
 - AstrBot 的 `vrchat` 平台和插件已停用，bridge 已停止。
 - 切回桌面模式的步骤：
   1. `echo desktop > ~/.config/vrc-mode`；

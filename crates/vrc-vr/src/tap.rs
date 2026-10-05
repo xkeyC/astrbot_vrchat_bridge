@@ -1,11 +1,19 @@
 //! Reader of the eye tap our Monado patch adds to its null compositor
 //! (`third_party/monado/patches/0001-null-compositor-frame-tap.patch`).
 //!
-//! Monado writes, at most `XRT_NULL_TAP_FPS` times a second, the first
-//! projection layer of the frame being committed to the file `XRT_NULL_TAP`
-//! (e.g. `/dev/shm/vrc-eyes`): a 512 byte header, then both eyes' pixels
-//! (left first, rows tightly packed, in the app's swapchain format). The
-//! header's `seq` is odd while a frame is being written.
+//! Monado writes the first projection layer of each committed frame (at
+//! most `XRT_NULL_TAP_FPS` a second, 0: all) to a ring of
+//! `XRT_NULL_TAP_SLOTS` frames in the file `XRT_NULL_TAP` (e.g.
+//! `/dev/shm/vrc-eyes`):
+//!
+//! - file header (512 bytes): `"MNDTAP02"`, u32 slots @8, u64 slot size @16,
+//!   u64 frames written @24 (the latest is in slot `(n - 1) % slots`);
+//! - each slot: a 512 byte header (`"MNDSLOT1"`, seq, frame id, times, eye
+//!   size and format, per-eye FOV and pose) and both eyes' pixels, left
+//!   first, rows tightly packed, in the app's swapchain format.
+//!
+//! A slot's `seq` is `2n` while frame `n` (from 1) is in it and odd while it
+//! is being written: a seqlock, and a frame's identity across slots.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -19,7 +27,7 @@ use memmap2::Mmap;
 use crate::pose::{Fov, Pose};
 
 const HEADER_SIZE: usize = 512;
-const MAGIC: &[u8; 8] = b"MNDTAP01";
+const MAGIC: &[u8; 8] = b"MNDTAP02";
 
 /// Vulkan formats the tap writes (VkFormat values).
 pub mod format {
@@ -40,6 +48,7 @@ pub struct EyeView {
 /// Both eyes of one frame.
 #[derive(Clone, Debug)]
 pub struct EyeFrame {
+    /// 2n for the tap's n-th frame.
     pub seq: u64,
     pub frame_id: i64,
     /// The time the app rendered for.
@@ -53,7 +62,7 @@ pub struct EyeFrame {
     pub format: u32,
     pub bytes_per_pixel: u32,
     pub views: [EyeView; 2],
-    /// Left eye, then right eye.
+    /// Left eye, then right eye (empty from [`EyeTap::peek`]).
     pub pixels: Vec<u8>,
 }
 
@@ -101,63 +110,135 @@ impl EyeTap {
         EyeTap { path: path.as_ref().to_owned(), map: None }
     }
 
-    /// The latest frame; `None` until Monado wrote one. Waits out a frame
-    /// being written (up to about a second).
+    /// Frames written so far (0 before the first, or while there is no tap).
+    pub fn written(&mut self) -> Result<u64> {
+        Ok(match self.ring()? {
+            Some(ring) => ring.written(),
+            None => 0,
+        })
+    }
+
+    /// The latest frame; `None` until Monado wrote one.
     pub fn read(&mut self) -> Result<Option<EyeFrame>> {
-        self.read_with(true)
+        self.latest(true)
     }
 
     /// The latest frame without its pixels (`pixels` empty): cheap enough
     /// to poll for a frame rendered at some pose.
     pub fn peek(&mut self) -> Result<Option<EyeFrame>> {
-        self.read_with(false)
+        self.latest(false)
     }
 
-    fn read_with(&mut self, pixels: bool) -> Result<Option<EyeFrame>> {
+    /// Every frame still in the ring, without pixels, oldest first.
+    pub fn peek_all(&mut self) -> Result<Vec<EyeFrame>> {
+        let Some(ring) = self.ring()? else { return Ok(Vec::new()) };
+        let mut frames: Vec<EyeFrame> =
+            (0..ring.slots).filter_map(|i| ring.slot(i, false).ok().flatten()).collect();
+        frames.sort_by_key(|f| f.seq);
+        Ok(frames)
+    }
+
+    /// The frame with this `seq`, if it is still in the ring.
+    pub fn read_seq(&mut self, seq: u64) -> Result<Option<EyeFrame>> {
+        let Some(ring) = self.ring()? else { return Ok(None) };
+        if seq < 2 {
+            return Ok(None);
+        }
+        let slot = ((seq / 2 - 1) % ring.slots as u64) as usize;
+        Ok(ring.slot(slot, true)?.filter(|f| f.seq == seq))
+    }
+
+    fn latest(&mut self, pixels: bool) -> Result<Option<EyeFrame>> {
+        for _ in 0..100 {
+            let Some(ring) = self.ring()? else { return Ok(None) };
+            let n = ring.written();
+            if n == 0 {
+                return Ok(None);
+            }
+            let slot = ((n - 1) % ring.slots as u64) as usize;
+            if let Some(frame) = ring.slot(slot, pixels)? {
+                if frame.seq == 2 * n {
+                    return Ok(Some(frame));
+                }
+            }
+            // Overwritten while reading, or a newer frame meanwhile: again.
+        }
+        bail!("the tap kept being written")
+    }
+
+    /// The ring as mapped now (remapped when Monado resized it).
+    fn ring(&mut self) -> Result<Option<Ring<'_>>> {
+        let len = std::fs::metadata(&self.path)
+            .with_context(|| format!("no tap at {}", self.path.display()))?
+            .len() as usize;
+        if len < HEADER_SIZE {
+            return Ok(None);
+        }
+        if self.map.as_ref().map(|m| m.len()) != Some(len) {
+            let file = File::open(&self.path)?;
+            // SAFETY: Monado only writes a slot inside its seqlock, which
+            // the reads check; it resizes the file only when the eyes change
+            // size, and a size change is noticed here and mapped again.
+            self.map = Some(unsafe { Mmap::map(&file)? });
+        }
+        let map = self.map.as_ref().unwrap();
+        if &map[..8] != MAGIC {
+            return Ok(None);
+        }
+        let slots = u32::from_le_bytes(map[8..12].try_into().unwrap()) as usize;
+        let slot_size = u64::from_le_bytes(map[16..24].try_into().unwrap()) as usize;
+        if slots == 0 || HEADER_SIZE + slots * slot_size > map.len() {
+            return Ok(None);
+        }
+        Ok(Some(Ring { map, slots, slot_size }))
+    }
+}
+
+struct Ring<'a> {
+    map: &'a Mmap,
+    slots: usize,
+    slot_size: usize,
+}
+
+impl Ring<'_> {
+    fn written(&self) -> u64 {
+        // SAFETY: offset 24 of a page-aligned mapping is 8-aligned.
+        unsafe { &*(self.map.as_ptr().add(24) as *const AtomicU64) }.load(Ordering::Acquire)
+    }
+
+    /// Slot `i` if it holds a whole frame (waits out a write in progress).
+    fn slot(&self, i: usize, pixels: bool) -> Result<Option<EyeFrame>> {
+        let base = HEADER_SIZE + i * self.slot_size;
+        let bytes = &self.map[base..base + self.slot_size];
+        // SAFETY: slots start 512 + k * slot size in, and slot sizes (512 +
+        // whole 4-byte pixels for two eyes) are multiples of 8, so +8 is 8-aligned.
+        let seq_cell = unsafe { &*(bytes.as_ptr().add(8) as *const AtomicU64) };
         for _ in 0..200 {
-            let len = std::fs::metadata(&self.path)
-                .with_context(|| format!("no tap at {}", self.path.display()))?
-                .len() as usize;
-            if len < HEADER_SIZE {
-                return Ok(None);
-            }
-            // The tap resizes the file when the eyes change size: map again.
-            if self.map.as_ref().map(|m| m.len()) != Some(len) {
-                let file = File::open(&self.path)?;
-                // SAFETY: Monado only writes inside the seqlock, which the
-                // copy below checks; the file is never shrunk under a reader
-                // that mapped its current size, as sizes only change with
-                // the eyes (a remap above).
-                self.map = Some(unsafe { Mmap::map(&file)? });
-            }
-            let map = self.map.as_ref().unwrap();
-            if &map[..8] != MAGIC {
-                return Ok(None);
-            }
-            // SAFETY: offset 8 of a page-aligned mapping is 8-aligned.
-            let seq_cell = unsafe { &*(map.as_ptr().add(8) as *const AtomicU64) };
             let seq = seq_cell.load(Ordering::Acquire);
-            if seq == 0 || seq % 2 == 1 {
-                sleep(Duration::from_millis(2));
+            if seq == 0 {
+                return Ok(None);
+            }
+            if seq % 2 == 1 {
+                sleep(Duration::from_micros(500));
                 continue;
             }
-            let header: [u8; HEADER_SIZE] = map[..HEADER_SIZE].try_into().unwrap();
-            let data = if pixels { map[HEADER_SIZE..].to_vec() } else { Vec::new() };
+            let header: [u8; HEADER_SIZE] = bytes[..HEADER_SIZE].try_into().unwrap();
+            let data = if pixels { bytes[HEADER_SIZE..].to_vec() } else { Vec::new() };
             fence(Ordering::Acquire);
             if seq_cell.load(Ordering::Relaxed) != seq {
                 continue;
             }
-            let frame = parse(seq, &header, data)?;
+            let frame = parse(seq, &header, data);
             if pixels && frame.pixels.len() < 2 * frame.eye_bytes() {
-                bail!("tap holds {} bytes of pixels, the header says {}", frame.pixels.len(), 2 * frame.eye_bytes());
+                bail!("a tap slot holds {} bytes, the frame needs {}", frame.pixels.len(), 2 * frame.eye_bytes());
             }
             return Ok(Some(frame));
         }
-        bail!("the tap kept being written")
+        bail!("tap slot {i} kept being written")
     }
 }
 
-fn parse(seq: u64, h: &[u8; HEADER_SIZE], pixels: Vec<u8>) -> Result<EyeFrame> {
+fn parse(seq: u64, h: &[u8; HEADER_SIZE], pixels: Vec<u8>) -> EyeFrame {
     let i64_at = |at: usize| i64::from_le_bytes(h[at..at + 8].try_into().unwrap());
     let u32_at = |at: usize| u32::from_le_bytes(h[at..at + 4].try_into().unwrap());
     let f32_at = |at: usize| f32::from_le_bytes(h[at..at + 4].try_into().unwrap());
@@ -168,7 +249,7 @@ fn parse(seq: u64, h: &[u8; HEADER_SIZE], pixels: Vec<u8>) -> Result<EyeFrame> {
             pose: Pose { orientation: [f(4), f(5), f(6), f(7)], position: [f(8), f(9), f(10)] },
         }
     };
-    let frame = EyeFrame {
+    EyeFrame {
         seq,
         frame_id: i64_at(16),
         display_time_ns: i64_at(24),
@@ -179,29 +260,53 @@ fn parse(seq: u64, h: &[u8; HEADER_SIZE], pixels: Vec<u8>) -> Result<EyeFrame> {
         bytes_per_pixel: u32_at(52),
         views: [view(56), view(100)],
         pixels,
-    };
-    Ok(frame)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    /// A ring file as Monado writes it: 3 slots, 2x1 eyes, `frames` written.
+    fn ring_file(frames: u64) -> PathBuf {
+        let slot_size = HEADER_SIZE + 2 * 2 * 4;
+        let mut buf = vec![0u8; HEADER_SIZE + 3 * slot_size];
+        buf[..8].copy_from_slice(MAGIC);
+        buf[8..12].copy_from_slice(&3u32.to_le_bytes());
+        buf[16..24].copy_from_slice(&(slot_size as u64).to_le_bytes());
+        buf[24..32].copy_from_slice(&frames.to_le_bytes());
+        for n in frames.saturating_sub(2).max(1)..=frames {
+            let s = HEADER_SIZE + ((n - 1) % 3) as usize * slot_size;
+            buf[s..s + 8].copy_from_slice(b"MNDSLOT1");
+            buf[s + 8..s + 16].copy_from_slice(&(2 * n).to_le_bytes());
+            buf[s + 16..s + 24].copy_from_slice(&(n as i64).to_le_bytes());
+            for (at, v) in [(40, 2u32), (44, 1), (48, format::B8G8R8A8_SRGB), (52, 4)] {
+                buf[s + at..s + at + 4].copy_from_slice(&v.to_le_bytes());
+            }
+            buf[s + 88..s + 92].copy_from_slice(&(-0.0315f32).to_le_bytes());
+            buf[s + 132..s + 136].copy_from_slice(&0.0315f32.to_le_bytes());
+            let px = [1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, n as u8, 255];
+            buf[s + HEADER_SIZE..s + HEADER_SIZE + 16].copy_from_slice(&px);
+        }
+        let path = std::env::temp_dir().join(format!("vrc-tap-test-{frames}-{}", std::process::id()));
+        File::create(&path).unwrap().write_all(&buf).unwrap();
+        path
+    }
 
     #[test]
-    fn parses_what_the_tap_writes() {
-        let mut h = [0u8; HEADER_SIZE];
-        h[..8].copy_from_slice(MAGIC);
-        h[16..24].copy_from_slice(&7i64.to_le_bytes());
-        for (at, v) in [(40, 2u32), (44, 1), (48, format::B8G8R8A8_SRGB), (52, 4)] {
-            h[at..at + 4].copy_from_slice(&v.to_le_bytes());
-        }
-        // right eye position x at 100 + 4 * 8
-        h[132..136].copy_from_slice(&0.0315f32.to_le_bytes());
-        h[88..92].copy_from_slice(&(-0.0315f32).to_le_bytes());
-        let pixels = vec![1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255];
-        let f = parse(2, &h, pixels).unwrap();
-        assert_eq!((f.frame_id, f.width, f.height), (7, 2, 1));
-        assert_eq!(f.eye_rgb8(1).unwrap(), vec![9, 8, 7, 12, 11, 10]);
+    fn reads_the_ring() {
+        let path = ring_file(5);
+        let mut tap = EyeTap::open(&path);
+        assert_eq!(tap.written().unwrap(), 5);
+        let f = tap.read().unwrap().unwrap();
+        assert_eq!((f.seq, f.frame_id, f.width, f.height), (10, 5, 2, 1));
+        assert_eq!(f.eye_rgb8(1).unwrap(), vec![9, 8, 7, 5, 11, 10]);
         assert!((f.baseline() - 0.063).abs() < 1e-6);
+        let all: Vec<i64> = tap.peek_all().unwrap().iter().map(|f| f.frame_id).collect();
+        assert_eq!(all, vec![3, 4, 5]);
+        assert_eq!(tap.read_seq(8).unwrap().unwrap().frame_id, 4);
+        assert!(tap.read_seq(4).unwrap().is_none()); // frame 2: overwritten by frame 5
+        std::fs::remove_file(path).ok();
     }
 }

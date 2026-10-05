@@ -10,7 +10,8 @@
 | `crates/vrc-stereo` | 新增。纯 Rust 实现的 SGM：7x7 census、8 方向聚合、亚像素、唯一性检查、左右一致性检查（rayon 并行）。`Stereo` 从抓帧构造（可缩小分辨率），输出深度和可追踪空间里的点云；`fit_floor` 用高度直方图找地面再做平面拟合。3 个单元测试，包括一个合成的双平面场景。 |
 | `crates/vrc-vr` 的 `scan` 模块 | 新增。按给定的一组偏航/俯仰依次转头，每个方向等到按该姿态渲染出的第一帧，结束后回到原来的姿态；`EyeTap::peek` 只读帧头，`Pose::unrotate` |
 | `crates/vrc-scene` | 新增。`Panorama::stitch`：用每帧的位姿把多张左眼图拼成等距柱状全景。`HeightMap`：2.5 维栅格，以拟合出的地面为基准，把每个格子分为地面、障碍、高台、未知，并能画成俯视图。 |
-| `vr-probe scan` | 新增。头部扫描后输出全景图和高度图 |
+| `vr-probe scan` | 新增。头部扫描后输出全景图和高度图；`--boost N` 扫描期间临时提高帧率，扫完恢复原帧率；`--hold-ms` 改用流水线扫描 |
+| `crates/vrc-vr` 的 `fps` 模块、`scan_pipelined` | 新增。`FpsControl` 读写 Monado 的帧率控制文件；`scan_pipelined` 不等每个方向的画面回来就转到下一个方向，再按位姿从环形缓冲区里认领画面，漏掉的方向最后逐个补拍 |
 | `astrbot_plugin/` | 由根目录移入：`main.py`、`vrchat_adapter.py`、`metadata.yaml`、`logo.svg`，内容未改 |
 | `legacy/bridge/` | 由 `bridge/` 移入，内容未改（桌面模式仍可用） |
 | `third_party/` | Monado、xrizer 的基础提交说明和补丁 |
@@ -44,6 +45,16 @@
   - 新增 `r_hmd_get_visibility_mask`：隐藏网格为空，可见网格是整个视野的四边形，轮廓是矩形；
   - 水平视场改为读 `XRT_REMOTE_FOV_DEG`（默认 85）。
 - 配置：`ops/vr/config_v0.json` 改为 2560x1280 像素、0.12x0.06 米，也就是每只眼 1280x1280 的正方形；`vrc-monado.service` 加上 `XRT_REMOTE_FOV_DEG=100`。
+
+### Monado：`third_party/monado/patches/0003-null-compositor-runtime-fps.patch`
+
+- `u_pacing.h` / `u_pacing_compositor_fake.c`：新增 `u_pc_fake_set_frame_period`，运行中修改假节拍器的帧间隔，合成时间按原规则重新计算。
+- `null_compositor.c/.h`：如果设置了 `XRT_NULL_FPS_FILE`，就映射一个 8 字节的控制文件（[0] 请求的帧率，0 表示回到默认值；[1] 当前帧率）；每次预测帧之前检查一下，请求变了就改节拍（上限 240）。
+
+### Monado 补丁 0001 第二版：抓帧改为环形缓冲区
+
+- 文件头 `MNDTAP02`：槽数（`XRT_NULL_TAP_SLOTS`，默认 8）、槽大小、已写帧数；每个槽是原来的 512 字节帧头（`MNDSLOT1`）加像素。帧头的 seq 等于 2n，表示第 n 帧，写入中为奇数。
+- Rust 端：`EyeTap::written`、`peek_all`（所有槽的帧头）、`read_seq`（按 seq 读取，帧已被覆盖时返回 None）。
 
 ### xrizer：`third_party/xrizer/patches/0001-swapchain-transfer-src.patch`
 

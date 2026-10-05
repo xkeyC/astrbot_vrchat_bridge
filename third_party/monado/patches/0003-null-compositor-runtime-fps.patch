@@ -1,0 +1,223 @@
+diff -ruN a/src/xrt/auxiliary/util/u_pacing.h b/src/xrt/auxiliary/util/u_pacing.h
+--- a/src/xrt/auxiliary/util/u_pacing.h
++++ b/src/xrt/auxiliary/util/u_pacing.h
+@@ -750,6 +750,15 @@
+ u_pc_fake_create(int64_t estimated_frame_period_ns, int64_t now_ns, struct u_pacing_compositor **out_upc);
+ 
+ /*!
++ * vrc fork: changes the frame period of a helper made by @ref u_pc_fake_create,
++ * from the next prediction on (the composition time follows, as at creation).
++ *
++ * @ingroup aux_pacing
++ */
++void
++u_pc_fake_set_frame_period(struct u_pacing_compositor *upc, int64_t frame_period_ns);
++
++/*!
+  * Creates a new application pacing factory helper.
+  *
+  * @ingroup aux_pacing
+diff -ruN a/src/xrt/auxiliary/util/u_pacing_compositor_fake.c b/src/xrt/auxiliary/util/u_pacing_compositor_fake.c
+--- a/src/xrt/auxiliary/util/u_pacing_compositor_fake.c
++++ b/src/xrt/auxiliary/util/u_pacing_compositor_fake.c
+@@ -456,6 +456,32 @@
+  *
+  */
+ 
++/*!
++ * The composition time: a percentage of the frame period, or at least a
++ * certain amount of time.
++ */
++static void
++set_comp_time(struct fake_timing *ft)
++{
++	float comp_time_fraction_percent = fabsf(debug_get_float_option_comp_time_fraction_percent());
++	ft->comp_time_ns = get_percent_of_time(ft->frame_period_ns, comp_time_fraction_percent);
++
++	double min_comp_time_ms_f = debug_get_float_option_min_comp_time_ms();
++	int64_t min_comp_time_ns = time_ms_f_to_ns(min_comp_time_ms_f);
++
++	if (ft->comp_time_ns < min_comp_time_ns) {
++		ft->comp_time_ns = min_comp_time_ns;
++	}
++}
++
++void
++u_pc_fake_set_frame_period(struct u_pacing_compositor *upc, int64_t frame_period_ns)
++{
++	struct fake_timing *ft = fake_timing(upc);
++	ft->frame_period_ns = frame_period_ns;
++	set_comp_time(ft);
++}
++
+ xrt_result_t
+ u_pc_fake_create(int64_t estimated_frame_period_ns, int64_t now_ns, struct u_pacing_compositor **out_upc)
+ {
+@@ -487,17 +513,7 @@
+ 	    .max = +40.0,
+ 	};
+ 
+-	// Set comp_time_ms to a percentage of the frame time.
+-	float comp_time_fraction_percent = fabsf(debug_get_float_option_comp_time_fraction_percent());
+-	ft->comp_time_ns = get_percent_of_time(estimated_frame_period_ns, comp_time_fraction_percent);
+-
+-	// Or at least a certain amount of time.
+-	double min_comp_time_ms_f = debug_get_float_option_min_comp_time_ms();
+-	int64_t min_comp_time_ns = time_ms_f_to_ns(min_comp_time_ms_f);
+-
+-	if (ft->comp_time_ns < min_comp_time_ns) {
+-		ft->comp_time_ns = min_comp_time_ns;
+-	}
++	set_comp_time(ft);
+ 
+ 	// Make the next present time be in the future.
+ 	ft->last_present_time_ns = now_ns + U_TIME_1MS_IN_NS * 50;
+@@ -518,8 +534,8 @@
+ 	    "\n\tpercentage: %f%%"
+ 	    "\n\tmin_comp_time: %fms"
+ 	    "\n\tcomp_time: %fms",
+-	    time_ns_to_ms_f(estimated_frame_period_ns), comp_time_fraction_percent, min_comp_time_ms_f,
+-	    time_ns_to_ms_f(ft->comp_time_ns));
++	    time_ns_to_ms_f(estimated_frame_period_ns), fabsf(debug_get_float_option_comp_time_fraction_percent()),
++	    debug_get_float_option_min_comp_time_ms(), time_ns_to_ms_f(ft->comp_time_ns));
+ 
+ 	return XRT_SUCCESS;
+ }
+diff -ruN a/src/xrt/compositor/null/null_compositor.c b/src/xrt/compositor/null/null_compositor.c
+--- a/src/xrt/compositor/null/null_compositor.c
++++ b/src/xrt/compositor/null/null_compositor.c
+@@ -34,11 +34,18 @@
+ #include "xrt/xrt_device.h"
+ 
+ 
++#include <fcntl.h>
+ #include <stdint.h>
+ #include <stdio.h>
++#include <sys/mman.h>
++#include <unistd.h>
+ 
+ DEBUG_GET_ONCE_LOG_OPTION(log, "XRT_COMPOSITOR_LOG", U_LOGGING_INFO)
+ DEBUG_GET_ONCE_NUM_OPTION(fps, "XRT_COMPOSITOR_NULL_FPS", 20)
++DEBUG_GET_ONCE_OPTION(fps_file, "XRT_NULL_FPS_FILE", NULL)
++
++//! vrc fork: the highest rate the control file may ask for.
++#define NULL_FPS_MAX 240
+ 
+ 
+ /*
+@@ -380,6 +387,57 @@
+ 	return XRT_SUCCESS;
+ }
+ 
++/*!
++ * vrc fork: maps the frame rate control file (XRT_NULL_FPS_FILE), two u32:
++ * the rate asked for and the rate in use.
++ */
++static void
++fps_ctl_init(struct null_compositor *c)
++{
++	const char *path = debug_get_option_fps_file();
++	if (path == NULL || path[0] == '\0') {
++		return;
++	}
++	int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0666);
++	if (fd < 0 || ftruncate(fd, 8) != 0) {
++		NULL_ERROR(c, "Cannot open the frame rate control '%s'", path);
++		if (fd >= 0) {
++			close(fd);
++		}
++		return;
++	}
++	void *map = mmap(NULL, 8, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++	close(fd);
++	if (map == MAP_FAILED) {
++		return;
++	}
++	c->fps_ctl = map;
++	__atomic_store_n(&c->fps_ctl[0], 0, __ATOMIC_RELAXED);
++	__atomic_store_n(&c->fps_ctl[1], c->fps_now, __ATOMIC_RELAXED);
++	NULL_INFO(c, "Frame rate control at '%s' (default %u fps)", path, c->fps_now);
++}
++
++//! vrc fork: follows the rate the control file asks for.
++static void
++fps_ctl_follow(struct null_compositor *c)
++{
++	if (c->fps_ctl == NULL) {
++		return;
++	}
++	uint32_t want = __atomic_load_n(&c->fps_ctl[0], __ATOMIC_RELAXED);
++	if (want == 0 || want > NULL_FPS_MAX) {
++		want = c->fps_default;
++	}
++	if (want == c->fps_now) {
++		return;
++	}
++	u_pc_fake_set_frame_period(c->upc, U_TIME_1S_IN_NS / want);
++	c->settings.frame_interval_ns = U_TIME_1S_IN_NS / want;
++	c->fps_now = want;
++	__atomic_store_n(&c->fps_ctl[1], want, __ATOMIC_RELAXED);
++	NULL_DEBUG(c, "Frame rate now %u fps", want);
++}
++
+ static xrt_result_t
+ null_compositor_predict_frame(struct xrt_compositor *xc,
+                               int64_t *out_frame_id,
+@@ -398,6 +456,8 @@
+ 	int64_t null_present_slop_ns = 0;
+ 	int64_t null_min_display_period_ns = 0;
+ 
++	fps_ctl_follow(c);
++
+ 	u_pc_predict(                        //
+ 	    c->upc,                          // upc
+ 	    now_ns,                          // now_ns
+@@ -541,6 +601,10 @@
+ 	comp_swapchain_shared_garbage_collect(&c->base.cscs);
+ 
+ 	null_tap_destroy(&c->tap, vk);
++	if (c->fps_ctl != NULL) {
++		munmap((void *)c->fps_ctl, 8);
++		c->fps_ctl = NULL;
++	}
+ 
+ 	// Must be destroyed before Vulkan.
+ 	comp_swapchain_shared_destroy(&c->base.cscs, vk);
+@@ -627,6 +691,8 @@
+ 		fps = 20;
+ 	}
+ 	c->settings.frame_interval_ns = U_TIME_1S_IN_NS / fps;
++	c->fps_default = (uint32_t)fps;
++	c->fps_now = (uint32_t)fps;
+ 	c->xdev = xdev;
+ 
+ 	NULL_DEBUG(c, "Doing init %p", (void *)c);
+@@ -662,6 +728,7 @@
+ 
+ 
+ 	c->tap = null_tap_create(get_vk(c));
++	fps_ctl_init(c);
+ 
+ 	NULL_DEBUG(c, "Done %p", (void *)c);
+ 
+diff -ruN a/src/xrt/compositor/null/null_compositor.h b/src/xrt/compositor/null/null_compositor.h
+--- a/src/xrt/compositor/null/null_compositor.h
++++ b/src/xrt/compositor/null/null_compositor.h
+@@ -104,6 +104,17 @@
+ 	//! The frame tap (XRT_NULL_TAP), NULL when off.
+ 	struct null_tap *tap;
+ 
++	/*!
++	 * vrc fork: frame rate control (XRT_NULL_FPS_FILE), NULL when off.
++	 * [0]: the rate asked for (0: back to XRT_COMPOSITOR_NULL_FPS), written by
++	 * clients; [1]: the rate in use, written here.
++	 */
++	uint32_t *fps_ctl;
++	//! The rate in use, frames per second.
++	uint32_t fps_now;
++	//! XRT_COMPOSITOR_NULL_FPS.
++	uint32_t fps_default;
++
+ 	struct
+ 	{
+ 		struct null_comp_frame waited;

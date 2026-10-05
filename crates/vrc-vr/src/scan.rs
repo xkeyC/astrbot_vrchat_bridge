@@ -49,6 +49,74 @@ pub fn scan(hmd: &mut RemoteHmd, tap: &mut EyeTap, views: &[(f32, f32)], timeout
     result.map(|()| shots)
 }
 
+/// Like [`scan`], but without waiting for each view's frame before the next:
+/// the head moves on every `hold`, and frames are claimed by the pose they
+/// were rendered with as they come back (the render pipeline is ~40 ms deep,
+/// so waiting view by view leaves the GPU idle). Views no frame came back for
+/// are then taken one by one.
+pub fn scan_pipelined(
+    hmd: &mut RemoteHmd,
+    tap: &mut EyeTap,
+    views: &[(f32, f32)],
+    hold: Duration,
+    timeout: Duration,
+) -> Result<Vec<Shot>> {
+    let home = hmd.state.head;
+    let started = Instant::now();
+    let mut got: Vec<Option<Shot>> = views.iter().map(|_| None).collect();
+    let result = (|| {
+        let mut next = 0usize;
+        let mut switch_at = started;
+        let mut written = tap.written()?;
+        let mut checked = 2 * written; // frames up to this seq are older than the scan
+        let deadline = started + hold * views.len() as u32 + Duration::from_millis(400);
+        while Instant::now() < deadline && got.iter().any(Option::is_none) {
+            let now = Instant::now();
+            if next < views.len() && now >= switch_at {
+                let (yaw, pitch) = views[next];
+                hmd.set_head(Pose::looking(yaw, pitch, home.position))?;
+                next += 1;
+                switch_at = now + hold;
+            }
+            let n = tap.written()?;
+            if n != written {
+                written = n;
+                // The ring keeps the last few frames: claim each new one by its pose.
+                for head in tap.peek_all()? {
+                    if head.seq <= checked {
+                        continue;
+                    }
+                    checked = head.seq;
+                    let (y, p) = head.views[0].pose.yaw_pitch();
+                    let hit = views.iter().enumerate().position(|(i, &(yaw, pitch))| {
+                        got[i].is_none()
+                            && angle_diff(y, yaw).abs() < AIM_TOLERANCE_DEG
+                            && (p - pitch).abs() < AIM_TOLERANCE_DEG
+                    });
+                    if let Some(i) = hit {
+                        if let Some(frame) = tap.read_seq(head.seq)? {
+                            let (yaw, pitch) = views[i];
+                            got[i] = Some(Shot { yaw, pitch, frame, waited: started.elapsed() });
+                        }
+                    }
+                }
+            }
+            sleep(Duration::from_micros(500));
+        }
+        // Whatever the stream missed, one by one.
+        for (i, &(yaw, pitch)) in views.iter().enumerate() {
+            if got[i].is_none() {
+                hmd.set_head(Pose::looking(yaw, pitch, home.position))?;
+                let frame = rendered_at(tap, yaw, pitch, timeout)?;
+                got[i] = Some(Shot { yaw, pitch, frame, waited: started.elapsed() });
+            }
+        }
+        Ok(())
+    })();
+    hmd.set_head(home)?;
+    result.map(|()| got.into_iter().flatten().collect())
+}
+
 /// The first frame rendered looking at `yaw`, `pitch` (polls the tap's header).
 pub fn rendered_at(tap: &mut EyeTap, yaw: f32, pitch: f32, timeout: Duration) -> Result<EyeFrame> {
     let started = Instant::now();

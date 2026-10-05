@@ -12,7 +12,11 @@ Environment=XRT_COMPOSITOR_NULL_FPS=30
 # Square eyes (config_v0.json: 1280x1280 each, 0.06 m square) at 100 degrees.
 Environment=XRT_REMOTE_FOV_DEG=100
 Environment=XRT_NULL_TAP=/dev/shm/vrc-eyes
-Environment=XRT_NULL_TAP_FPS=10
+# Every frame, into a ring of 8 (head scans claim frames by pose).
+Environment=XRT_NULL_TAP_FPS=0
+Environment=XRT_NULL_TAP_SLOTS=8
+# Frame rate changes while running (vrc_vr::fps).
+Environment=XRT_NULL_FPS_FILE=/dev/shm/vrc-fps
 ExecStart=/bin/sh -c 'exec "$VR_ROOT/prefix/bin/monado-service"'
 Restart=on-failure
 

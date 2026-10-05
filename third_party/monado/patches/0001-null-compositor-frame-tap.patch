@@ -64,18 +64,28 @@ diff -ruN a/src/xrt/compositor/null/null_compositor.h b/src/xrt/compositor/null/
 diff -ruN a/src/xrt/compositor/null/null_tap.c b/src/xrt/compositor/null/null_tap.c
 --- a/src/xrt/compositor/null/null_tap.c
 +++ b/src/xrt/compositor/null/null_tap.c
-@@ -0,0 +1,335 @@
+@@ -0,0 +1,377 @@
 +// Copyright 2026, xkeyC.
 +// SPDX-License-Identifier: BSL-1.0
 +/*!
 + * @file
 + * @brief  Frame tap of the null compositor: the eyes an app submits, to shared memory.
 + *
-+ * The file XRT_NULL_TAP holds a 512 byte header and then both eyes' pixels,
-+ * rows tightly packed, left eye first, as the app's swapchain format has them:
++ * The file XRT_NULL_TAP is a ring of XRT_NULL_TAP_SLOTS (default 8) frames,
++ * so a reader busy copying one frame does not miss the next ones:
 + *
-+ *     0   char[8]   magic "MNDTAP01"
-+ *     8   u64       seq: odd while a frame is being written (a seqlock)
++ *     0   char[8]   magic "MNDTAP02"
++ *     8   u32       slots
++ *     16  u64       slot size (bytes)
++ *     24  u64       frames written so far; the latest is in slot (n - 1) % slots
++ *     512 the slots
++ *
++ * A slot is a 512 byte header and then both eyes' pixels, rows tightly
++ * packed, left eye first, as the app's swapchain format has them:
++ *
++ *     0   char[8]   "MNDSLOT1"
++ *     8   u64       seq: 2n while frame n (from 1) is there, odd while being written
++ *                   (a seqlock; also tells frames apart across slots)
 + *     16  i64       frame_id
 + *     24  i64       display_time_ns (the time the app rendered for)
 + *     32  i64       capture_ns (CLOCK_MONOTONIC)
@@ -112,8 +122,19 @@ diff -ruN a/src/xrt/compositor/null/null_tap.c b/src/xrt/compositor/null/null_ta
 +
 +DEBUG_GET_ONCE_OPTION(tap_path, "XRT_NULL_TAP", NULL)
 +DEBUG_GET_ONCE_NUM_OPTION(tap_fps, "XRT_NULL_TAP_FPS", 10)
++DEBUG_GET_ONCE_NUM_OPTION(tap_slots, "XRT_NULL_TAP_SLOTS", 8)
 +
 +#define TAP_HEADER_SIZE 512
++#define TAP_MAX_SLOTS 64
++
++struct tap_file
++{
++	char magic[8];
++	uint32_t slots;
++	uint32_t pad;
++	uint64_t slot_size;
++	_Atomic uint64_t written;
++};
 +
 +struct tap_view
 +{
@@ -144,6 +165,8 @@ diff -ruN a/src/xrt/compositor/null/null_tap.c b/src/xrt/compositor/null/null_ta
 +	int fd;
 +	uint8_t *map;
 +	size_t map_size;
++	uint32_t slots;
++	size_t slot_size;
 +
 +	VkBuffer buffer;
 +	VkDeviceMemory memory;
@@ -187,13 +210,17 @@ diff -ruN a/src/xrt/compositor/null/null_tap.c b/src/xrt/compositor/null/null_ta
 +	tap->fd = fd;
 +	int64_t fps = debug_get_num_option_tap_fps();
 +	tap->interval_ns = fps > 0 ? U_TIME_1S_IN_NS / fps : 0;
-+	U_LOG_I("null tap: eyes to '%s' at up to %d fps", path, (int)fps);
++	int64_t slots = debug_get_num_option_tap_slots();
++	tap->slots = (uint32_t)(slots < 1 ? 1 : slots > TAP_MAX_SLOTS ? TAP_MAX_SLOTS : slots);
++	U_LOG_I("null tap: eyes to '%s' at up to %d fps (0: all), %u slots", path, (int)fps, tap->slots);
 +	return tap;
 +}
 +
++//! Maps the ring for slots of `slot_size` bytes (a new, empty ring when it changes).
 +static bool
-+ensure_map(struct null_tap *tap, size_t size)
++ensure_map(struct null_tap *tap, size_t slot_size)
 +{
++	size_t size = TAP_HEADER_SIZE + slot_size * tap->slots;
 +	if (tap->map_size == size) {
 +		return true;
 +	}
@@ -211,7 +238,18 @@ diff -ruN a/src/xrt/compositor/null/null_tap.c b/src/xrt/compositor/null/null_ta
 +	}
 +	tap->map = map;
 +	tap->map_size = size;
-+	memcpy(tap->map, "MNDTAP01", 8);
++	tap->slot_size = slot_size;
++	memset(tap->map, 0, TAP_HEADER_SIZE);
++	for (uint32_t i = 0; i < tap->slots; i++) {
++		uint8_t *slot = tap->map + TAP_HEADER_SIZE + slot_size * i;
++		memset(slot, 0, TAP_HEADER_SIZE);
++		memcpy(slot, "MNDSLOT1", 8);
++	}
++	struct tap_file *file = (struct tap_file *)tap->map;
++	file->slots = tap->slots;
++	file->slot_size = slot_size;
++	atomic_store(&file->written, 0);
++	memcpy(file->magic, "MNDTAP02", 8);
 +	return true;
 +}
 +
@@ -361,8 +399,11 @@ diff -ruN a/src/xrt/compositor/null/null_tap.c b/src/xrt/compositor/null/null_ta
 +		return;
 +	}
 +
-+	struct tap_header *hdr = (struct tap_header *)tap->map;
-+	uint64_t seq = atomic_load(&hdr->seq) & ~(uint64_t)1;
++	struct tap_file *file = (struct tap_file *)tap->map;
++	uint64_t n = atomic_load(&file->written);
++	uint8_t *slot = tap->map + TAP_HEADER_SIZE + tap->slot_size * (n % tap->slots);
++	struct tap_header *hdr = (struct tap_header *)slot;
++	uint64_t seq = 2 * n; // frame n + 1 ends at 2 (n + 1)
 +	atomic_store(&hdr->seq, seq + 1);
 +	hdr->frame_id = frame_id;
 +	hdr->display_time_ns = accum->data.display_time_ns;
@@ -376,8 +417,9 @@ diff -ruN a/src/xrt/compositor/null/null_tap.c b/src/xrt/compositor/null/null_ta
 +		hdr->array_index[i] = views[i].sub.array_index;
 +	}
 +	hdr->layer_type = (uint32_t)layer->data.type;
-+	memcpy(tap->map + TAP_HEADER_SIZE, tap->buffer_ptr, (size_t)eye_bytes * 2);
++	memcpy(slot + TAP_HEADER_SIZE, tap->buffer_ptr, (size_t)eye_bytes * 2);
 +	atomic_store(&hdr->seq, seq + 2);
++	atomic_store(&file->written, n + 1);
 +	tap->last_ns = now_ns;
 +}
 +

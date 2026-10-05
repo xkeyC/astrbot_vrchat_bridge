@@ -11,6 +11,7 @@
 //!
 //! See `docs/full-vr/` for how the pieces fit and why.
 
+pub mod fps;
 pub mod pose;
 pub mod remote;
 pub mod scan;

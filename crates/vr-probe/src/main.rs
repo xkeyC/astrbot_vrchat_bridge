@@ -17,6 +17,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use vrc_scene::{HeightMap, MapParams, Panorama};
 use vrc_stereo::{fit_floor, SgmParams, Stereo};
+use vrc_vr::fps::FpsControl;
 use vrc_vr::remote::RemoteHmd;
 use vrc_vr::scan;
 use vrc_vr::tap::{EyeFrame, EyeTap};
@@ -30,6 +31,9 @@ struct Cli {
     /// The null compositor's eye tap.
     #[arg(long, default_value = "/dev/shm/vrc-eyes", global = true)]
     tap: PathBuf,
+    /// The null compositor's frame rate control.
+    #[arg(long, default_value = "/dev/shm/vrc-fps", global = true)]
+    fps_file: PathBuf,
     #[command(subcommand)]
     command: Command,
 }
@@ -80,6 +84,13 @@ enum Command {
         /// Also look down at the feet.
         #[arg(long)]
         down: bool,
+        /// Render this fast during the scan (0: as is).
+        #[arg(long, default_value_t = 0)]
+        boost: u32,
+        /// Move the head on every this many ms without waiting for each
+        /// view's frame (0: view by view).
+        #[arg(long, default_value_t = 0)]
+        hold_ms: u64,
     },
 }
 
@@ -113,7 +124,9 @@ fn main() -> Result<()> {
         Command::Depth { prefix, scale, max_disparity } => {
             depth(&latest(&mut tap)?, &prefix, scale, max_disparity)?
         }
-        Command::Scan { ref prefix, count, pitch, down } => scan_around(&cli, &mut tap, prefix, count, pitch, down)?,
+        Command::Scan { ref prefix, count, pitch, down, boost, hold_ms } => {
+            scan_around(&cli, &mut tap, prefix, count, pitch, down, boost, hold_ms)?
+        }
     }
     Ok(())
 }
@@ -224,7 +237,17 @@ fn latest(tap: &mut EyeTap) -> Result<EyeFrame> {
 /// The first frame whose eyes look where the head was just turned.
 /// Head scan: a ring of views (and one looking down at the feet), the
 /// panorama of their left eyes, and a height map from stereo on each.
-fn scan_around(cli: &Cli, tap: &mut EyeTap, prefix: &Path, count: usize, pitch: f32, down: bool) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn scan_around(
+    cli: &Cli,
+    tap: &mut EyeTap,
+    prefix: &Path,
+    count: usize,
+    pitch: f32,
+    down: bool,
+    boost: u32,
+    hold_ms: u64,
+) -> Result<()> {
     if let Some(dir) = prefix.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -236,7 +259,22 @@ fn scan_around(cli: &Cli, tap: &mut EyeTap, prefix: &Path, count: usize, pitch: 
         views.push((0.0, -80.0));
     }
     let started = Instant::now();
-    let shots = scan::scan(&mut hmd, tap, &views, Duration::from_secs(2))?;
+    let fps = if boost > 0 { Some(FpsControl::open(&cli.fps_file)?) } else { None };
+    let mut was = 0;
+    if let Some(fps) = &fps {
+        was = fps.current();
+        let now = fps.set(boost, Duration::from_millis(500));
+        println!("frame rate {was} -> {now} fps in {:.0} ms", started.elapsed().as_secs_f64() * 1e3);
+    }
+    let shots = if hold_ms > 0 {
+        scan::scan_pipelined(&mut hmd, tap, &views, Duration::from_millis(hold_ms), Duration::from_secs(2))
+    } else {
+        scan::scan(&mut hmd, tap, &views, Duration::from_secs(2))
+    };
+    if let Some(fps) = &fps {
+        fps.request(was); // back to the rate before the scan
+    }
+    let shots = shots?;
     let scan_took = started.elapsed();
     for s in &shots {
         println!("  yaw {:+6.1} pitch {:+5.1}: frame {} after {:.0} ms", s.yaw, s.pitch, s.frame.frame_id, s.waited.as_secs_f64() * 1e3);
