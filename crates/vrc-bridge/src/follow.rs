@@ -11,12 +11,13 @@
 //! distance, braking smoothly as it shrinks: a round of the eyes takes
 //! 0.3-0.8 s, and at full stick the avatar runs 4 m/s.
 //!
-//! In the way (each view's points, along the way to the target): a low
-//! obstacle (a step up, a bench: up to JUMP_MAX_M) is jumped with a run-up;
-//! anything else is walked round, along the path a planner finds on a
-//! height map of the view (`vrc_nav::next_waypoint`, the walks' planner).
-//! Pushing without moving (stuck) jumps once, then backs off and turns
-//! aside.
+//! In the way (each view's points, along the way to the target, measured
+//! from the ground just before it): whatever does not reach the eyes is
+//! jumped first, with a run-up (user's rule); what reaches them, or what a
+//! jump did not get past, is walked round, along the path a planner finds
+//! on a height map of the view (`vrc_nav::next_waypoint`, the walks'
+//! planner). Pushing without moving (stuck) jumps once, then backs off and
+//! turns aside.
 //!
 //! Lost, the bot stands and the eyes look around one view at a time,
 //! starting where the target was last seen and widening both ways; the
@@ -82,13 +83,18 @@ const TURN_RATE: f32 = 200.0;
 /// Fixes predict the target's motion at most this far ahead.
 const PREDICT_S: f32 = 1.0;
 const ODOMETRY_KEPT: Duration = Duration::from_secs(4);
-/// Obstacles: counted from this high above the floor (lower ones are
-/// stepped over), jumped up to JUMP_MAX_M (VRChat's default jump clears
-/// about half a metre), with the jump this far before them and a run-up
-/// at least this fast.
-const OBSTACLE_FROM_M: f32 = 0.25;
-const JUMP_MAX_M: f32 = 0.45;
+/// Obstacles: standing more than STEP_M over the ground before them (lower
+/// ones are walked up), with at least OBSTACLE_POINTS points; reaching
+/// within EYE_MARGIN_M of the eyes, walked round, else jumped first, this
+/// far before them, after a run-up at least RUN_UP_SPEED fast.
+const STEP_M: f32 = 0.3;
+const OBSTACLE_POINTS: usize = 4;
+const EYE_MARGIN_M: f32 = 0.25;
 const JUMP_AT_M: f32 = 0.5;
+/// A jump that left the same obstacle (within this) in the way failed:
+/// walk round it for a while.
+const SAME_PLACE_M: f32 = 0.7;
+const NO_JUMP_FOR: Duration = Duration::from_secs(10);
 const RUN_UP_SPEED: f32 = 1.6;
 const JUMP_EVERY: Duration = Duration::from_millis(1500);
 /// A detour is followed this long after the view that planned it.
@@ -148,6 +154,10 @@ struct Track {
     obstacle: Option<Obstacle>,
     /// A way round it: (until when, heading).
     detour: Option<(Instant, f32)>,
+    /// The last jump: when, and where the obstacle stood (odometry).
+    jumped: Option<(Instant, [f32; 2])>,
+    /// Obstacles a jump did not get past (odometry), until when.
+    no_jump: Vec<([f32; 2], Instant)>,
 }
 
 /// Something in the way (world metres).
@@ -156,9 +166,10 @@ struct Obstacle {
     /// The heading it lies along, and the odometry then.
     yaw: f32,
     then: [f32; 2],
-    /// How far along the heading, and how high its top above the floor.
+    /// How far along the heading.
     distance: f32,
-    top: f32,
+    /// To be jumped (else walked round).
+    jump: bool,
 }
 
 impl Obstacle {
@@ -172,29 +183,68 @@ impl Obstacle {
         Some(self.distance - ((pos[0] - self.then[0]) * s - (pos[1] - self.then[1]) * c))
     }
 
-    fn jumpable(&self) -> bool {
-        self.top <= JUMP_MAX_M
+    /// Where it stands (odometry).
+    fn place(&self) -> [f32; 2] {
+        let (s, c) = self.yaw.to_radians().sin_cos();
+        [self.then[0] + s * self.distance, self.then[1] - c * self.distance]
     }
 }
 
-/// The nearest thing along `yaw` from `eye` in a corridor half a metre wide
-/// (world metres), and the top of it (the highest point within 0.4 m past
-/// its front): `None` when the way is clear. Points nearer than 0.35 m are
-/// the bot's own arm (a gesture).
-fn corridor(points: &[[f32; 3]], eye: [f32; 3], yaw: f32, metres: f32, floor: f32) -> Option<(f32, f32)> {
+/// What stands in the way, from the view's points (world metres).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Blocker {
+    /// How far ahead its front is.
+    distance: f32,
+    /// Its top over the ground before it.
+    top: f32,
+    /// It reaches (nearly) up to the eyes: no jumping that.
+    tall: bool,
+}
+
+/// The first thing in the way along `yaw` from `eye`, in a corridor half a
+/// metre wide out to 4 m; `None` when the way is clear. The ground is
+/// followed along the corridor (slopes, steps), so a raised floor is not in
+/// the way; something stands in the way when it rises more than a step
+/// over the ground before it. Points nearer than 0.35 m are the bot's own
+/// arm (a gesture).
+fn corridor(points: &[[f32; 3]], eye: [f32; 3], yaw: f32, metres: f32, floor: f32) -> Option<Blocker> {
+    const BIN: f32 = 0.1;
+    const FROM: f32 = 0.35;
+    const BINS: usize = 37;
     let (s, c) = yaw.to_radians().sin_cos();
-    let along = |p: &[f32; 3]| {
-        let (dx, dz) = (p[0] - eye[0], p[2] - eye[2]);
-        ((dx * s - dz * c) * metres, (dx * c + dz * s) * metres, (p[1] - floor) * metres)
-    };
     let eye_m = (eye[1] - floor) * metres;
-    let inside = |a: &(f32, f32, f32)| a.0 > 0.35 && a.1.abs() < 0.25 && a.2 > OBSTACLE_FROM_M && a.2 < eye_m;
-    let near = points.iter().map(along).filter(inside).map(|a| a.0).fold(f32::INFINITY, f32::min);
-    if !near.is_finite() {
-        return None;
+    // Per 10 cm along the way: the heights of the points in it.
+    let mut bins: Vec<Vec<(f32, f32)>> = vec![Vec::new(); BINS];
+    for p in points {
+        let (dx, dz) = (p[0] - eye[0], p[2] - eye[2]);
+        let (ahead, side, up) = ((dx * s - dz * c) * metres, (dx * c + dz * s) * metres, (p[1] - floor) * metres);
+        if ahead > FROM && side.abs() < 0.25 && up < eye_m + 0.3 {
+            let i = ((ahead - FROM) / BIN) as usize;
+            if i < BINS {
+                bins[i].push((ahead, up));
+            }
+        }
     }
-    let top = points.iter().map(along).filter(inside).filter(|a| a.0 < near + 0.4).map(|a| a.2).fold(0.0, f32::max);
-    Some((near, top))
+    let mut ground = 0.0f32;
+    for (i, bin) in bins.iter().enumerate() {
+        if bin.is_empty() {
+            continue;
+        }
+        let above: Vec<(f32, f32)> = bin.iter().copied().filter(|&(_, up)| up > ground + STEP_M).collect();
+        if above.len() >= OBSTACLE_POINTS {
+            let distance = above.iter().map(|a| a.0).fold(f32::INFINITY, f32::min);
+            // Its top: the highest point within half a metre past the front.
+            let upto = (i + 6).min(BINS);
+            let top = bins[i..upto].iter().flatten().filter(|a| a.0 < distance + 0.5).map(|a| a.1).fold(0.0f32, f32::max);
+            return Some(Blocker { distance, top: top - ground, tall: top >= eye_m - EYE_MARGIN_M });
+        }
+        // Ground: follow it up and down by a step at most (a drop is not followed).
+        let low = bin.iter().map(|a| a.1).fold(f32::INFINITY, f32::min);
+        if (low - ground).abs() <= STEP_M {
+            ground = low;
+        }
+    }
+    None
 }
 
 impl Track {
@@ -478,16 +528,28 @@ impl Follower {
             return Ok(found); // not in view: the detour (or the turn) goes on
         }
         // Their own body (within half a metre of their feet) is not in the way.
-        let blocked = corridor(&points, eye, direct, metres, floor).filter(|&(d, _)| d < gap - 0.5 && d < 3.0);
+        let blocked = corridor(&points, eye, direct, metres, floor).filter(|b| b.distance < gap - 0.5 && b.distance < 3.0);
         let mut s = self.inner.lock().unwrap();
-        s.obstacle = blocked.map_or(f32::INFINITY, |b| b.0);
-        let Some((distance, top)) = blocked else {
+        s.obstacle = blocked.map_or(f32::INFINITY, |b| b.distance);
+        let Some(b) = blocked else {
             t.obstacle = None;
             t.detour = None;
             s.avoiding = "";
             return Ok(found);
         };
-        let obstacle = Obstacle { yaw: direct, then, distance, top };
+        let mut obstacle = Obstacle { yaw: direct, then, distance: b.distance, jump: false };
+        let place = obstacle.place();
+        let near = |q: [f32; 2]| (q[0] - place[0]).hypot(q[1] - place[1]) < SAME_PLACE_M;
+        // Still there after a jump at it: that jump failed.
+        if let Some((when, q)) = t.jumped {
+            let since = at.saturating_duration_since(when);
+            if since > Duration::from_millis(600) && since < Duration::from_secs(4) && near(q) {
+                t.no_jump.push((q, at + NO_JUMP_FOR));
+                t.jumped = None;
+            }
+        }
+        t.no_jump.retain(|&(_, until)| at < until);
+        obstacle.jump = !b.tall && !t.no_jump.iter().any(|&(q, _)| near(q));
         t.obstacle = Some(obstacle);
         // A way round, on a height map of this view.
         let to = [eye[0] + (goal[0] - then[0]) / metres, eye[2] + (goal[1] - then[1]) / metres];
@@ -496,8 +558,8 @@ impl Follower {
         let round = vrc_nav::next_waypoint(&map, eye, to, vrc_nav::CLEARANCE_M / metres, 2.0 / metres)
             .map(|(yaw, _)| yaw)
             .filter(|&w| angle_diff(w, direct).abs() > 5.0);
-        // Low and a long way round: over it.
-        let over = obstacle.jumpable() && round.is_none_or(|w| angle_diff(w, direct).abs() > 45.0);
+        // Not up to the eyes, and not failed yet: over it, first.
+        let over = obstacle.jump;
         t.detour = if over { None } else { round.map(|w| (at + DETOUR_FOR, w)) };
         s.avoiding = if over {
             "jump"
@@ -571,10 +633,13 @@ impl Follower {
                     // Something in the way, nearer than they are?
                     let facing = t.facing;
                     let ob = t.obstacle.and_then(|o| o.ahead(pos, facing).map(|d| (o, d))).filter(|&(_, d)| d < gap - 0.3);
-                    let over = ob.filter(|(o, d)| o.jumpable() && *d < 2.0 && last_jump.is_none_or(|j| now - j > JUMP_EVERY));
+                    let over = ob.filter(|(o, d)| o.jump && *d < 2.0 && last_jump.is_none_or(|j| now - j > JUMP_EVERY));
                     let blocked = ob.is_some_and(|(_, d)| d < OBSTACLE_M) && over.is_none();
-                    if let Some((_, d)) = over {
+                    if let Some((o, d)) = over {
                         jump = d < JUMP_AT_M + speed * 0.1;
+                        if jump {
+                            t.jumped = Some((now, o.place()));
+                        }
                     }
                     let start = if axis > 0.0 { 0.05 } else { WALK_MARGIN };
                     if gap - stand > start && !blocked {
@@ -594,7 +659,8 @@ impl Follower {
             // Stuck: pushing, not moving. Jump once; then back off and turn aside.
             if axis > STUCK_AXIS {
                 let pushed = *pushed_since.get_or_insert(now);
-                if now - pushed > Duration::from_millis(500) && vz < STUCK_SPEED {
+                // The way it moves (the body may lag the head: sideways too).
+                if now - pushed > Duration::from_millis(500) && vx.hypot(vz) < STUCK_SPEED {
                     if now - *slow_since.get_or_insert(now) > STUCK_FOR {
                         slow_since = None;
                         if last_jump.is_none_or(|j| now - j > Duration::from_secs(3)) {
@@ -705,25 +771,53 @@ mod tests {
     #[test]
     fn corridors_find_and_measure_obstacles() {
         let eye = [0.0, 1.6, 0.0];
-        // A box 0.4 m high from 1.0 m ahead (-z), and a wall off to the side.
+        let floor_to = |points: &mut Vec<[f32; 3]>, from: f32, to: f32, y: f32| {
+            let mut z = from;
+            while z < to {
+                for i in 0..5 {
+                    points.push([-0.2 + 0.1 * i as f32, y, -z]);
+                }
+                z += 0.05;
+            }
+        };
+        // Floor, then a box 0.4 m high from 1.0 m ahead (-z).
         let mut points = Vec::new();
-        for i in 0..10 {
-            for j in 0..8 {
-                points.push([-0.2 + 0.04 * i as f32, 0.05 * j as f32, -1.0 - 0.03 * (i % 3) as f32]);
-                points.push([1.5, 0.2 * j as f32, -0.2 + 0.04 * i as f32]);
+        floor_to(&mut points, 0.4, 1.0, 0.0);
+        for j in 0..9 {
+            for i in 0..5 {
+                points.push([-0.2 + 0.1 * i as f32, 0.05 * j as f32, -1.0]);
             }
         }
-        let (d, top) = corridor(&points, eye, 0.0, 1.0, 0.0).unwrap();
-        assert!((d - 1.0).abs() < 0.1 && (top - 0.35).abs() < 0.05, "{d} {top}");
-        // Turned 90 degrees right: the wall, 1.5 m off, is in the way; its top is the eyes' cut.
-        let (d, _) = corridor(&points, eye, 90.0, 1.0, 0.0).unwrap();
-        assert!((d - 1.5).abs() < 0.05);
-        assert!(corridor(&points, eye, -90.0, 1.0, 0.0).is_none());
-        // Walking up to the box along its heading brings it nearer; another way, it is not ahead.
-        let o = Obstacle { yaw: 0.0, then: [0.0, 0.0], distance: 1.0, top };
+        let b = corridor(&points, eye, 0.0, 1.0, 0.0).unwrap();
+        assert!((b.distance - 1.0).abs() < 0.05 && (b.top - 0.4).abs() < 0.05 && !b.tall, "{b:?}");
+        // A wall up past the eyes, 1.5 m to the right: tall.
+        let mut wall = Vec::new();
+        floor_to(&mut wall, 0.4, 1.5, 0.0);
+        let wall: Vec<[f32; 3]> = wall.iter().map(|p| [-p[2], p[1], p[0]]).collect::<Vec<_>>();
+        let mut wall = wall;
+        for j in 0..40 {
+            for i in 0..5 {
+                wall.push([1.5, 0.05 * j as f32, -0.2 + 0.1 * i as f32]);
+            }
+        }
+        let b = corridor(&wall, eye, 90.0, 1.0, 0.0).unwrap();
+        assert!((b.distance - 1.5).abs() < 0.05 && b.tall, "{b:?}");
+        assert!(corridor(&wall, eye, -90.0, 1.0, 0.0).is_none());
+        // A ramp rising 0.15 m per 0.3 m: followed, not in the way.
+        let mut ramp = Vec::new();
+        let mut z = 0.4;
+        while z < 3.0 {
+            for i in 0..5 {
+                ramp.push([-0.2 + 0.1 * i as f32, (z - 0.4) * 0.5, -z]);
+            }
+            z += 0.05;
+        }
+        assert!(corridor(&ramp, eye, 0.0, 1.0, 0.0).is_none());
+        // Walking up to an obstacle along its heading brings it nearer; another way, it is not ahead.
+        let o = Obstacle { yaw: 0.0, then: [0.0, 0.0], distance: 1.0, jump: true };
         assert!((o.ahead([0.0, -0.4], 0.0).unwrap() - 0.6).abs() < 1e-4);
         assert!(o.ahead([0.0, 0.0], 60.0).is_none());
-        assert!(o.jumpable());
+        assert_eq!(o.place(), [0.0, -1.0]);
     }
 
     #[test]
