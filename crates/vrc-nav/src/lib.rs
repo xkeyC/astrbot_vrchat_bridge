@@ -175,8 +175,8 @@ pub fn survey(rig: &mut Rig, opts: &SurveyOptions, blocked: &[[f32; 2]]) -> Resu
 impl Survey {
     /// The candidates as the model sees them (world metres, degrees).
     pub fn candidates_json(&self) -> serde_json::Value {
-        let m = self.metres;
-        let r2 = |v: f32| (v * 100.0).round() / 100.0;
+        let m = self.metres as f64;
+        let r2 = |v: f32| (v as f64 * m * 100.0).round() / 100.0;
         serde_json::Value::Array(
             self.candidates
                 .iter()
@@ -186,10 +186,11 @@ impl Survey {
                         "kind": c.kind.name(),
                         "name": c.name,
                         "whitelist_rank": c.whitelist_rank,
-                        "distance_m": r2(c.distance * m),
-                        "bearing_deg": c.bearing.round(),
-                        "walk_m": if c.path.is_finite() { serde_json::json!(r2(c.path * m)) } else { serde_json::Value::Null },
-                        "height_m": r2((c.position[1] - self.floor.height) * m),
+                        "distance_m": r2(c.distance),
+                        "bearing_deg": c.bearing.round() as f64,
+                        "walk_m": if c.path.is_finite() { serde_json::json!(r2(c.path)) } else { serde_json::Value::Null },
+                        "height_m": r2(c.position[1] - self.floor.height),
+                        "rise_m": c.rise.map(r2),
                     })
                 })
                 .collect(),

@@ -55,6 +55,8 @@ pub struct Candidate {
     pub name: Option<String>,
     /// A player's priority on the whitelist (1 first).
     pub whitelist_rank: Option<usize>,
+    /// A platform's height over the ground it is jumped onto from.
+    pub rise: Option<f32>,
 }
 
 /// A player to offer as a candidate.
@@ -221,6 +223,7 @@ pub fn candidates(
             bearing,
             name: None,
             whitelist_rank: None,
+            rise: None,
         }
     };
     let neighbours = |i: usize| {
@@ -250,6 +253,7 @@ pub fn candidates(
                 bearing: super_angle(dx.atan2(-dz).to_degrees() - yaw_deg),
                 name: Some(person.name.clone()),
                 whitelist_rank: person.whitelist_rank,
+                rise: None,
             },
         ));
     }
@@ -329,7 +333,7 @@ pub fn candidates(
     // reachable neighbour by more than a step and at most a jump.
     let (step, jump) = (map.params.step, map.params.jump);
     let free = walkable(map, 0.0);
-    let is_top = |i: usize| -> Option<u32> {
+    let is_top = |i: usize| -> Option<(u32, f32)> {
         let h = ground[i]?;
         if dist[i].is_some() || !free[i] {
             return None;
@@ -346,8 +350,8 @@ pub fn candidates(
                 let j = rr as usize * n + cc as usize;
                 if let (Some(d), Some(g)) = (dist[j], ground[j]) {
                     let rise = h - g;
-                    if rise > step && rise <= jump && best.is_none_or(|b| d < b) {
-                        best = Some(d);
+                    if rise > step && rise <= jump && best.is_none_or(|(b, _)| d < b) {
+                        best = Some((d, rise));
                     }
                 }
             }
@@ -378,9 +382,11 @@ pub fn candidates(
             continue;
         }
         // Its edge cell nearest by walk.
-        let best = group.iter().filter_map(|&a| is_top(a).map(|d| (d, a))).min();
-        if let Some((d, a)) = best {
-            found.push((group.len() as f32 * cell * 2.0, make(a, Kind::Platform, d)));
+        let best = group.iter().filter_map(|&a| is_top(a).map(|(d, rise)| (d, a, rise))).min_by_key(|t| (t.0, t.1));
+        if let Some((d, a, rise)) = best {
+            let mut c = make(a, Kind::Platform, d);
+            c.rise = Some(rise);
+            found.push((group.len() as f32 * cell * 2.0, c));
         }
     }
 

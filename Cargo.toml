@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/vrc-vr", "crates/vrc-stereo", "crates/vrc-scene", "crates/vrc-players", "crates/vrc-nav", "crates/vr-probe"]
+members = ["crates/vrc-vr", "crates/vrc-stereo", "crates/vrc-scene", "crates/vrc-players", "crates/vrc-nav", "crates/vrc-bridge", "crates/vr-probe"]
 
 [workspace.package]
 edition = "2021"

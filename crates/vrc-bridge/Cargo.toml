@@ -1,0 +1,17 @@
+[package]
+name = "vrc-bridge"
+version = "0.1.0"
+description = "The bridge's HTTP API for the AstrBot plugin: the VR capabilities (survey, walk to) of the bot's virtual headset"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+jpeg-encoder.workspace = true
+png.workspace = true
+serde_json.workspace = true
+tiny_http = "0.12"
+vrc-nav.workspace = true
+vrc-scene.workspace = true

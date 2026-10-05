@@ -69,6 +69,9 @@ DEFAULT_CONFIG = {
     "enable": False,
     "vrchat_bridge_url": "http://127.0.0.1:6120",
     "vrchat_bridge_token": "",
+    # The VR bridge (Rust vrc-bridge): set when VRChat runs in VR mode on the
+    # virtual headset; its walking tools then replace the desktop ones.
+    "vrchat_vr_bridge_url": "",
     "vrchat_voice_name": "AstrBot",
     "vrchat_voice_aliases": [],
     "vrchat_voice_prompt": "",
@@ -91,6 +94,11 @@ CONFIG_METADATA = {
         "type": "string",
         "hint": "bridge 的 token 文件（~/.config/vrc-bridge/token）的内容。",
         "secret": True,
+    },
+    "vrchat_vr_bridge_url": {
+        "description": "VR bridge 地址（VR 模式）",
+        "type": "string",
+        "hint": "VRChat 以 VR 模式运行在虚拟头显上时，Rust 写的 vrc-bridge 的 HTTP 地址（与上面的 bridge 共用 token）。填写后语音和文字工具改用 VR 的环视与行走（vrchat_look_around / vrchat_walk_to）；留空则用桌面模式的工具。",
     },
     "vrchat_voice_name": {
         "description": "语音唤醒名",
@@ -243,7 +251,70 @@ def room_context(state: dict) -> str:
     return f"({text})"
 
 
-def room_prompt(name: str, aliases: list[str], tools: bool) -> str:
+VR_LOOK_DESCRIPTION = (
+    "Looks all around (about 2 s) and shows you two pictures with the same numbered places: "
+    "a panorama (its middle is where you face, its edges behind you) and a top-down map (you "
+    "in the middle facing up; green floor, red obstacles, dark unknown). Players are found by "
+    "their name tags; whitelisted friends are marked.")
+VR_WALK_DESCRIPTION = (
+    "Walks to a numbered place of your last look around (it plans a path around obstacles, "
+    "walks in short legs and looks again after each), or a distance at a bearing. Then shows "
+    "you the new look around.")
+VR_WALK_PARAMS = {
+    "place": {"type": "integer", "description": "The place's number in your last look around."},
+    "bearing": {"type": "number",
+                "description": "Instead of a place: degrees from where you face (+ right, 180 behind)."},
+    "distance": {"type": "number", "description": "With bearing: metres to walk (default 2)."},
+}
+VR_TOOLS_PROMPT = ("When you are addressed, answer briefly in the speaker's language, like a person in the room: spoken to in Chinese, say everything in Chinese, though your tools answer in English. Quick actions you do yourself with your tools, without delegating: gestures (vrchat_emote), a jump, stopping, writing in the chatbox, who is here. To see where you are, vrchat_look_around: a panorama and a top-down map with numbered places (players by name, places to walk to, edges of what you have seen to look further from, raised tops to jump onto); its text lists them with distance and bearing (+ right of where you face). To get somewhere, vrchat_walk_to the number nearest your goal, then look at the new pictures it shows, and again until you are there (within about 1.5 m); with someone to find, walk to their number. When what you look for is not among the places, walk to an edge toward where it may be and look again. A mirror shows a reflection: places that seem to lie inside or behind a mirror are not real. Never walk into a portal (a frame showing another world). In a series of moves write nothing between them, just the next call; speak once, when you are there or stuck. Any text you write is spoken aloud: never write thoughts, plans or notes (not even in brackets). Do not describe what you see unless asked. Delegate real tasks (anything needing facts, lookups or work), and tell the speaker the result briefly.")
+
+
+KIND_WORDS = {
+    "open": "open floor",
+    "frontier": "edge of what you have seen",
+    "platform": "a raised top to jump onto",
+    "player": "player",
+}
+
+
+def survey_words(data: dict) -> str:
+    """A survey's places and players in words for the model."""
+    lines = []
+    for c in data.get("candidates", []):
+        what = KIND_WORDS.get(c["kind"], c["kind"])
+        if c["kind"] == "player":
+            what = f"{c['name']}" + (f" (friend, whitelist #{c['whitelist_rank']})" if c.get("whitelist_rank") else "")
+        elif c["kind"] == "platform" and c.get("rise_m") is not None:
+            what += f" ({c['rise_m']:.1f} m up)"
+        walk = f", walk {c['walk_m']:.1f} m" if c.get("walk_m") is not None else ", no path seen"
+        lines.append(f"{c['id']}: {what}, {c['distance_m']:.1f} m at {c['bearing_deg']:+.0f} deg{walk}")
+    places = "; ".join(lines) if lines else "none (look around again, or step back)"
+    room = data.get("room") or []
+    seen = {p["name"] for p in data.get("players", [])}
+    unseen = [n for n in room if n not in seen]
+    others = f" In the room but not in sight: {', '.join(unseen)}." if unseen else ""
+    return f"Numbered places (bearing from where you face, + right): {places}.{others}"
+
+
+def goto_words(data: dict) -> str:
+    legs = data.get("legs", [])
+    blocked = sum(1 for l in legs if l.get("blocked"))
+    bumps = f", bumped into something {blocked} time(s)" if blocked else ""
+    if data.get("arrived"):
+        return f"You are there ({data['remaining_m']:.1f} m off, {data['took_s']:.0f} s{bumps})."
+    return (f"You stopped {data['remaining_m']:.1f} m short ({data.get('reason') or 'stuck'}"
+            f"{bumps}).")
+
+
+def vr_goto_body(a: dict) -> dict:
+    if a.get("place") is not None:
+        return {"candidate": int(a["place"])}
+    if a.get("bearing") is not None:
+        return {"bearing": float(a["bearing"]), "distance": float(a.get("distance") or 2.0)}
+    raise RuntimeError("give a place number, or a bearing")
+
+
+def room_prompt(name: str, aliases: list[str], tools: bool, vr: bool = False) -> str:
     others = [a for a in aliases if a and a != name]
     alias_text = (
         f' ("{name}"' + "".join(f', "{a}"' for a in others) + ")"
@@ -252,7 +323,7 @@ def room_prompt(name: str, aliases: list[str], tools: bool) -> str:
     )
     prompt = ROOM_PROMPT.format(name=name, aliases=alias_text)
     if tools:
-        prompt = prompt[: prompt.rindex("When you are addressed")] + ROOM_TOOLS_PROMPT
+        prompt = prompt[: prompt.rindex("When you are addressed")] + (VR_TOOLS_PROMPT if vr else ROOM_TOOLS_PROMPT)
     # The session adds the voice persona (or the platform's extra prompt) and the time.
     return prompt
 
@@ -277,6 +348,7 @@ class VRChatPlatformAdapter(Platform):
         cfg = {**DEFAULT_CONFIG, **platform_config}
         self.settings = platform_settings
         self.base_url = str(cfg["vrchat_bridge_url"]).rstrip("/")
+        self.vr_url = str(cfg.get("vrchat_vr_bridge_url") or "").rstrip("/")
         self.token = str(cfg["vrchat_bridge_token"] or "").strip()
         if not self.token:
             raise ValueError("VRChat bridge token 是必需的")
@@ -360,6 +432,41 @@ class VRChatPlatformAdapter(Platform):
                 data = await resp.json(content_type=None)
                 raise RuntimeError(data.get("error") or f"HTTP {resp.status}")
             return await resp.read(), dict(resp.headers)
+
+    # -- the VR bridge (VR mode) ----------------------------------------------
+
+    async def _vr(self, method: str, path: str, body: dict | None = None, timeout: float = 30) -> Any:
+        """Calls the VR bridge: JSON back, or bytes for images."""
+        if self._http is None:
+            raise RuntimeError("VRChat bridge 未连接")
+        if not self.vr_url:
+            raise RuntimeError("VR bridge 未配置")
+        async with self._http.request(method, self.vr_url + path, json=body, headers=self._headers(),
+                                      timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+            if resp.content_type.startswith("image/"):
+                return await resp.read()
+            data = await resp.json(content_type=None)
+            if resp.status >= 300:
+                raise RuntimeError(data.get("error") or f"HTTP {resp.status}")
+            return data
+
+    async def vr_survey(self, players: bool = True) -> tuple[dict, bytes, bytes]:
+        """Looks all around (VR): the candidates and players, the numbered
+        panorama (JPEG) and map (PNG)."""
+        async with self._moving:
+            data = await self._vr("POST", "/v1/vr/survey", {"players": players}, timeout=60)
+            pano = await self._vr("GET", "/v1/vr/survey/pano.jpg")
+            top = await self._vr("GET", "/v1/vr/survey/map.png")
+        return data, pano, top
+
+    async def vr_goto(self, body: dict) -> tuple[dict, bytes, bytes]:
+        """Walks to a candidate of the last survey, or by bearing and
+        distance (VR); the report, and the new survey's pictures."""
+        async with self._moving:
+            data = await self._vr("POST", "/v1/vr/goto", body, timeout=120)
+            pano = await self._vr("GET", "/v1/vr/survey/pano.jpg")
+            top = await self._vr("GET", "/v1/vr/survey/map.png")
+        return data, pano, top
 
     def _in_turn(self, path: str) -> asyncio.Lock | contextlib.nullcontext:
         """What a call to ``path`` waits for: the moves before it finished."""
@@ -870,6 +977,32 @@ class VRChatPlatformAdapter(Platform):
         # No action ends the turn by itself: the model sees how it went and
         # answers in its own words (it ended turns early with a walk).
         tools = [VoiceTool(s, run) for s, run in actions]
+        if self.vr_url:
+
+            def pictures(text: str, pano: bytes, top: bytes) -> list[dict]:
+                return [{"type": "inputText", "text": text},
+                        {"type": "inputImage",
+                         "imageUrl": "data:image/jpeg;base64," + base64.b64encode(pano).decode()},
+                        {"type": "inputImage",
+                         "imageUrl": "data:image/png;base64," + base64.b64encode(top).decode()}]
+
+            async def look_around(a: dict) -> list[dict]:
+                data, pano, top = await self.vr_survey(bool(a.get("players", True)))
+                return pictures(survey_words(data), pano, top)
+
+            async def walk_to(a: dict) -> list[dict]:
+                body = vr_goto_body(a)
+                data, pano, top = await self.vr_goto(body)
+                return pictures(goto_words(data) + " " + survey_words(data["after"]), pano, top)
+
+            return tools + [
+                VoiceTool(spec("vrchat_who", "Lists the other players in the room.", {}, []), who),
+                VoiceTool(spec("vrchat_look_around", VR_LOOK_DESCRIPTION, {
+                    "players": {"type": "boolean",
+                                "description": "Read name tags to find players (default true; "
+                                               "false is a little faster)."}}, []), look_around),
+                VoiceTool(spec("vrchat_walk_to", VR_WALK_DESCRIPTION, VR_WALK_PARAMS, []), walk_to),
+            ]
         return tools + [
             VoiceTool(spec("vrchat_goto",
                            "How you get anywhere: walks to a numbered place of your last view "
@@ -1037,7 +1170,7 @@ class VRChatPlatformAdapter(Platform):
         session = new_voice_session(
             key=ROOM_SESSION,
             scope_id=f"{self.meta().id}:voice:{ROOM_SESSION}",
-            prompt=room_prompt(self.voice_options.name, self.voice_options.aliases, bool(tools)),
+            prompt=room_prompt(self.voice_options.name, self.voice_options.aliases, bool(tools), bool(self.vr_url)),
             options=self.voice_options,
             media=PcmMedia(
                 self._send_audio,
