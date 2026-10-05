@@ -17,10 +17,12 @@
 //! jump did not get past, is walked round by following it (a "bug"
 //! algorithm, user's rule): keep it on one side (the side away from the
 //! target's way round), each view taking the free heading nearest that
-//! side, round corners, until the straight way to the target is open and
-//! nearer than where the wall began; out of an enclosure or into one alike.
-//! While following a wall the target may be out of sight: the bot keeps
-//! going for where they were. Pushing without moving (stuck) jumps once,
+//! side, round corners, until the straight way to the target is open (no
+//! wall up to the eyes; user's rule: keep checking while going round): out
+//! of an enclosure or into one alike. Every GLANCE_EVERY the head turns to
+//! the target's way for a view of it, as the walk along the wall faces
+//! elsewhere. While following a wall the target may be out of sight: the
+//! bot keeps going for where they were. Pushing without moving (stuck) jumps once,
 //! then backs off and turns aside.
 //!
 //! Lost, the bot stands and the eyes look around one view at a time,
@@ -112,14 +114,17 @@ const VIEW_HALF_DEG: f32 = 40.0;
 const STEREO_THREADS: usize = 6;
 /// Following a wall: headings tried this far apart (degrees), each side of
 /// where it looks; a heading is free when nothing stands within FREE_M
-/// along it. The wall is left once the way to the target is open and at
-/// least LEAVE_NEARER_M nearer than where it began; given up after WALL_FOR.
+/// along it. The wall is left once, along the way to the target, nothing up
+/// to the eyes stands in it; given up after WALL_FOR. A
+/// wall met again within SAME_SIDE_FOR of leaving one is followed on the
+/// same side.
 const WALL_STEP_DEG: f32 = 15.0;
 const WALL_STEPS: i32 = 3;
 const FREE_M: f32 = 1.2;
-const LEAVE_NEARER_M: f32 = 0.3;
 const WALL_FOR: Duration = Duration::from_secs(40);
 const WALL_SPEED: f32 = 1.4;
+const GLANCE_EVERY: Duration = Duration::from_millis(1500);
+const SAME_SIDE_FOR: Duration = Duration::from_secs(8);
 
 #[derive(Default)]
 pub struct Follower {
@@ -173,15 +178,16 @@ struct Track {
     no_jump: Vec<([f32; 2], Instant)>,
     /// Following a wall round to the target.
     wall: Option<Wall>,
+    /// The side of the last wall followed, and when it was left.
+    last_side: Option<(f32, Instant)>,
 }
 
-/// Following a wall: on which side it is kept (-1 left, +1 right), since
-/// when, and how far the target was then (world metres).
+/// Following a wall: on which side it is kept (-1 left, +1 right), and
+/// since when.
 #[derive(Clone, Copy, Debug)]
 struct Wall {
     side: f32,
     since: Instant,
-    gap: f32,
 }
 
 /// Something in the way (world metres).
@@ -399,6 +405,7 @@ impl Follower {
         let mut last_here = Instant::now();
         let mut searching = false;
         let mut next_search = Instant::now();
+        let mut last_glance = Instant::now();
         let mut osc: Option<Osc> = None;
         while !stop.load(Ordering::SeqCst) {
             let (running, here, room) = {
@@ -430,7 +437,21 @@ impl Follower {
                 let t = track.lock().unwrap();
                 t.wall.is_none() && t.target.is_none_or(|f| f.at.elapsed() > LOST_AFTER)
             };
-            let result = if !lost {
+            // Along a wall, now and then a view the target's way.
+            let glance = {
+                let t = track.lock().unwrap();
+                match (t.wall, t.target_now()) {
+                    (Some(_), Some(goal)) if last_glance.elapsed() > GLANCE_EVERY => {
+                        let to = bearing(t.pos, goal);
+                        (angle_diff(to, t.facing).abs() > VIEW_HALF_DEG).then_some(to)
+                    }
+                    _ => None,
+                }
+            };
+            let result = if let Some(to) = glance {
+                last_glance = Instant::now();
+                self.look(&bridge, &track, &target, &room, metres, Some(to)).map(|_| ())
+            } else if !lost {
                 self.look(&bridge, &track, &target, &room, metres, None).map(|_| ())
             } else if Instant::now() >= next_search {
                 if !searching {
@@ -564,26 +585,30 @@ impl Follower {
         let mut s = self.inner.lock().unwrap();
         s.obstacle = blocked.map_or(f32::INFINITY, |b| b.distance);
         if let Some(w) = t.wall {
-            let open = in_view && blocked.is_none();
-            if open && gap < w.gap - LEAVE_NEARER_M {
+            // Nothing up to the eyes the straight way, nor a low thing a
+            // jump did not clear (one not yet tried is jumped, below):
+            // leave the wall for them.
+            let (ds, dc) = direct.to_radians().sin_cos();
+            let failed = |b: &Blocker| {
+                let q = [then[0] + ds * b.distance, then[1] - dc * b.distance];
+                t.no_jump.iter().any(|&(n, until)| at < until && (n[0] - q[0]).hypot(n[1] - q[1]) < SAME_PLACE_M)
+            };
+            let open = in_view && blocked.is_none_or(|b| !b.tall && !failed(&b));
+            if open || at - w.since > WALL_FOR {
                 t.wall = None;
                 t.detour = None;
+                t.last_side = Some((w.side, at));
                 s.avoiding = "";
+            } else if aim.is_some() {
+                return Ok(found); // a glance their way: the walk along the wall goes on
+            } else {
+                // A hand on the wall: the free heading nearest its side.
+                let pick = (-WALL_STEPS..=WALL_STEPS).rev().map(|k| wrap(yaw + w.side * k as f32 * WALL_STEP_DEG)).find(|&h| free(h));
+                let heading = pick.unwrap_or_else(|| wrap(yaw - w.side * 70.0)); // boxed in: turn away
+                t.detour = Some((at + DETOUR_FOR, heading));
+                s.avoiding = "wall";
                 return Ok(found);
             }
-            if at - w.since > WALL_FOR {
-                // Round and round: try the other way next time.
-                t.wall = None;
-                t.detour = None;
-                s.avoiding = "";
-                return Ok(found);
-            }
-            // A hand on the wall: the free heading nearest its side.
-            let pick = (-WALL_STEPS..=WALL_STEPS).rev().map(|k| wrap(yaw + w.side * k as f32 * WALL_STEP_DEG)).find(|&h| free(h));
-            let heading = pick.unwrap_or_else(|| wrap(yaw - w.side * 70.0)); // boxed in: turn away
-            t.detour = Some((at + DETOUR_FOR, heading));
-            s.avoiding = "wall";
-            return Ok(found);
         }
         if !in_view {
             return Ok(found); // not in view: the turn goes on
@@ -617,7 +642,8 @@ impl Follower {
         // Else round it, following it: go the side with a free heading
         // nearest the way to them, keeping the wall on the other side.
         t.obstacle = None;
-        let side = (1..=4)
+        let again = t.last_side.filter(|&(_, when)| at - when < SAME_SIDE_FOR).map(|(side, _)| side);
+        let side = again.unwrap_or_else(|| (1..=4)
             .find_map(|k| {
                 let (r, l) = (wrap(direct + k as f32 * WALL_STEP_DEG), wrap(direct - k as f32 * WALL_STEP_DEG));
                 if free(r) {
@@ -628,8 +654,8 @@ impl Follower {
                     None
                 }
             })
-            .unwrap_or(1.0);
-        t.wall = Some(Wall { side, since: at, gap });
+            .unwrap_or(1.0));
+        t.wall = Some(Wall { side, since: at });
         t.detour = None;
         s.avoiding = "wall";
         Ok(found)
