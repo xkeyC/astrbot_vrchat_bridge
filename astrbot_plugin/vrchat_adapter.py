@@ -238,7 +238,25 @@ VR_WALK_PARAMS = {
     "distance": {"type": "number", "description": "With bearing: metres to walk (default 2)."},
 }
 # Replaces the last paragraph of ROOM_PROMPT when the voice model has the room's tools.
-ROOM_TOOLS_PROMPT = ("When you are addressed, answer briefly in the speaker's language, like a person in the room: spoken to in Chinese, say everything in Chinese, though your tools answer in English. Quick actions you do yourself with your tools, without delegating: gestures (vrchat_emote), a jump, a few steps or a turn (vrchat_step), stopping, writing in the chatbox, who is here, following someone in this room ('follow me', 'come with me') until told to stop, and while following: closer, farther, stay put ('wait here', 'don't move'), follow again. For a quick action call its tool at once, without weighing options, then say a few words. To see where you are, vrchat_look_around: a panorama and a top-down map with numbered places (players by name, places to walk to, edges of what you have seen to look further from, raised tops to jump onto); its text lists them with distance and bearing (+ right of where you face). To get somewhere, vrchat_walk_to the number nearest your goal, then look at the new pictures it shows, and again until you are there (within about 1.5 m); with someone to find, walk to their number. When what you look for is not among the places, walk to an edge toward where it may be and look again. To recall when you last saw a friend, vrchat_last_seen. A mirror shows a reflection: places that seem to lie inside or behind a mirror are not real. Never walk into a portal (a frame showing another world). In a series of moves write nothing between them, just the next call; speak once, when you are there or stuck. Any text you write is spoken aloud: never write thoughts, plans or notes (not even in brackets). Do not describe what you see unless asked. Delegate real tasks (anything needing facts, lookups or work), and tell the speaker the result briefly.")
+ROOM_TOOLS_PROMPT = ("When you are addressed, answer briefly in the speaker's language, like a person in the room: spoken to in Chinese, say everything in Chinese, though your tools answer in English. Quick actions you do yourself with your tools, without delegating: gestures (vrchat_emote), a jump, a few steps or a turn (vrchat_step), stopping, writing in the chatbox, who is here, following someone in this room ('follow me', 'come with me') until told to stop, and while following: closer, farther, stay put ('wait here', 'don't move'), follow again. For a quick action call its tool at once, without weighing options, then say a few words. To see where you are, vrchat_look_around: a panorama and a top-down map with numbered places (players by name, places to walk to, edges of what you have seen to look further from, raised tops to jump onto); its text lists them with distance and bearing (+ right of where you face). To get somewhere, vrchat_walk_to the number nearest your goal, then look at the new pictures it shows, and again until you are there (within about 1.5 m); with someone to find, walk to their number. When what you look for is not among the places, walk to an edge toward where it may be and look again. To recall when you last saw a friend, vrchat_last_seen. Told you stand on tiptoe or crouch, or to be taller or shorter, vrchat_height; your view or body stuck or wrong, vrchat_vr_reset. A mirror shows a reflection: places that seem to lie inside or behind a mirror are not real. Never walk into a portal (a frame showing another world). In a series of moves write nothing between them, just the next call; speak once, when you are there or stuck. Any text you write is spoken aloud: never write thoughts, plans or notes (not even in brackets). Do not describe what you see unless asked. Delegate real tasks (anything needing facts, lookups or work), and tell the speaker the result briefly.")
+
+
+HEIGHT_DESCRIPTION = ("Sets how high your virtual headset stands above the floor, which is your avatar's posture: "
+                      "standing on tiptoe means too high, bent knees too low (a few centimetres matter). "
+                      "Without arguments, tells the height now.")
+HEIGHT_PARAMS = {
+    "metres": {"type": "number", "description": "The height, metres (1.2-1.9; about 1.56 fits now)."},
+    "change_cm": {"type": "number", "description": "Or a change from now, centimetres (+ higher)."},
+}
+VR_RESET_DESCRIPTION = ("Resets your virtual headset, like SteamVR's reset: stops walking and following, "
+                        "connects the headset again, looks level ahead with the arms at rest, recenters. "
+                        "For a view or body that looks stuck or wrong.")
+
+
+def vr_reset_words(data: dict) -> str:
+    recentered = {True: " and recentered", False: " (recentering failed)", None: ""}[data.get("recentered")]
+    return (f"Headset reset{recentered}: looking level ahead, arms at rest, "
+            f"standing {data.get('head_height', 0):.2f} m high.")
 
 
 KIND_WORDS = {
@@ -655,6 +673,22 @@ class VRChatPlatformAdapter(Platform):
                            f"{sighting['age_s']:.0f} s ago, in {sighting['world'] or 'an unknown world'}.",
                            jpeg)
 
+        async def height(a: dict) -> str:
+            body = {}
+            if a.get("metres") is not None:
+                body["metres"] = float(a["metres"])
+            elif a.get("change_cm") is not None:
+                body["change_cm"] = float(a["change_cm"])
+            if not body:
+                data = await self.request("GET", "/v1/vr/height")
+                return f"Your headset stands {data['head_height']:.2f} m above the floor."
+            data = await self.request("POST", "/v1/vr/height", body)
+            return f"Headset height {data['was']:.2f} m -> {data['head_height']:.2f} m."
+
+        async def vr_reset(a: dict) -> str:
+            data = await self.request("POST", "/v1/vr/reset")
+            return vr_reset_words(data)
+
         actions = [
             (spec("vrchat_emote", "Plays a gesture of your avatar.", {
                 "name": {"type": "string", "enum": list(EMOTES)}}, ["name"]), emote),
@@ -682,6 +716,8 @@ class VRChatPlatformAdapter(Platform):
                                            "false is a little faster)."}}, []), look_around),
             (spec("vrchat_walk_to", VR_WALK_DESCRIPTION, VR_WALK_PARAMS, []), walk_to),
             (spec("vrchat_step", STEP_DESCRIPTION, STEP_PARAMS, []), step),
+            (spec("vrchat_height", HEIGHT_DESCRIPTION, HEIGHT_PARAMS, []), height),
+            (spec("vrchat_vr_reset", VR_RESET_DESCRIPTION, {}, []), vr_reset),
             (spec("vrchat_last_seen", "Shows your view when you last saw a friend of your whitelist, "
                   "how long ago and in which world.", {
                       "name": {"type": "string",

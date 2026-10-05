@@ -64,6 +64,11 @@ pub struct AnimParams {
     pub bob_m: f32,
     /// Gestures and nods while talking.
     pub talk: bool,
+    /// The head's height above the tracking floor (m): where VRChat's
+    /// calibration expects it (higher, the avatar stands on tiptoe; lower,
+    /// it bends its knees; 1.56 by eye, D23). Not animation: the owner's,
+    /// kept here to be tuned and kept with the rest.
+    pub head_height: f32,
 }
 
 impl Default for AnimParams {
@@ -82,6 +87,7 @@ impl Default for AnimParams {
             swing: 1.0,
             bob_m: 0.025,
             talk: true,
+            head_height: 1.56,
         }
     }
 }

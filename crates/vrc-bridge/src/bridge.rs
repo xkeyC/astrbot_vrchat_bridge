@@ -71,7 +71,10 @@ impl Bridge {
         let (chat_tx, chat_rx) = mpsc::channel(20);
         let config_dir = game::expand(&args.token_file).parent().map(|p| p.to_path_buf()).unwrap_or_default();
         let social = Arc::new(Social::new(config_dir.join("social.json"), config_dir.join("cookies.json")));
-        let vr = Arc::new(Mutex::new(VrCore::new(&args)));
+        let anim = Arc::new(Anim::new(config_dir.join("anim.json")));
+        let mut core = VrCore::new(&args);
+        core.head_height = anim.params().head_height;
+        let vr = Arc::new(Mutex::new(core));
         let bridge = Arc::new(Bridge {
             token,
             osc,
@@ -86,7 +89,7 @@ impl Bridge {
             vr,
             follower: Arc::new(Follower::default()),
             sightings: Arc::new(Sightings::default()),
-            anim: Arc::new(Anim::new(config_dir.join("anim.json"))),
+            anim,
             args,
         });
         (bridge, chat_rx)

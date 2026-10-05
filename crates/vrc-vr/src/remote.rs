@@ -36,9 +36,14 @@ const PER_VIEW_VALID_AT: usize = CENTER_AT + 28;
 const LEFT_AT: usize = 136;
 const RIGHT_AT: usize = 256;
 
-/// The eyes' height above VRChat's floor in the tracking space (VRChat
-/// scales the world so; measured by stereo, see `docs/full-vr` D13).
+/// The eyes' height above VRChat's floor in the tracking space with the
+/// head at Monado's default 1.6 m (measured by stereo, see `docs/full-vr`
+/// D13): the unit of the rest pose and the animation's distances.
 pub const EYE_HEIGHT: f32 = 1.93;
+/// VRChat's floor in the tracking space: below Monado's (y = 0), where its
+/// height calibration put it for this avatar (stereo: -0.31..-0.32 with the
+/// head at 1.45-1.6 m; D23). Eyes to floor = head height - FLOOR_Y.
+pub const FLOOR_Y: f32 = -0.32;
 /// One eye as the driver reports it: its field of view, and its pose
 /// relative to the head.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

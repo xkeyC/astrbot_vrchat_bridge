@@ -89,6 +89,9 @@ pub struct Args {
     /// The null compositor's eye tap.
     #[arg(long, default_value = "/dev/shm/vrc-eyes")]
     pub tap: String,
+    /// Monado's `monado-ctl`, for recentering on `/v1/vr/reset` (none: skip).
+    #[arg(long, default_value = "")]
+    pub monado_ctl: String,
 }
 
 #[derive(Subcommand, Clone, Debug)]
@@ -152,6 +155,8 @@ async fn main() -> Result<()> {
         .route("/v1/game/stop", post(game_stop))
         .route("/v1/vr/survey", post(vr_survey))
         .route("/v1/vr/goto", post(vr_goto))
+        .route("/v1/vr/height", get(vr_height).post(vr_set_height))
+        .route("/v1/vr/reset", post(vr_reset))
         .route("/v1/vr/survey/pano.jpg", get(vr_pano))
         .route("/v1/vr/survey/map.png", get(vr_map))
         .route_layer(middleware::from_fn_with_state(bridge.clone(), auth))
@@ -414,6 +419,10 @@ async fn anim_params(State(b): State<App>) -> Json<Value> {
 
 async fn anim_tune(State(b): State<App>, Body(body): Body) -> Reply {
     let p = b.anim.tune(&body)?;
+    if body.get("head_height").is_some() {
+        let h = p.head_height;
+        on_headset(&b, move |vr, _| vr.set_head_height(h)).await?;
+    }
     Ok(Json(serde_json::to_value(p)?))
 }
 
@@ -496,6 +505,53 @@ async fn vr_goto(State(b): State<App>, Body(body): Body) -> Reply {
     b.follower.stop();
     let whitelist = b.social.whitelist_names();
     Ok(Json(on_headset(&b, move |vr, _| vr.goto(&whitelist, &body)).await?))
+}
+
+async fn vr_height(State(b): State<App>) -> Json<Value> {
+    Json(json!({"head_height": cm(b.anim.params().head_height)}))
+}
+
+/// Metres to the centimetre.
+fn cm(metres: f32) -> f64 {
+    (metres as f64 * 100.0).round() / 100.0
+}
+
+/// The headset's height: `metres` (1.2-1.9), or `change_cm` from now.
+async fn vr_set_height(State(b): State<App>, Body(body): Body) -> Reply {
+    let now = b.anim.params().head_height;
+    let h = match (body["metres"].as_f64(), body["change_cm"].as_f64()) {
+        (Some(m), _) => m as f32,
+        (None, Some(cm)) => now + cm as f32 / 100.0,
+        _ => return Err(anyhow::anyhow!("metres, or change_cm").into()),
+    };
+    let h = (h.clamp(vr::MIN_HEAD_HEIGHT, vr::MAX_HEAD_HEIGHT) * 100.0).round() / 100.0;
+    b.anim.tune(&json!({"head_height": h}))?;
+    on_headset(&b, move |vr, _| vr.set_head_height(h)).await?;
+    Ok(Json(json!({"head_height": cm(h), "was": cm(now)})))
+}
+
+/// Like SteamVR's reset: stops moving, connects the headset again, looks
+/// level ahead with the hands at rest, and recenters Monado's local spaces.
+async fn vr_reset(State(b): State<App>) -> Reply {
+    b.follower.stop();
+    for axis in ["/input/Vertical", "/input/Horizontal"] {
+        let _ = b.osc.send_f32(axis, 0.0);
+    }
+    let yaw = on_headset(&b, |vr, _| {
+        let yaw = vr.yaw;
+        vr.reset();
+        vr.face(yaw, 0.0)?;
+        Ok(yaw)
+    })
+    .await?;
+    let recentered = if b.args.monado_ctl.is_empty() {
+        None
+    } else {
+        let out = tokio::process::Command::new(&b.args.monado_ctl).arg("-c").output().await;
+        Some(matches!(out, Ok(ref o) if o.status.success()))
+    };
+    b.notify_state();
+    Ok(Json(json!({"ok": true, "facing_deg": yaw.round(), "head_height": cm(b.anim.params().head_height), "recentered": recentered})))
 }
 
 async fn vr_pano(State(b): State<App>) -> std::result::Result<Response, Fail> {

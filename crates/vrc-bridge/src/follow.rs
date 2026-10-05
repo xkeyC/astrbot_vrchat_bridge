@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 use vrc_players::names::match_score;
 use vrc_stereo::{SgmParams, Stereo};
 use vrc_vr::osc::Osc;
-use vrc_vr::remote::EYE_HEIGHT;
+use vrc_vr::remote::FLOOR_Y;
 use vrc_vr::scan::{self, angle_diff};
 use vrc_vr::tap::EyeFrame;
 
@@ -261,7 +261,7 @@ impl Follower {
                 osc = bridge.osc_query().ok();
             }
             let metres = match osc.as_ref().map(|o| o.eye_height()) {
-                Some(Ok(h)) if h > 0.0 => h as f32 / EYE_HEIGHT,
+                Some(Ok(h)) if h > 0.0 => h as f32 / (bridge.anim.params().head_height - FLOOR_Y),
                 _ => {
                     osc = None;
                     1.0
@@ -357,8 +357,8 @@ impl Follower {
         let disp = stereo.disparity(&SgmParams::default());
         let eye = eye_of(&frame);
         let (yaw, _) = frame.views[0].pose.yaw_pitch();
-        // The floor, in stereo units: the usual eye height above it.
-        let floor = eye[1] - EYE_HEIGHT;
+        // The floor, in stereo units (the tracking space's).
+        let floor = FLOOR_Y;
         let lines = ocr.lines_rgb(&frame.eye_rgb8(0)?, frame.width as u16, frame.height as u16)?;
         let mut names: Vec<String> = room.to_vec();
         if !names.iter().any(|n| n == target) {

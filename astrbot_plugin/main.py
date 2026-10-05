@@ -253,6 +253,28 @@ class VRChatPlugin(Star):
         """
         return await self._act(event, lambda a: a.step(turn, direction, meters, jump))
 
+    @llm_tool("vrchat_height")
+    async def vrchat_height(self, event: AstrMessageEvent, metres: float | None = None,
+                            change_cm: float | None = None) -> str:
+        """设置 VR 头显离地的高度，也就是角色的站姿：踮脚说明太高，屈膝说明太低（几厘米就有差别）。不给参数时返回当前高度。
+
+        Args:
+            metres(number): 高度，米（1.2 到 1.9；现在 1.56 左右合适）。
+            change_cm(number): 或者相对现在的变化，厘米（正为升高）。
+        """
+        if metres is not None:
+            body = {"metres": metres}
+        elif change_cm is not None:
+            body = {"change_cm": change_cm}
+        else:
+            return await self._act(event, lambda a: a.request("GET", "/v1/vr/height"))
+        return await self._act(event, lambda a: a.request("POST", "/v1/vr/height", body))
+
+    @llm_tool("vrchat_vr_reset")
+    async def vrchat_vr_reset(self, event: AstrMessageEvent) -> str:
+        """像 SteamVR 的重置那样重置虚拟头显：停止行走和跟随，重新连接头显，平视前方、双手放回身侧，并重新居中。画面或身体看起来卡住、不对劲时用。"""
+        return await self._act(event, lambda a: a.request("POST", "/v1/vr/reset"))
+
     @llm_tool("vrchat_jump")
     async def vrchat_jump(self, event: AstrMessageEvent) -> str:
         """在 VRChat 里跳一下。"""

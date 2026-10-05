@@ -17,6 +17,8 @@ use vrc_vr::Pose;
 use crate::Args;
 
 pub const STEP_MAX_M: f32 = 5.0;
+pub const MIN_HEAD_HEIGHT: f32 = 1.2;
+pub const MAX_HEAD_HEIGHT: f32 = 1.9;
 
 pub struct VrCore {
     remote: String,
@@ -29,6 +31,10 @@ pub struct VrCore {
     /// Where the head looks (degrees): turns and tilts keep it.
     pub yaw: f32,
     pub pitch: f32,
+    /// The head's height above the tracking space's floor (metres): where
+    /// VRChat's calibration expects it, else the avatar stands on tiptoe
+    /// (too high) or crouches.
+    pub head_height: f32,
 }
 
 impl VrCore {
@@ -43,6 +49,7 @@ impl VrCore {
             serial: 0,
             yaw: 0.0,
             pitch: 0.0,
+            head_height: vrc_vr::anim::AnimParams::default().head_height,
         }
     }
 
@@ -53,8 +60,10 @@ impl VrCore {
             let (yaw, pitch) = rig.hmd.state.head.yaw_pitch();
             self.yaw = yaw;
             self.pitch = pitch;
+            rig.hmd.state.head.position[1] = self.head_height;
             let head = rig.hmd.state.head.position;
             rig.hmd.state.hands_at_rest(head, yaw);
+            rig.hmd.send()?;
             self.rig = Some(rig);
         }
         let rig = self.rig.as_mut().unwrap();
@@ -64,6 +73,18 @@ impl VrCore {
             rig.osc = Osc::connect().ok();
         }
         Ok(rig)
+    }
+
+    /// Moves the head to `metres` above the floor (the hands with it).
+    pub fn set_head_height(&mut self, metres: f32) -> Result<()> {
+        self.head_height = metres;
+        if let Some(rig) = self.rig.as_mut() {
+            rig.hmd.state.head.position[1] = metres;
+            let (head, body) = (rig.hmd.state.head.position, rig.hmd.state.body_yaw);
+            rig.hmd.state.hands_at_rest(head, body);
+            rig.hmd.send()?;
+        }
+        Ok(())
     }
 
     /// The headset connection's animator handle, once the rig is up.
