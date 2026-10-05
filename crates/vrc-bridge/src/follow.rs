@@ -25,9 +25,14 @@
 //! bot keeps going for where they were. Pushing without moving (stuck) jumps once,
 //! then backs off and turns aside.
 //!
+//! Glances turn only the head: the stick is split into ahead and aside
+//! (VRChat walks relative to the head), so the walk keeps its way.
+//!
 //! Lost, the bot stands and the eyes look around one view at a time,
-//! starting where the target was last seen and widening both ways; the
-//! first view that finds them ends the search and the legs go that way.
+//! a full turn one way, starting where the target was last seen; the first
+//! view that finds them ends the search and the legs go that way. A turn
+//! that finds nobody walks a while toward where they were, then turns
+//! again.
 //! Following ends only when told to stop or when they leave the room.
 
 use std::collections::VecDeque;
@@ -66,7 +71,11 @@ const LOST_AFTER: Duration = Duration::from_millis(1500);
 const GONE_AFTER: Duration = Duration::from_secs(20);
 const PITCH: f32 = -10.0;
 /// Search views: offsets (degrees) from where the target was last seen.
-const SEARCH: [f32; 6] = [0.0, 55.0, -55.0, 115.0, -115.0, 180.0];
+const SEARCH: [f32; 6] = [0.0, 60.0, 120.0, 180.0, 240.0, 300.0];
+/// A search that found nobody: walk toward where they were this long.
+const SEEK_FOR: Duration = Duration::from_secs(4);
+/// Following a wall without seeing the target this long: stop and search.
+const WALL_UNSEEN: Duration = Duration::from_secs(10);
 /// A whole search found nothing: wait this long before the next.
 const SEARCH_PAUSE: Duration = Duration::from_secs(2);
 
@@ -180,6 +189,8 @@ struct Track {
     wall: Option<Wall>,
     /// The side of the last wall followed, and when it was left.
     last_side: Option<(f32, Instant)>,
+    /// Walking toward where the target was (not seen), until when.
+    seek: Option<Instant>,
 }
 
 /// Following a wall: on which side it is kept (-1 left, +1 right), and
@@ -434,8 +445,14 @@ impl Follower {
             };
             // Following a wall, the target may be out of sight a while.
             let lost = {
-                let t = track.lock().unwrap();
-                t.wall.is_none() && t.target.is_none_or(|f| f.at.elapsed() > LOST_AFTER)
+                let mut t = track.lock().unwrap();
+                let unseen = t.target.map_or(Duration::MAX, |f| f.at.elapsed());
+                if t.wall.is_some() && unseen > WALL_UNSEEN {
+                    t.wall = None; // round a wall long out of sight: look for them
+                    t.detour = None;
+                }
+                let seeking = t.seek.is_some_and(|until| Instant::now() < until);
+                t.wall.is_none() && !seeking && unseen > LOST_AFTER
             };
             // Along a wall, now and then a view the target's way.
             let glance = {
@@ -461,7 +478,15 @@ impl Follower {
                 }
                 let found = self.search(&bridge, &track, &target, &room, metres, &stop);
                 if !matches!(found, Ok(true)) {
-                    next_search = Instant::now() + SEARCH_PAUSE;
+                    // Nobody all round: walk toward where they were a while.
+                    let mut t = track.lock().unwrap();
+                    let far = t.target_now().is_some_and(|g| (g[0] - t.pos[0]).hypot(g[1] - t.pos[1]) > self.inner.lock().unwrap().stand + 0.5);
+                    if far {
+                        t.seek = Some(Instant::now() + SEEK_FOR);
+                        next_search = Instant::now() + SEEK_FOR;
+                    } else {
+                        next_search = Instant::now() + SEARCH_PAUSE;
+                    }
                 }
                 found.map(|_| ())
             } else {
@@ -516,6 +541,8 @@ impl Follower {
     /// that way, the whole bot turned there), its name tags placed; whether
     /// the target was among them.
     fn look(&self, bridge: &Arc<Bridge>, track: &Arc<Mutex<Track>>, target: &str, room: &[String], metres: f32, aim: Option<f32>) -> anyhow::Result<bool> {
+        // Along a wall a look elsewhere is a glance: the head alone.
+        let glance = aim.is_some() && track.lock().unwrap().wall.is_some();
         let whitelist = bridge.social.whitelist_names();
         let (frame, ocr) = {
             let mut vr = bridge.vr.lock().unwrap();
@@ -523,9 +550,12 @@ impl Follower {
                 Some(yaw) => {
                     // Exactly that way: the animation's sway would miss it.
                     vr.rig(&whitelist)?.hmd.hold_still(true)?;
-                    let frame = vr.face(yaw, PITCH).and_then(|()| scan::rendered_at(&mut vr.rig(&whitelist)?.tap, yaw, PITCH, Duration::from_secs(1)));
+                    let turned = if glance { vr.aim(yaw, PITCH) } else { vr.face(yaw, PITCH) };
+                    let frame = turned.and_then(|()| scan::rendered_at(&mut vr.rig(&whitelist)?.tap, yaw, PITCH, Duration::from_secs(1)));
                     vr.rig(&whitelist)?.hmd.hold_still(false)?;
-                    track.lock().unwrap().facing = yaw;
+                    if !glance {
+                        track.lock().unwrap().facing = yaw;
+                    }
                     frame?
                 }
                 None => vr.rig(&whitelist)?.tap.read()?.ok_or_else(|| anyhow::anyhow!("no frame yet"))?,
@@ -563,6 +593,7 @@ impl Follower {
         let found = if let Some(hit) = hit {
             let rel = [(hit.feet[0] - eye[0]) * metres, (hit.feet[2] - eye[2]) * metres];
             t.add_fix(at, [then[0] + rel[0], then[1] + rel[1]]);
+            t.seek = None;
             let mut s = self.inner.lock().unwrap();
             s.last_seen = Some(at);
             s.distance = rel[0].hypot(rel[1]);
@@ -599,12 +630,17 @@ impl Follower {
                 t.detour = None;
                 t.last_side = Some((w.side, at));
                 s.avoiding = "";
-            } else if aim.is_some() {
+            } else if glance {
                 return Ok(found); // a glance their way: the walk along the wall goes on
             } else {
-                // A hand on the wall: the free heading nearest its side.
-                let pick = (-WALL_STEPS..=WALL_STEPS).rev().map(|k| wrap(yaw + w.side * k as f32 * WALL_STEP_DEG)).find(|&h| free(h));
-                let heading = pick.unwrap_or_else(|| wrap(yaw - w.side * 70.0)); // boxed in: turn away
+                // A hand on the wall: turn toward it only where it opens up
+                // (a corner: 30 degrees or more its way free), keep the way
+                // while it is free, else the free heading nearest the wall.
+                let at_side = |k: i32| wrap(yaw + w.side * k as f32 * WALL_STEP_DEG);
+                let opening = (2..=WALL_STEPS).rev().map(at_side).find(|&h| free(h));
+                let keep = Some(yaw).filter(|&h| free(h));
+                let away = (-WALL_STEPS..=1).rev().map(at_side).find(|&h| free(h));
+                let heading = opening.or(keep).or(away).unwrap_or_else(|| wrap(yaw - w.side * 70.0)); // boxed in: turn away
                 t.detour = Some((at + DETOUR_FOR, heading));
                 s.avoiding = "wall";
                 return Ok(found);
@@ -673,6 +709,7 @@ impl Follower {
         let mut escape: Option<Instant> = None;
         let mut aside = 1.0f32;
         let mut link: Option<vrc_vr::remote::HmdLink> = None;
+        let mut strafe = 0.0f32;
         while !stop.load(Ordering::SeqCst) {
             std::thread::sleep(TICK);
             if osc.is_none() {
@@ -711,7 +748,8 @@ impl Follower {
             while t.history.front().is_some_and(|h| now - h.0 > ODOMETRY_KEPT) {
                 t.history.pop_front();
             }
-            let fresh = t.wall.is_some() || t.target.is_some_and(|f| f.at.elapsed() < LOST_AFTER);
+            let seeking = t.seek.is_some_and(|until| now < until);
+            let fresh = t.wall.is_some() || seeking || t.target.is_some_and(|f| f.at.elapsed() < LOST_AFTER);
             let walling = t.wall.is_some();
             let mut jump = false;
             let want = match t.target_now() {
@@ -783,8 +821,25 @@ impl Follower {
             }
             let facing = t.facing;
             drop(t);
-            if (want - axis).abs() > 0.02 || (want == 0.0 && axis != 0.0) {
-                self.set_axis(bridge, &mut axis, want.clamp(-1.0, 1.0));
+            // Walking goes where the head looks: split the stick so the walk
+            // keeps to the facing while a glance turns the head.
+            let off = heading.map_or(0.0, |h| angle_diff(facing, h));
+            let (ahead_axis, aside_axis) = if want > 0.0 {
+                if off.abs() > 100.0 {
+                    (0.0, 0.0)
+                } else {
+                    let (s, c) = off.to_radians().sin_cos();
+                    (want * c, want * s)
+                }
+            } else {
+                (want, 0.0)
+            };
+            if (ahead_axis - axis).abs() > 0.02 || (ahead_axis == 0.0 && axis != 0.0) {
+                self.set_axis(bridge, &mut axis, ahead_axis.clamp(-1.0, 1.0));
+            }
+            if (aside_axis - strafe).abs() > 0.03 || (aside_axis == 0.0 && strafe != 0.0) {
+                strafe = aside_axis.clamp(-1.0, 1.0);
+                let _ = bridge.osc.send_f32("/input/Horizontal", strafe);
             }
             if jump {
                 last_jump = Some(now);
@@ -806,6 +861,7 @@ impl Follower {
             }
         }
         self.set_axis(bridge, &mut axis, 0.0);
+        let _ = bridge.osc.send_f32("/input/Horizontal", 0.0);
     }
 
     fn set_axis(&self, bridge: &Arc<Bridge>, axis: &mut f32, value: f32) {
