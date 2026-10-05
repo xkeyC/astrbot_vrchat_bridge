@@ -538,8 +538,10 @@ impl Follower {
             } else if Instant::now() >= next_search {
                 if !searching {
                     searching = true;
-                    if let Some(mut s) = self.inner_for(&stop) {
-                        s.state = "searching";
+                    // The event after the lock: sending it reads the follow's
+                    // state (status), and the lock is not reentrant.
+                    let current = self.inner_for(&stop).map(|mut s| s.state = "searching").is_some();
+                    if current {
                         bridge.send_event(json!({"type": "follow", "state": "searching", "target": target}));
                     }
                 }
@@ -568,8 +570,8 @@ impl Follower {
             let seen = track.lk().target.is_some_and(|f| f.at.elapsed() < LOST_AFTER);
             if seen && searching {
                 searching = false;
-                if let Some(mut s) = self.inner_for(&stop) {
-                    s.state = "following";
+                let current = self.inner_for(&stop).map(|mut s| s.state = "following").is_some();
+                if current {
                     bridge.send_event(json!({"type": "follow", "state": "found", "target": target}));
                 }
             }
