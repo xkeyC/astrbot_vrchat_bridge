@@ -74,12 +74,14 @@ impl Fov {
     }
 }
 
-fn quat_axis(axis: [f32; 3], angle: f32) -> [f32; 4] {
+/// The rotation by `angle` radians about the unit `axis`.
+pub fn quat_axis(axis: [f32; 3], angle: f32) -> [f32; 4] {
     let (s, c) = (angle / 2.0).sin_cos();
     [axis[0] * s, axis[1] * s, axis[2] * s, c]
 }
 
-fn quat_mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+/// `a` after `b` (Hamilton product).
+pub fn quat_mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
     let [ax, ay, az, aw] = a;
     let [bx, by, bz, bw] = b;
     [

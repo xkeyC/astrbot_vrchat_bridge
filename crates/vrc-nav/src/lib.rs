@@ -112,7 +112,7 @@ pub fn survey(rig: &mut Rig, opts: &SurveyOptions, blocked: &[[f32; 2]]) -> Resu
         views.push((yaw, -80.0));
     }
     // Arms down at the sides, out of the views.
-    rig.hmd.state.hands_at_rest(head.position);
+    rig.hmd.state.hands_at_rest(head.position, yaw);
     rig.hmd.send()?;
     sleep(ARMS_SETTLE);
     let t = Instant::now();

@@ -17,6 +17,7 @@ pub struct OcrLine {
     pub bbox: [f32; 4],
 }
 
+#[derive(Clone)]
 pub struct OcrClient {
     host: String,
     port: u16,

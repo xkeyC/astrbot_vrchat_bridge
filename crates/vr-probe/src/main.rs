@@ -153,7 +153,7 @@ fn main() -> Result<()> {
         Command::Walk { yaw, metres, axis } => {
             let mut hmd = RemoteHmd::connect(&cli.remote)?;
             let head = hmd.state.head.position;
-            hmd.state.hands_at_rest(head);
+            hmd.state.hands_at_rest(head, yaw);
             let osc = Osc::connect()?;
             let leg = walk::leg(&mut hmd, &osc, yaw, metres, &walk::WalkParams { axis, ..Default::default() })?;
             for (t, vx, vz) in &leg.samples {
@@ -165,7 +165,7 @@ fn main() -> Result<()> {
             let mut hmd = RemoteHmd::connect(&cli.remote)?;
             let head = hmd.state.head.position;
             match pose.as_str() {
-                "rest" => hmd.state.hands_at_rest(head),
+                "rest" => hmd.state.hands_at_rest(head, yaw),
                 "up-behind" => hmd.state.hands_up_behind(head, yaw),
                 other => anyhow::bail!("no hand pose {other}"),
             }

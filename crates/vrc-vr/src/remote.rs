@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
-use crate::pose::{Fov, Pose};
+use crate::pose::{quat_axis, quat_mul, Fov, Pose};
 
 /// Size of `struct r_remote_data`.
 pub const PACKET_SIZE: usize = 376;
@@ -26,6 +26,15 @@ const CENTER_AT: usize = HEAD_AT + 2 * VIEW_SIZE;
 const PER_VIEW_VALID_AT: usize = CENTER_AT + 28;
 const LEFT_AT: usize = 136;
 const RIGHT_AT: usize = 256;
+
+/// The eyes' height above VRChat's floor in the tracking space (VRChat
+/// scales the world so; measured by stereo, see `docs/full-vr` D13).
+pub const EYE_HEIGHT: f32 = 1.93;
+/// The relaxed hand: tipped down and turned palm-back (degrees), fingers
+/// curled (little, ring, middle, index, thumb; 0..1).
+const REST_TIP_DEG: f32 = 20.0;
+const REST_TURN_DEG: f32 = 20.0;
+const REST_CURL: [f32; 5] = [0.40, 0.35, 0.30, 0.25, 0.25];
 
 /// One eye as the driver reports it: its field of view, and its pose
 /// relative to the head.
@@ -77,21 +86,33 @@ pub struct State {
 
 impl State {
     /// Both hands hanging at the sides of a body under `head` (tracking
-    /// space), palms in. Monado's remote driver starts them half a metre in
-    /// front of the eyes: then turning the head swings the avatar's arms into
-    /// the view (they reach for hands that did not turn).
-    pub fn hands_at_rest(&mut self, head: [f32; 3]) {
-        let down = |side: f32| Pose {
-            // Pointing down: -90 degrees about x; then rolled so the palm faces in.
-            orientation: {
-                let (s, c) = (std::f32::consts::FRAC_PI_4.sin(), std::f32::consts::FRAC_PI_4.cos());
-                [-s, 0.0, 0.0, c]
-            },
-            position: [head[0] + side * 0.22, head[1] - 0.75, head[2] + 0.05],
-        };
-        for (hand, side) in [(&mut self.left, -1.0), (&mut self.right, 1.0)] {
+    /// space) that faces `body_yaw_deg`, palms in. Monado's remote driver
+    /// starts them half a metre in front of the eyes: then turning the head
+    /// swings the avatar's arms into the view (they reach for hands that did
+    /// not turn). The body is where the hands say: VRChat turns it to keep
+    /// them at its sides, so placing them for a new facing turns the body.
+    ///
+    /// The pose is OpenXR's grip pose, whose identity (in the body's frame)
+    /// is a fist hanging at the side: palm in, thumb ahead (-z runs from the
+    /// little finger to the thumb). Relaxed, the hand tips down a little and
+    /// turns the palm a little back. Pointing the grip's -z down instead
+    /// (the old pose) made the arm bend the wrist and cross the body.
+    pub fn hands_at_rest(&mut self, head: [f32; 3], body_yaw_deg: f32) {
+        let body = Pose::looking(body_yaw_deg, 0.0, head);
+        let (tip, turn) = (REST_TIP_DEG.to_radians(), REST_TURN_DEG.to_radians());
+        for (hand, side) in [(&mut self.left, -1.0f32), (&mut self.right, 1.0)] {
+            let relaxed = quat_mul(quat_axis([0.0, 1.0, 0.0], side * turn), quat_axis([1.0, 0.0, 0.0], -tip));
+            // Body frame: +x right, -z ahead; in eye heights.
+            let offset = body.rotate([side * 0.125 * EYE_HEIGHT, -0.49 * EYE_HEIGHT, 0.04 * EYE_HEIGHT]);
             hand.active = true;
-            hand.pose = down(side);
+            hand.pose = Pose {
+                orientation: quat_mul(body.orientation, relaxed),
+                position: [head[0] + offset[0], head[1] + offset[1], head[2] + offset[2]],
+            };
+            // Fingers loosely curled (little, ring, middle, index, thumb):
+            // xrizer passes them on as the skeleton (XR_EXT_hand_tracking).
+            hand.hand_tracking_active = true;
+            hand.hand_curl = REST_CURL;
         }
     }
 
@@ -304,6 +325,23 @@ impl Reader<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hands_rest_at_the_sides() {
+        let mut s = State::default();
+        s.hands_at_rest([0.0, 1.93, 0.0], 0.0);
+        let q = s.right.pose.orientation;
+        for (a, b) in q.iter().zip([-0.1710, 0.1710, 0.0302, 0.9698]) {
+            assert!((a - b).abs() < 1e-3, "{q:?}");
+        }
+        // The grip's -z (little finger to thumb): ahead, a little down and in.
+        let tube = s.right.pose.rotate([0.0, 0.0, -1.0]);
+        assert!(tube[2] < -0.8 && tube[1] < 0.0 && tube[0] < 0.0, "{tube:?}");
+        assert!(s.left.pose.position[0] < 0.0 && s.right.pose.position[0] > 0.0);
+        // Facing right (+x): the right hand is behind (+z), the left ahead.
+        s.hands_at_rest([0.0, 1.93, 0.0], 90.0);
+        assert!(s.right.pose.position[2] > 0.2 && s.left.pose.position[2] < -0.2);
+    }
 
     #[test]
     fn round_trips() {

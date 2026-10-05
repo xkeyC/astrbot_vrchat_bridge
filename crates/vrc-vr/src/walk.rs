@@ -55,6 +55,8 @@ impl Default for WalkParams {
 /// Faces `yaw_deg` (head, level) and walks `metres` (world) forward.
 pub fn leg(hmd: &mut RemoteHmd, osc: &Osc, yaw_deg: f32, metres: f32, p: &WalkParams) -> Result<Leg> {
     let head = hmd.state.head.position;
+    // The whole body faces the way: the hands too.
+    hmd.state.hands_at_rest(head, yaw_deg);
     hmd.set_head(Pose::looking(yaw_deg, 0.0, head))?;
     sleep(Duration::from_millis(60)); // a frame or two for the body to follow
     let started = Instant::now();

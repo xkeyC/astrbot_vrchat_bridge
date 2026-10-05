@@ -405,8 +405,12 @@ async fn social_config(State(b): State<App>, Body(body): Body) -> Reply {
 async fn screenshot(State(b): State<App>, Query(q): Query<std::collections::HashMap<String, String>>) -> std::result::Result<Response, Fail> {
     b.require_game()?;
     let width: u32 = q.get("width").and_then(|w| w.parse().ok()).unwrap_or(0).min(3840);
+    let pitch: Option<f32> = q.get("pitch").and_then(|p| p.parse().ok());
     let jpeg = on_headset(&b, move |vr, _| {
-        let frame = vr.frame()?;
+        let frame = match pitch {
+            Some(pitch) => vr.frame_looking(pitch)?,
+            None => vr.frame()?,
+        };
         vr::eye_jpeg(&frame, width)
     })
     .await?;

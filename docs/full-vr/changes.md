@@ -22,6 +22,8 @@
 | `legacy/bridge/` | 由 `bridge/` 移入，后来整个删除（已由 `crates/vrc-bridge` 取代，代码可在 git 历史中查到） |
 | `third_party/` | Monado、xrizer 的基础提交说明和补丁 |
 | `ops/vr/` | 构建脚本（Monado、xrizer）、安装脚本、`vrc-launch.sh`（按 `~/.config/vrc-mode` 切换桌面/VR）、Monado 配置、`openvrpaths.vrpath` 模板、`vrc-monado.service` 用户单元 |
+| `crates/vrc-vr` 的 `remote` | 静止时双手的姿势跟着身体朝向放，握持姿态按 OpenXR 规范，手指放松（D21） |
+| `crates/vrc-bridge` 的 `follow` | 重写：看和走拆成两个线程，靠自身速度推算距离，刹车平滑；找人时逐个方向看（D22）。`/v1/screenshot` 加 `pitch` 参数 |
 | `docs/full-vr/` | 本文档集 |
 
 ## 其他项目

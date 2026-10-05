@@ -9,6 +9,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use vrc_nav::{GotoOptions, Rig, Survey, SurveyOptions};
 use vrc_vr::osc::Osc;
+use vrc_vr::scan;
 use vrc_vr::tap::EyeFrame;
 use vrc_vr::walk::{self, WalkParams};
 use vrc_vr::Pose;
@@ -53,7 +54,7 @@ impl VrCore {
             self.yaw = yaw;
             self.pitch = pitch;
             let head = rig.hmd.state.head.position;
-            rig.hmd.state.hands_at_rest(head);
+            rig.hmd.state.hands_at_rest(head, yaw);
             self.rig = Some(rig);
         }
         let rig = self.rig.as_mut().unwrap();
@@ -79,6 +80,15 @@ impl VrCore {
         self.yaw = (yaw + 540.0).rem_euclid(360.0) - 180.0;
         self.pitch = pitch;
         Ok(())
+    }
+
+    /// Turns the whole bot: the head (degrees; pitch clamped to +-80) and
+    /// the body under it (the hands at its sides).
+    pub fn face(&mut self, yaw: f32, pitch: f32) -> Result<()> {
+        let rig = self.rig(&[])?;
+        let head = rig.hmd.state.head.position;
+        rig.hmd.state.hands_at_rest(head, yaw);
+        self.aim(yaw, pitch)
     }
 
     // -- surveys and walks --------------------------------------------------------
@@ -143,7 +153,7 @@ impl VrCore {
         };
         let facing = self.yaw + turn;
         if turn != 0.0 || meters == 0.0 {
-            self.aim(facing, 0.0)?;
+            self.face(facing, 0.0)?;
         }
         if jump {
             osc_jump();
@@ -163,6 +173,15 @@ impl VrCore {
             "ok": true, "turned": turn, "blocked": leg.blocked,
             "moved": {"ahead_m": r1(leg.walked * c), "right_m": r1(leg.walked * s)},
         }))
+    }
+
+    /// The first frame with the head tilted to `pitch` (degrees, + up).
+    pub fn frame_looking(&mut self, pitch: f32) -> Result<EyeFrame> {
+        let yaw = self.yaw;
+        self.aim(yaw, pitch)?;
+        let pitch = self.pitch;
+        let rig = self.rig(&[])?;
+        scan::rendered_at(&mut rig.tap, yaw, pitch, Duration::from_secs(1))
     }
 
     /// The latest frame of the eyes.
