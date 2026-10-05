@@ -1,5 +1,5 @@
 //! Matching OCR text to display names. Same rule as the desktop bridge
-//! (`legacy/bridge/follow.py`): case and spaces ignored; a name inside a
+//! (its Python `follow.py`, in the git history): case and spaces ignored; a name inside a
 //! longer line is a full match; otherwise a similarity ratio, and 0.6 or
 //! more counts.
 

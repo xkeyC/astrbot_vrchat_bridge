@@ -19,7 +19,7 @@
 | `ops/vr/vrc-bridge.service` | 新增。Rust bridge 的用户单元 |
 | `astrbot_plugin/` | 改为只支持 VR：删掉桌面导航工具，新增 look_around、walk_to、step、last_seen；VR 版提示词 |
 | `astrbot_plugin/` | 由根目录移入：`main.py`、`vrchat_adapter.py`、`metadata.yaml`、`logo.svg`，内容未改 |
-| `legacy/bridge/` | 由 `bridge/` 移入，内容未改（桌面模式仍可用） |
+| `legacy/bridge/` | 由 `bridge/` 移入，后来整个删除（已由 `crates/vrc-bridge` 取代，代码可在 git 历史中查到） |
 | `third_party/` | Monado、xrizer 的基础提交说明和补丁 |
 | `ops/vr/` | 构建脚本（Monado、xrizer）、安装脚本、`vrc-launch.sh`（按 `~/.config/vrc-mode` 切换桌面/VR）、Monado 配置、`openvrpaths.vrpath` 模板、`vrc-monado.service` 用户单元 |
 | `docs/full-vr/` | 本文档集 |

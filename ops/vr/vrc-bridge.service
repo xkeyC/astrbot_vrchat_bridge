@@ -1,5 +1,5 @@
 # User unit of the bot user: ~/.config/systemd/user/vrc-bridge.service
-# The Rust bridge (crates/vrc-bridge), replacing legacy/bridge's Python one.
+# The Rust bridge (crates/vrc-bridge).
 # Machine-specific arguments (listen address, infra's OCR) go in
 # ~/.config/vrc-bridge/env as VRC_BRIDGE_ARGS=...
 [Unit]

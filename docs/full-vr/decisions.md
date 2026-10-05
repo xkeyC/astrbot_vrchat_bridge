@@ -182,7 +182,7 @@
 - **现在的工具**：
   - 语音：look_around、walk_to、step、last_seen、follow、follow_adjust、emote、jump、stop、chatbox、who；
   - 文字线程另外还有：status、social、follow_rooms、join。
-- **旧 Python bridge** 保留在 `legacy/bridge/` 作参考（桌面模式）。
+- **旧 Python bridge** 已删除（用户要求，git 历史可查），桌面模式不再维护。
 
 ## 待定 / 下一步
 

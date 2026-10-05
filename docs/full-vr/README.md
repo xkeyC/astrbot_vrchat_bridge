@@ -49,7 +49,6 @@ crates/vrc-nav/         环视（survey）和走到某点（goto）
 crates/vrc-bridge/      bridge：HTTP/WebSocket 给 AstrBot 插件（音频、状态、输入、Web API、跟随、VR 能力）
 crates/vr-probe/        手动调试工具：info / grab / look / sweep / depth / scan
 astrbot_plugin/         AstrBot 插件（Python，AstrBot 只认 Python 插件；本分支只支持 VR）
-legacy/bridge/          桌面模式的 Python bridge（已由 vrc-bridge 取代，仅作参考）
 third_party/monado/     上游基础提交 + 补丁
 third_party/xrizer/     上游基础提交 + 补丁
 ops/vr/                 构建、安装脚本和配置（已脱敏，路径和用户用参数传入）
