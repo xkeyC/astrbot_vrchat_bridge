@@ -10,4 +10,5 @@ repository.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 png.workspace = true
+vrc-stereo.workspace = true
 vrc-vr.workspace = true

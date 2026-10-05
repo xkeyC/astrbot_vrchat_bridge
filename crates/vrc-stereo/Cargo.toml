@@ -1,0 +1,11 @@
+[package]
+name = "vrc-stereo"
+version = "0.1.0"
+description = "Stereo depth from the bot's two rendered eyes: census SGM, metric depth, point clouds"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rayon.workspace = true
+vrc-vr.workspace = true

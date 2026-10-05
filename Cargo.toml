@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/vrc-vr", "crates/vr-probe"]
+members = ["crates/vrc-vr", "crates/vrc-stereo", "crates/vr-probe"]
 
 [workspace.package]
 edition = "2021"
@@ -12,4 +12,10 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 memmap2 = "0.9"
 png = "0.17"
+rayon = "1"
+vrc-stereo = { path = "crates/vrc-stereo" }
 vrc-vr = { path = "crates/vrc-vr" }
+
+# SGM loops are hot even in tests and probes run on the server: optimise them.
+[profile.dev.package.vrc-stereo]
+opt-level = 3
