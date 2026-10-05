@@ -1,17 +1,14 @@
 [package]
-name = "vr-probe"
+name = "vrc-players"
 version = "0.1.0"
-description = "Pokes the bot's virtual headset by hand: set the head, grab the eyes"
+description = "Who is around and where: name tags read by OCR, matched to the room's players and the whitelist, placed by stereo"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-clap.workspace = true
-png.workspace = true
+jpeg-encoder.workspace = true
 serde_json.workspace = true
-vrc-nav.workspace = true
-vrc-scene.workspace = true
 vrc-stereo.workspace = true
 vrc-vr.workspace = true

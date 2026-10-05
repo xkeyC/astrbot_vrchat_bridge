@@ -12,9 +12,11 @@
 //! See `docs/full-vr/` for how the pieces fit and why.
 
 pub mod fps;
+pub mod osc;
 pub mod pose;
 pub mod remote;
 pub mod scan;
 pub mod tap;
+pub mod walk;
 
 pub use pose::{Fov, Pose};

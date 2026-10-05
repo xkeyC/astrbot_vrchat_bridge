@@ -76,6 +76,40 @@ pub struct State {
 }
 
 impl State {
+    /// Both hands hanging at the sides of a body under `head` (tracking
+    /// space), palms in. Monado's remote driver starts them half a metre in
+    /// front of the eyes: then turning the head swings the avatar's arms into
+    /// the view (they reach for hands that did not turn).
+    pub fn hands_at_rest(&mut self, head: [f32; 3]) {
+        let down = |side: f32| Pose {
+            // Pointing down: -90 degrees about x; then rolled so the palm faces in.
+            orientation: {
+                let (s, c) = (std::f32::consts::FRAC_PI_4.sin(), std::f32::consts::FRAC_PI_4.cos());
+                [-s, 0.0, 0.0, c]
+            },
+            position: [head[0] + side * 0.22, head[1] - 0.75, head[2] + 0.05],
+        };
+        for (hand, side) in [(&mut self.left, -1.0), (&mut self.right, 1.0)] {
+            hand.active = true;
+            hand.pose = down(side);
+        }
+    }
+
+    /// Both hands raised behind the head as seen looking along `yaw_deg`:
+    /// out of that view, so only a mirror shows them (`vrc_scene::mirror`).
+    pub fn hands_up_behind(&mut self, head: [f32; 3], yaw_deg: f32) {
+        let (s, c) = yaw_deg.to_radians().sin_cos();
+        // View frame: right = (c, 0, s), ahead = (s, 0, -c); behind is -ahead.
+        for (hand, side) in [(&mut self.left, -1.0f32), (&mut self.right, 1.0)] {
+            let (right, back) = (side * 0.25, 0.45);
+            hand.active = true;
+            hand.pose = Pose {
+                orientation: [0.0, 0.0, 0.0, 1.0],
+                position: [head[0] + right * c - back * s, head[1] + 0.3, head[2] + right * s + back * c],
+            };
+        }
+    }
+
     pub fn encode(&self) -> [u8; PACKET_SIZE] {
         let mut w = Writer { buf: [0; PACKET_SIZE], at: 0 };
         w.bytes(&MAGIC);

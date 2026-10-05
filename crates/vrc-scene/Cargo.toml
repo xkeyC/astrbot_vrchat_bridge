@@ -8,4 +8,5 @@ repository.workspace = true
 
 [dependencies]
 rayon.workspace = true
+vrc-stereo.workspace = true
 vrc-vr.workspace = true

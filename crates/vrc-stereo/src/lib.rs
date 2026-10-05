@@ -59,6 +59,19 @@ impl Stereo {
         disp.data.iter().map(|&d| if d > 0.25 { fb / d } else { f32::NAN }).collect()
     }
 
+    /// The tracking-space point at (`x`, `y`) of the matched (scaled) left
+    /// image with disparity `d`; pixel coordinates are continuous (a pixel's
+    /// centre is at +0.5).
+    pub fn point(&self, x: f32, y: f32, d: f32) -> [f32; 3] {
+        let [fx, fy, cx, cy] = self.intrinsics;
+        let z = fx * self.baseline / d;
+        // OpenXR view space: x right, y up, -z ahead; pixel rows go down.
+        let v = [(x - cx) / fx * z, -(y - cy) / fy * z, -z];
+        let r = self.left_pose.rotate(v);
+        let t = self.left_pose.position;
+        [r[0] + t[0], r[1] + t[1], r[2] + t[2]]
+    }
+
     /// Points in the tracking space (every `step`th pixel each way), and the
     /// pixel each came from.
     pub fn points(&self, disp: &Disparity, step: usize) -> Vec<([f32; 3], (u32, u32))> {

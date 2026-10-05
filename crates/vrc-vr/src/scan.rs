@@ -32,7 +32,9 @@ pub fn ring(count: usize, pitch: f32) -> Vec<(f32, f32)> {
 
 /// Turns the head through `views` (yaw, pitch in degrees, relative to the
 /// tracking space) and returns the first frame rendered looking at each; the
-/// head goes back to where it was at the end.
+/// head goes back to where it was at the end. The hands stay where the
+/// caller put them: down at the sides ([`crate::remote::State::hands_at_rest`])
+/// keeps the arms out of the views.
 pub fn scan(hmd: &mut RemoteHmd, tap: &mut EyeTap, views: &[(f32, f32)], timeout: Duration) -> Result<Vec<Shot>> {
     let home = hmd.state.head;
     let mut shots = Vec::with_capacity(views.len());
@@ -143,6 +145,24 @@ pub fn rendered_at(tap: &mut EyeTap, yaw: f32, pitch: f32, timeout: Duration) ->
         sleep(Duration::from_millis(2));
     }
     bail!("no frame rendered looking at yaw {yaw}, pitch {pitch} within {timeout:?}")
+}
+
+/// The first frame newer than `after_seq` rendered looking at `yaw`, `pitch`
+/// (for "the same view, after something changed").
+pub fn rendered_after(tap: &mut EyeTap, after_seq: u64, yaw: f32, pitch: f32, timeout: Duration) -> Result<EyeFrame> {
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if let Some(head) = tap.peek()? {
+            let (y, p) = head.views[0].pose.yaw_pitch();
+            if head.seq > after_seq && angle_diff(y, yaw).abs() < AIM_TOLERANCE_DEG && (p - pitch).abs() < AIM_TOLERANCE_DEG {
+                if let Some(frame) = tap.read_seq(head.seq)? {
+                    return Ok(frame);
+                }
+            }
+        }
+        sleep(Duration::from_millis(2));
+    }
+    bail!("no new frame looking at yaw {yaw}, pitch {pitch} within {timeout:?}")
 }
 
 /// `a - b` wrapped to -180..180 degrees.

@@ -15,12 +15,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use vrc_scene::{HeightMap, MapParams, Panorama};
+use vrc_nav::{GotoOptions, Rig, Survey, SurveyOptions};
+use vrc_scene::Kind;
 use vrc_stereo::{fit_floor, SgmParams, Stereo};
-use vrc_vr::fps::FpsControl;
+use vrc_vr::osc::Osc;
 use vrc_vr::remote::RemoteHmd;
 use vrc_vr::scan;
 use vrc_vr::tap::{EyeFrame, EyeTap};
+use vrc_vr::walk;
 use vrc_vr::Pose;
 
 #[derive(Parser)]
@@ -31,9 +33,14 @@ struct Cli {
     /// The null compositor's eye tap.
     #[arg(long, default_value = "/dev/shm/vrc-eyes", global = true)]
     tap: PathBuf,
-    /// The null compositor's frame rate control.
-    #[arg(long, default_value = "/dev/shm/vrc-fps", global = true)]
-    fps_file: PathBuf,
+    /// local-multimodal-infra's OCR endpoint ("" for no OCR).
+    #[arg(long, default_value = "http://10.88.0.1:17890/v1/ocr/lines", global = true)]
+    ocr_url: String,
+    #[arg(long, default_value = "ppocrv5-mobile-onnx", global = true)]
+    ocr_model: String,
+    /// Whitelisted display names, in priority order (comma-separated).
+    #[arg(long, value_delimiter = ',', global = true)]
+    whitelist: Vec<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -62,6 +69,24 @@ enum Command {
         #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
         pitch: f32,
     },
+    /// Walk one measured leg: face --yaw (head) and walk --metres (world).
+    Walk {
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+        yaw: f32,
+        #[arg(long, default_value_t = 1.0)]
+        metres: f32,
+        #[arg(long, default_value_t = 0.6)]
+        axis: f32,
+    },
+    /// Put the hands somewhere: rest (down at the sides), up-behind (raised
+    /// behind the head as seen along --yaw), and hold.
+    Hands {
+        pose: String,
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+        yaw: f32,
+        #[arg(long, default_value_t = 1.0)]
+        hold: f32,
+    },
     /// Stereo depth of the latest frame: `<prefix>_depth.png` (left eye |
     /// depth), `<prefix>.ply` (points in the tracking space), and a floor fit.
     Depth {
@@ -84,13 +109,17 @@ enum Command {
         /// Also look down at the feet.
         #[arg(long)]
         down: bool,
-        /// Render this fast during the scan (0: as is).
-        #[arg(long, default_value_t = 0)]
-        boost: u32,
-        /// Move the head on every this many ms without waiting for each
-        /// view's frame (0: view by view).
-        #[arg(long, default_value_t = 0)]
-        hold_ms: u64,
+    },
+    /// Survey, then walk to a candidate (or a point by bearing and distance):
+    /// `<prefix>_before_*` and `<prefix>_after_*` pictures.
+    Goto {
+        prefix: PathBuf,
+        #[arg(long)]
+        candidate: Option<usize>,
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+        bearing: f32,
+        #[arg(long, default_value_t = 2.0)]
+        distance: f32,
     },
 }
 
@@ -121,12 +150,35 @@ fn main() -> Result<()> {
                 println!("{}\n-> {}", describe(&frame), out.display());
             }
         }
+        Command::Walk { yaw, metres, axis } => {
+            let mut hmd = RemoteHmd::connect(&cli.remote)?;
+            let head = hmd.state.head.position;
+            hmd.state.hands_at_rest(head);
+            let osc = Osc::connect()?;
+            let leg = walk::leg(&mut hmd, &osc, yaw, metres, &walk::WalkParams { axis, ..Default::default() })?;
+            for (t, vx, vz) in &leg.samples {
+                println!("  {t:5.2} s  vx {vx:+.2}  vz {vz:+.2}");
+            }
+            println!("walked {:.2} m of {metres} in {:.2} s{}", leg.walked, leg.took.as_secs_f32(), if leg.blocked { ", BLOCKED" } else { "" });
+        }
+        Command::Hands { ref pose, yaw, hold } => {
+            let mut hmd = RemoteHmd::connect(&cli.remote)?;
+            let head = hmd.state.head.position;
+            match pose.as_str() {
+                "rest" => hmd.state.hands_at_rest(head),
+                "up-behind" => hmd.state.hands_up_behind(head, yaw),
+                other => anyhow::bail!("no hand pose {other}"),
+            }
+            hmd.send()?;
+            sleep(Duration::from_secs_f32(hold));
+        }
         Command::Depth { prefix, scale, max_disparity } => {
             depth(&latest(&mut tap)?, &prefix, scale, max_disparity)?
         }
-        Command::Scan { ref prefix, count, pitch, down, boost, hold_ms } => {
-            scan_around(&cli, &mut tap, prefix, count, pitch, down, boost, hold_ms)?
+        Command::Scan { ref prefix, count, pitch, down } => {
+            scan_around(&cli, prefix, &SurveyOptions { count, pitch, down, ..Default::default() })?
         }
+        Command::Goto { ref prefix, candidate, bearing, distance } => goto_cmd(&cli, prefix, candidate, bearing, distance)?,
     }
     Ok(())
 }
@@ -234,87 +286,132 @@ fn latest(tap: &mut EyeTap) -> Result<EyeFrame> {
     tap.read()?.context("Monado has not tapped a frame yet")
 }
 
-/// The first frame whose eyes look where the head was just turned.
-/// Head scan: a ring of views (and one looking down at the feet), the
-/// panorama of their left eyes, and a height map from stereo on each.
-#[allow(clippy::too_many_arguments)]
-fn scan_around(
-    cli: &Cli,
-    tap: &mut EyeTap,
-    prefix: &Path,
-    count: usize,
-    pitch: f32,
-    down: bool,
-    boost: u32,
-    hold_ms: u64,
-) -> Result<()> {
+/// A survey: scan all around, stereo, height map, players, candidates;
+/// writes the panorama and the map (numbered) and the candidates.
+fn scan_around(cli: &Cli, prefix: &Path, opts: &SurveyOptions) -> Result<()> {
     if let Some(dir) = prefix.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let stem = prefix.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "scan".into());
-    let mut hmd = RemoteHmd::connect(&cli.remote)?;
-    let head = hmd.state.head;
-    let mut views = scan::ring(count, pitch);
-    if down {
-        views.push((0.0, -80.0));
-    }
-    let started = Instant::now();
-    let fps = if boost > 0 { Some(FpsControl::open(&cli.fps_file)?) } else { None };
-    let mut was = 0;
-    if let Some(fps) = &fps {
-        was = fps.current();
-        let now = fps.set(boost, Duration::from_millis(500));
-        println!("frame rate {was} -> {now} fps in {:.0} ms", started.elapsed().as_secs_f64() * 1e3);
-    }
-    let shots = if hold_ms > 0 {
-        scan::scan_pipelined(&mut hmd, tap, &views, Duration::from_millis(hold_ms), Duration::from_secs(2))
-    } else {
-        scan::scan(&mut hmd, tap, &views, Duration::from_secs(2))
-    };
-    if let Some(fps) = &fps {
-        fps.request(was); // back to the rate before the scan
-    }
-    let shots = shots?;
-    let scan_took = started.elapsed();
-    for s in &shots {
-        println!("  yaw {:+6.1} pitch {:+5.1}: frame {} after {:.0} ms", s.yaw, s.pitch, s.frame.frame_id, s.waited.as_secs_f64() * 1e3);
-    }
-    println!("scan: {} views in {:.0} ms", shots.len(), scan_took.as_secs_f64() * 1e3);
-
-    let started = Instant::now();
-    let frames: Vec<&EyeFrame> = shots.iter().map(|s| &s.frame).collect();
-    let pano = Panorama::stitch(&frames, 2048);
-    println!("panorama: {:.0}% covered in {:.0} ms", pano.coverage * 100.0, started.elapsed().as_secs_f64() * 1e3);
-    write_png(&prefix.with_file_name(format!("{stem}_pano.png")), pano.width, pano.height, &pano.rgb)?;
-
-    let started = Instant::now();
-    let mut points = Vec::new();
-    for s in &shots {
-        let stereo = Stereo::from_frame(&s.frame, 2).context("not an 8-bit frame")?;
-        let disp = stereo.disparity(&SgmParams::default());
-        points.extend(stereo.points(&disp, 1).into_iter().map(|(p, _)| p));
-    }
-    let eye = head.position;
-    let floor = fit_floor(&points, eye, 0.5).context("no floor in the scan")?;
-    let mut map = HeightMap::new(MapParams::default(), [eye[0], eye[2]], floor.height);
-    map.add(&points, eye);
-    let [unknown, free, raised, blocked] = map.census();
-    println!(
-        "stereo + map: {} points in {:.0} ms; floor {:.3} below the eye (tilt {:.2} deg); \
-         cells {}x{} of {:.2}: {free} floor, {blocked} obstacle, {raised} raised, {unknown} unknown",
-        points.len(),
-        started.elapsed().as_secs_f64() * 1e3,
-        eye[1] - floor.height,
-        floor.tilt_deg,
-        map.size,
-        map.size,
-        map.params.cell
-    );
-    let (yaw, _) = head.yaw_pitch();
-    write_png(&prefix.with_file_name(format!("{stem}_map.png")), map.size, map.size, &map.render(eye, yaw))?;
-    println!("-> {}_pano.png, {}_map.png", prefix.display(), prefix.display());
+    let mut rig = rig(cli)?;
+    let s = vrc_nav::survey(&mut rig, opts, &[])?;
+    report_survey(&s);
+    save_survey(&s, prefix)?;
     Ok(())
 }
+
+fn rig(cli: &Cli) -> Result<Rig> {
+    Rig::connect(
+        &cli.remote,
+        &cli.tap.to_string_lossy(),
+        Some(cli.ocr_url.as_str()),
+        &cli.ocr_model,
+        cli.whitelist.clone(),
+    )
+}
+
+fn report_survey(s: &Survey) {
+    let t = &s.timings;
+    println!(
+        "survey: scan {:.0} ms, stereo {:.0} ms, OCR {:.0} ms, map {:.0} ms; floor {:.3} below the eye (tilt {:.2} deg); x {:.3} = metres",
+        t.scan.as_secs_f64() * 1e3,
+        t.stereo.as_secs_f64() * 1e3,
+        t.ocr.as_secs_f64() * 1e3,
+        t.map.as_secs_f64() * 1e3,
+        s.eye[1] - s.floor.height,
+        s.floor.tilt_deg,
+        s.metres
+    );
+    if !s.room.is_empty() {
+        println!("room: {}", s.room.join(", "));
+    }
+    for p in &s.players {
+        println!(
+            "  player {} (OCR {:?}, {:.2}){}",
+            p.name,
+            p.text,
+            p.score,
+            p.whitelist_rank.map(|r| format!(" whitelist #{r}")).unwrap_or_default()
+        );
+    }
+    let m = s.metres;
+    for c in &s.candidates {
+        println!(
+            "  {:>2} {:<8} {:>5.1} m at {:+5.0} deg (walk {:.1} m){}",
+            c.id,
+            c.kind.name(),
+            c.distance * m,
+            c.bearing,
+            c.path * m,
+            match (&c.name, c.kind) {
+                (Some(n), _) => format!(" {n}{}", c.whitelist_rank.map(|r| format!(" (whitelist #{r})")).unwrap_or_default()),
+                (None, Kind::Platform) => format!(", top {:+.2} m", (c.position[1] - s.floor.height) * m),
+                _ => String::new(),
+            }
+        );
+    }
+}
+
+fn save_survey(s: &Survey, prefix: &Path) -> Result<()> {
+    let stem = prefix.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "scan".into());
+    let pano = s.marked_panorama(2048);
+    write_png(&prefix.with_file_name(format!("{stem}_pano_marked.png")), pano.width, pano.height, &pano.rgb)?;
+    let (side, map) = s.marked_map(4);
+    write_png(&prefix.with_file_name(format!("{stem}_map_marked.png")), side, side, &map)?;
+    std::fs::write(
+        prefix.with_file_name(format!("{stem}_candidates.json")),
+        serde_json::to_string_pretty(&s.candidates_json())?,
+    )?;
+    println!("-> {p}_pano_marked.png, {p}_map_marked.png, {p}_candidates.json", p = prefix.display());
+    Ok(())
+}
+
+/// Survey, pick a candidate (or a point by bearing and distance), walk there.
+fn goto_cmd(cli: &Cli, prefix: &Path, candidate: Option<usize>, bearing: f32, distance: f32) -> Result<()> {
+    if let Some(dir) = prefix.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let stem = prefix.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "goto".into());
+    let mut rig = rig(cli)?;
+    let s = vrc_nav::survey(&mut rig, &SurveyOptions::default(), &[])?;
+    report_survey(&s);
+    save_survey(&s, &prefix.with_file_name(format!("{stem}_before")))?;
+    let target = match candidate {
+        Some(id) => {
+            let c = s.candidates.iter().find(|c| c.id == id).context("no such candidate")?;
+            println!("going to {} ({}), {:.1} m at {:+.0} deg", c.id, c.kind.name(), c.distance * s.metres, c.bearing);
+            [c.position[0], c.position[2]]
+        }
+        None => {
+            let yaw = (s.yaw + bearing).to_radians();
+            let d = distance / s.metres;
+            println!("going {distance:.1} m at {bearing:+.0} deg");
+            [s.eye[0] + yaw.sin() * d, s.eye[2] - yaw.cos() * d]
+        }
+    };
+    let report = vrc_nav::goto(&mut rig, s, target, &GotoOptions::default())?;
+    for (i, l) in report.legs.iter().enumerate() {
+        println!(
+            "  leg {}: {:.1} m left, heading {:+.0} deg, walked {:.2} of {:.2} m{}",
+            i + 1,
+            l.before,
+            l.yaw,
+            l.walked,
+            l.planned,
+            if l.blocked { ", BLOCKED" } else { "" }
+        );
+    }
+    println!(
+        "{} in {:.1} s, {:.2} m left{}",
+        if report.arrived { "ARRIVED" } else { "STOPPED" },
+        report.took.as_secs_f32(),
+        report.remaining,
+        report.reason.as_ref().map(|r| format!(" ({r})")).unwrap_or_default()
+    );
+    let after = vrc_nav::survey(&mut rig, &SurveyOptions::default(), &[])?;
+    save_survey(&after, &prefix.with_file_name(format!("{stem}_after")))?;
+    Ok(())
+}
+
 
 fn write_png(path: &Path, w: usize, h: usize, rgb: &[u8]) -> Result<()> {
     let mut enc = png::Encoder::new(BufWriter::new(File::create(path)?), w as u32, h as u32);
