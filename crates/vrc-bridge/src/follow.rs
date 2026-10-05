@@ -19,6 +19,17 @@
 //! planner). Pushing without moving (stuck) jumps once, then backs off and
 //! turns aside.
 //!
+//! No nearer for a while with something in the way (a jump that did not
+//! clear it, a detour that leads nowhere), the bot finds a way round: out
+//! of an enclosure the target is outside of (seen through a window), or in
+//! to one they are inside of, alike. It looks all around (a survey: a
+//! height map of everything in sight) and walks (`vrc_nav::goto`) to the
+//! target if the map reaches them, else to the edge of what it has seen
+//! that makes the shortest way to them (walking there, then straight on),
+//! edges it has been to costing more (so it goes on along the wall, not
+//! back and forth at the window), and looks again; round, it looks for them
+//! where they were last.
+//!
 //! Lost, the bot stands and the eyes look around one view at a time,
 //! starting where the target was last seen and widening both ways; the
 //! first view that finds them ends the search and the legs go that way.
@@ -31,7 +42,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use vrc_players::names::match_score;
-use vrc_scene::HeightMap;
+use vrc_nav::GotoOptions;
+use vrc_scene::candidates::reachable;
+use vrc_scene::{HeightMap, Kind};
 use vrc_stereo::{SgmParams, Stereo};
 use vrc_vr::osc::Osc;
 use vrc_vr::remote::FLOOR_Y;
@@ -107,6 +120,21 @@ const ESCAPE_FOR: Duration = Duration::from_millis(500);
 /// Views judge only ways within this of where they look (degrees).
 const VIEW_HALF_DEG: f32 = 40.0;
 const STEREO_THREADS: usize = 6;
+/// No nearer by NO_PROGRESS_M for NO_PROGRESS_FOR, farther than the
+/// standing distance by ROUTE_BEYOND_M and something in the way: find a
+/// way round with surveys, at most ROUTE_ROUNDS of them.
+const NO_PROGRESS_M: f32 = 0.4;
+const NO_PROGRESS_FOR: Duration = Duration::from_secs(6);
+const ROUTE_BEYOND_M: f32 = 1.0;
+const ROUTE_ROUNDS: usize = 8;
+/// An edge within this of one already walked to costs VISITED_COST_M more.
+const VISITED_M: f32 = 1.2;
+const VISITED_COST_M: f32 = 4.0;
+/// Walks to an edge give up after this many legs; an edge not reached
+/// rules out edges within DEAD_END_M of it for the rest of the way round
+/// (a gap the map shows in a wall that is not there: no trying it again).
+const ROUTE_LEGS: usize = 3;
+const DEAD_END_M: f32 = 1.5;
 
 #[derive(Default)]
 pub struct Follower {
@@ -158,6 +186,10 @@ struct Track {
     jumped: Option<(Instant, [f32; 2])>,
     /// Obstacles a jump did not get past (odometry), until when.
     no_jump: Vec<([f32; 2], Instant)>,
+    /// Finding a way round with surveys: the legs keep only the odometry.
+    routing: bool,
+    /// The nearest the target has been lately, and since when.
+    progress: Option<(Instant, f32)>,
 }
 
 /// Something in the way (world metres).
@@ -205,12 +237,15 @@ struct Blocker {
 /// metre wide out to 4 m; `None` when the way is clear. The ground is
 /// followed along the corridor (slopes, steps), so a raised floor is not in
 /// the way; something stands in the way when it rises more than a step
-/// over the ground before it. Points nearer than 0.35 m are the bot's own
-/// arm (a gesture).
+/// over the ground before it. Points nearer than 0.9 m are the bot's own
+/// body (arms swinging forward, a gesture, props such as a weapon on the
+/// back that reaches over the shoulder; the walks' maps leave out 0.8 m):
+/// nearer obstacles were seen from farther, and the odometry counts down to
+/// them.
 fn corridor(points: &[[f32; 3]], eye: [f32; 3], yaw: f32, metres: f32, floor: f32) -> Option<Blocker> {
     const BIN: f32 = 0.1;
-    const FROM: f32 = 0.35;
-    const BINS: usize = 37;
+    const FROM: f32 = 0.9;
+    const BINS: usize = 31;
     let (s, c) = yaw.to_radians().sin_cos();
     let eye_m = (eye[1] - floor) * metres;
     // Per 10 cm along the way: the heights of the points in it.
@@ -421,6 +456,22 @@ impl Follower {
                 bridge.vr.lock().unwrap().reset();
                 std::thread::sleep(Duration::from_millis(500));
             }
+            if self.walled_in(&track) {
+                self.inner.lock().unwrap().state = "routing";
+                bridge.send_event(json!({"type": "follow", "state": "routing", "target": target}));
+                match self.route(&bridge, &track, &target, &stop) {
+                    Ok(out) => tracing::info!("follow: way round {}", if out { "found" } else { "not found" }),
+                    Err(e) => {
+                        tracing::warn!("follow: finding a way round failed: {e:#}");
+                        bridge.vr.lock().unwrap().reset();
+                    }
+                }
+                let mut t = track.lock().unwrap();
+                (t.routing, t.obstacle, t.detour, t.progress) = (false, None, None, None);
+                t.no_jump.clear();
+                drop(t);
+                self.inner.lock().unwrap().state = "following";
+            }
             let seen = track.lock().unwrap().target.is_some_and(|f| f.at.elapsed() < LOST_AFTER);
             if seen && searching {
                 searching = false;
@@ -436,6 +487,118 @@ impl Follower {
         s.moving = 0.0;
         drop(s);
         bridge.notify_state();
+    }
+
+    /// Whether to find a way round: no nearer for a while, well beyond the
+    /// standing distance, something in the way.
+    fn walled_in(&self, track: &Arc<Mutex<Track>>) -> bool {
+        let stand = self.inner.lock().unwrap().stand;
+        let mut t = track.lock().unwrap();
+        let Some(goal) = t.target.filter(|f| f.at.elapsed() < LOST_AFTER).and_then(|_| t.target_now()) else {
+            t.progress = None;
+            return false;
+        };
+        let gap = (goal[0] - t.pos[0]).hypot(goal[1] - t.pos[1]);
+        let now = Instant::now();
+        match t.progress {
+            Some((_, best)) if gap > best - NO_PROGRESS_M => {}
+            _ => t.progress = Some((now, gap)),
+        }
+        let (since, _) = t.progress.unwrap();
+        t.obstacle.is_some() && gap > stand + ROUTE_BEYOND_M && now - since > NO_PROGRESS_FOR
+    }
+
+    /// Finds a way round to the target with surveys and walks (see the
+    /// module's notes); whether the target could be reached.
+    fn route(&self, bridge: &Arc<Bridge>, track: &Arc<Mutex<Track>>, target: &str, stop: &AtomicBool) -> anyhow::Result<bool> {
+        track.lock().unwrap().routing = true;
+        let whitelist = bridge.social.whitelist_names();
+        let stand = self.inner.lock().unwrap().stand;
+        // Edges walked to, and those not reached (odometry).
+        let mut visited: Vec<[f32; 2]> = Vec::new();
+        let mut dead: Vec<[f32; 2]> = Vec::new();
+        for round in 0..ROUTE_ROUNDS {
+            if stop.load(Ordering::SeqCst) {
+                return Ok(false);
+            }
+            let mut vr = bridge.vr.lock().unwrap();
+            vr.survey(&whitelist, true)?;
+            let s = vr.survey.take().ok_or_else(|| anyhow::anyhow!("no survey"))?;
+            let m = s.metres;
+            let at = Instant::now();
+            // Where they are: in this survey, else where the odometry puts them.
+            let goal = {
+                let mut t = track.lock().unwrap();
+                let pos = t.pos;
+                let seen = s.players.iter().filter(|p| match_score(&p.name, target) >= 0.6).max_by(|a, b| a.score.total_cmp(&b.score));
+                if let Some(p) = seen {
+                    t.add_fix(at, [pos[0] + (p.feet[0] - s.eye[0]) * m, pos[1] + (p.feet[2] - s.eye[2]) * m]);
+                    self.inner.lock().unwrap().last_seen = Some(at);
+                    [p.feet[0], p.feet[2]]
+                } else {
+                    let Some(g) = t.target_now() else { return Ok(false) };
+                    [s.eye[0] + (g[0] - pos[0]) / m, s.eye[2] + (g[1] - pos[1]) / m]
+                }
+            };
+            let dist = reachable(&s.map, s.eye, vrc_nav::CLEARANCE_M / m);
+            let near_goal = cells_within(&s.map, goal, 1.0 / m).any(|i| dist[i].is_some());
+            let pos = track.lock().unwrap().pos;
+            // A point of this survey in the odometry.
+            let odo = |p: [f32; 2]| [pos[0] + (p[0] - s.eye[0]) * m, pos[1] + (p[1] - s.eye[2]) * m];
+            let (to, arrive) = if near_goal {
+                (goal, stand)
+            } else {
+                // The edge of what is seen that makes the shortest way: walk
+                // there, then straight on to them; edges been to cost more.
+                let cost = |c: &vrc_scene::Candidate| {
+                    let o = odo([c.position[0], c.position[2]]);
+                    let been = visited.iter().any(|v| (v[0] - o[0]).hypot(v[1] - o[1]) < VISITED_M);
+                    c.path * m + (c.position[0] - goal[0]).hypot(c.position[2] - goal[1]) * m + if been { VISITED_COST_M } else { 0.0 }
+                };
+                let alive = |c: &vrc_scene::Candidate| {
+                    let o = odo([c.position[0], c.position[2]]);
+                    !dead.iter().any(|d| (d[0] - o[0]).hypot(d[1] - o[1]) < DEAD_END_M)
+                };
+                let best = s
+                    .candidates
+                    .iter()
+                    .filter(|c| matches!(c.kind, Kind::Frontier | Kind::Open) && c.path.is_finite() && c.distance * m > 0.6 && alive(c))
+                    .min_by(|a, b| cost(a).total_cmp(&cost(b)));
+                let Some(c) = best else {
+                    tracing::info!("follow: way round, round {round}: no edge to walk to");
+                    return Ok(false);
+                };
+                visited.push(odo([c.position[0], c.position[2]]));
+                ([c.position[0], c.position[2]], 0.5)
+            };
+            let goal_odo = odo(to);
+            let opts = GotoOptions { arrive, max_legs: if near_goal { 6 } else { ROUTE_LEGS }, ..Default::default() };
+            tracing::info!(
+                "follow: way round, round {round}: {} {:.1} m off at {:.0} deg ({} candidates)",
+                if near_goal { "to them," } else { "to an edge," },
+                (to[0] - s.eye[0]).hypot(to[1] - s.eye[2]) * m,
+                (to[0] - s.eye[0]).atan2(-(to[1] - s.eye[2])).to_degrees(),
+                s.candidates.len()
+            );
+            let report = vrc_nav::goto(vr.rig(&whitelist)?, s, to, &opts)?;
+            tracing::info!(
+                "follow: way round, round {round}: arrived {}, {:.1} m left, {} legs{}",
+                report.arrived,
+                report.remaining,
+                report.legs.len(),
+                report.reason.as_deref().map(|r| format!(" ({r})")).unwrap_or_default()
+            );
+            let yaw = vr.yaw;
+            drop(vr);
+            track.lock().unwrap().facing = yaw;
+            if near_goal && report.arrived {
+                return Ok(true);
+            }
+            if !report.arrived && !near_goal {
+                dead.push(goal_odo);
+            }
+        }
+        Ok(false)
     }
 
     /// The search: one view at a time, from where the target was last seen
@@ -582,6 +745,7 @@ impl Follower {
         let mut pushed_since: Option<Instant> = None;
         let mut escape: Option<Instant> = None;
         let mut aside = 1.0f32;
+        let mut link: Option<vrc_vr::remote::HmdLink> = None;
         while !stop.load(Ordering::SeqCst) {
             std::thread::sleep(TICK);
             if osc.is_none() {
@@ -602,9 +766,15 @@ impl Follower {
                 let s = self.inner.lock().unwrap();
                 (s.stand, s.hold)
             };
+            // The way the head looks (walking follows it): from the headset
+            // itself, as walks of a way round turn it too.
+            if link.is_none() {
+                link = bridge.vr.try_lock().ok().and_then(|vr| vr.link());
+            }
+            let heading = link.as_ref().and_then(|l| l.owner()).map(|o| o.state.head.yaw_pitch().0);
             let mut t = track.lock().unwrap();
             // Odometry: the avatar's velocity is its own (z ahead, x right).
-            let (fs, fc) = t.facing.to_radians().sin_cos();
+            let (fs, fc) = heading.unwrap_or(t.facing).to_radians().sin_cos();
             let (ahead, right) = ([fs, -fc], [fc, fs]);
             for k in 0..2 {
                 t.pos[k] += (vz * ahead[k] + vx * right[k]) * dt;
@@ -613,6 +783,13 @@ impl Follower {
             t.history.push_back((now, pos));
             while t.history.front().is_some_and(|h| now - h.0 > ODOMETRY_KEPT) {
                 t.history.pop_front();
+            }
+            if t.routing {
+                // The walks of the way round have the stick.
+                drop(t);
+                axis = 0.0;
+                aimed = f32::NAN;
+                continue;
             }
             let fresh = t.target.is_some_and(|f| f.at.elapsed() < LOST_AFTER);
             let mut jump = false;
@@ -721,6 +898,46 @@ impl Follower {
 fn stereo_pool() -> &'static rayon::ThreadPool {
     static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     POOL.get_or_init(|| rayon::ThreadPoolBuilder::new().num_threads(STEREO_THREADS).build().expect("a thread pool"))
+}
+
+/// What the corridor along `yaw` holds, for tuning (`/v1/vr/corridor`):
+/// per 10 cm from 0.3 m out, the points' count and lowest and highest
+/// height over the floor (world metres), and what `corridor` makes of it.
+pub fn corridor_report(frame: &EyeFrame, yaw: Option<f32>, metres: f32) -> anyhow::Result<Value> {
+    let stereo = Stereo::from_frame(frame, 2).ok_or_else(|| anyhow::anyhow!("not an 8-bit frame"))?;
+    let disp = stereo_pool().install(|| stereo.disparity(&SgmParams::default()));
+    let points: Vec<[f32; 3]> = stereo.points(&disp, 2).into_iter().map(|(p, _)| p).collect();
+    let eye = eye_of(frame);
+    let yaw = yaw.unwrap_or_else(|| frame.views[0].pose.yaw_pitch().0);
+    let (s, c) = yaw.to_radians().sin_cos();
+    let mut bins: Vec<(usize, f32, f32)> = vec![(0, f32::INFINITY, f32::NEG_INFINITY); 40];
+    for p in &points {
+        let (dx, dz) = (p[0] - eye[0], p[2] - eye[2]);
+        let (ahead, side, up) = ((dx * s - dz * c) * metres, (dx * c + dz * s) * metres, (p[1] - FLOOR_Y) * metres);
+        if ahead > 0.3 && side.abs() < 0.25 {
+            let i = ((ahead - 0.3) / 0.1) as usize;
+            if let Some(b) = bins.get_mut(i) {
+                (b.0, b.1, b.2) = (b.0 + 1, b.1.min(up), b.2.max(up));
+            }
+        }
+    }
+    let r = |v: f32| (v as f64 * 100.0).round() / 100.0;
+    Ok(json!({
+        "yaw": yaw.round(),
+        "eye_m": r((eye[1] - FLOOR_Y) * metres),
+        "points": points.len(),
+        "blocker": corridor(&points, eye, yaw, metres, FLOOR_Y).map(|b| json!({"distance": r(b.distance), "top": r(b.top), "tall": b.tall})),
+        "bins": bins.iter().enumerate().filter(|(_, b)| b.0 > 0).map(|(i, b)| json!([r(0.3 + 0.1 * i as f32), b.0, r(b.1), r(b.2)])).collect::<Vec<_>>(),
+    }))
+}
+
+/// The cells of `map` within `radius` of `at` (x, z).
+fn cells_within(map: &HeightMap, at: [f32; 2], radius: f32) -> impl Iterator<Item = usize> + '_ {
+    let n = (radius / map.params.cell).ceil() as i32;
+    (-n..=n).flat_map(move |dx| (-n..=n).map(move |dz| (dx, dz))).filter_map(move |(dx, dz)| {
+        let (x, z) = (at[0] + dx as f32 * map.params.cell, at[1] + dz as f32 * map.params.cell);
+        ((x - at[0]).hypot(z - at[1]) <= radius).then(|| map.index(x, z)).flatten()
+    })
 }
 
 /// The middle of the eyes of `frame` (tracking space, stereo units).

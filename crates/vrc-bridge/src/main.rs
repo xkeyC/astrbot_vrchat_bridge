@@ -157,6 +157,7 @@ async fn main() -> Result<()> {
         .route("/v1/vr/goto", post(vr_goto))
         .route("/v1/vr/height", get(vr_height).post(vr_set_height))
         .route("/v1/vr/reset", post(vr_reset))
+        .route("/v1/vr/corridor", get(vr_corridor))
         .route("/v1/vr/survey/pano.jpg", get(vr_pano))
         .route("/v1/vr/survey/map.png", get(vr_map))
         .route_layer(middleware::from_fn_with_state(bridge.clone(), auth))
@@ -554,6 +555,16 @@ async fn vr_reset(State(b): State<App>) -> Reply {
     };
     b.notify_state();
     Ok(Json(json!({"ok": true, "facing_deg": yaw.round(), "head_height": cm(b.anim.params().head_height), "recentered": recentered})))
+}
+
+/// The corridor ahead as the follower sees it (tuning): `yaw` to look along
+/// another way than the head's.
+async fn vr_corridor(State(b): State<App>, Query(q): Query<std::collections::HashMap<String, String>>) -> Reply {
+    let yaw: Option<f32> = q.get("yaw").and_then(|v| v.parse().ok());
+    let height = b.osc_query().and_then(|o| o.eye_height()).unwrap_or(0.0) as f32;
+    let metres = if height > 0.0 { height / (b.anim.params().head_height - vrc_vr::remote::FLOOR_Y) } else { 1.0 };
+    let frame = on_headset(&b, |vr, _| vr.frame()).await?;
+    Ok(Json(tokio::task::spawn_blocking(move || follow::corridor_report(&frame, yaw, metres)).await??))
 }
 
 async fn vr_pano(State(b): State<App>) -> std::result::Result<Response, Fail> {
