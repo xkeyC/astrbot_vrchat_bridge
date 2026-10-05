@@ -28,6 +28,12 @@ impl Pose {
         (yaw, pitch)
     }
 
+    /// `v` rotated back by this pose's orientation (into the pose's frame).
+    pub fn unrotate(&self, v: [f32; 3]) -> [f32; 3] {
+        let [x, y, z, w] = self.orientation;
+        Pose { orientation: [-x, -y, -z, w], position: [0.0; 3] }.rotate(v)
+    }
+
     /// `v` rotated by this pose's orientation.
     pub fn rotate(&self, v: [f32; 3]) -> [f32; 3] {
         let [x, y, z, w] = self.orientation;
@@ -98,6 +104,14 @@ mod tests {
             let (y, p) = Pose::looking(yaw, pitch, [0.0; 3]).yaw_pitch();
             assert!(close(y, yaw) && close(p, pitch), "{yaw},{pitch} -> {y},{p}");
         }
+    }
+
+    #[test]
+    fn unrotate_undoes_rotate() {
+        let p = Pose::looking(70.0, -25.0, [0.0; 3]);
+        let v = [0.3, -0.2, 0.9];
+        let back = p.unrotate(p.rotate(v));
+        assert!((0..3).all(|i| close(back[i], v[i])), "{back:?}");
     }
 
     #[test]

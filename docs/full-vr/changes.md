@@ -8,6 +8,9 @@
 | `crates/vrc-vr` | 新增。`pose`：位姿、视场角、由视场角求内参（fx fy cx cy）、按偏航/俯仰构造朝向。`remote`：Monado remote 驱动的 376 字节协议编解码，以及 TCP 客户端 `RemoteHmd`。`tap`：读取抓帧共享内存（seqlock、文件尺寸变化时重新映射、RGBA/BGRA 转 RGB）。6 个单元测试。 |
 | `crates/vr-probe` | 新增。命令行工具：`info` / `grab` / `look` / `sweep`（转头后等到按新姿态渲染的帧再存图）/ `depth`（双目深度：左眼和深度并排的 PNG、点云 PLY、几个位置的距离、地面拟合） |
 | `crates/vrc-stereo` | 新增。纯 Rust 实现的 SGM：7x7 census、8 方向聚合、亚像素、唯一性检查、左右一致性检查（rayon 并行）。`Stereo` 从抓帧构造（可缩小分辨率），输出深度和可追踪空间里的点云；`fit_floor` 用高度直方图找地面再做平面拟合。3 个单元测试，包括一个合成的双平面场景。 |
+| `crates/vrc-vr` 的 `scan` 模块 | 新增。按给定的一组偏航/俯仰依次转头，每个方向等到按该姿态渲染出的第一帧，结束后回到原来的姿态；`EyeTap::peek` 只读帧头，`Pose::unrotate` |
+| `crates/vrc-scene` | 新增。`Panorama::stitch`：用每帧的位姿把多张左眼图拼成等距柱状全景。`HeightMap`：2.5 维栅格，以拟合出的地面为基准，把每个格子分为地面、障碍、高台、未知，并能画成俯视图。 |
+| `vr-probe scan` | 新增。头部扫描后输出全景图和高度图 |
 | `astrbot_plugin/` | 由根目录移入：`main.py`、`vrchat_adapter.py`、`metadata.yaml`、`logo.svg`，内容未改 |
 | `legacy/bridge/` | 由 `bridge/` 移入，内容未改（桌面模式仍可用） |
 | `third_party/` | Monado、xrizer 的基础提交说明和补丁 |

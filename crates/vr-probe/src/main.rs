@@ -5,6 +5,7 @@
 //!     vr-probe look --yaw 60 --pitch -20  # turn the head (held while connected)
 //!     vr-probe sweep out/ --yaws=-60,0,60 # turn, settle, grab, for each yaw
 //!     vr-probe depth out/scene            # stereo depth: PNG, PLY, floor fit
+//!     vr-probe scan out/room --down       # head scan: panorama + height map
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -12,11 +13,13 @@ use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use vrc_vr::remote::RemoteHmd;
-use vrc_vr::tap::{EyeFrame, EyeTap};
+use vrc_scene::{HeightMap, MapParams, Panorama};
 use vrc_stereo::{fit_floor, SgmParams, Stereo};
+use vrc_vr::remote::RemoteHmd;
+use vrc_vr::scan;
+use vrc_vr::tap::{EyeFrame, EyeTap};
 use vrc_vr::Pose;
 
 #[derive(Parser)]
@@ -65,6 +68,19 @@ enum Command {
         #[arg(long, default_value_t = 64)]
         max_disparity: usize,
     },
+    /// Look all around by turning the head: `<prefix>_pano.png` (left eyes,
+    /// equirectangular) and `<prefix>_map.png` (height map from stereo).
+    Scan {
+        prefix: PathBuf,
+        /// Views in the ring.
+        #[arg(long, default_value_t = 5)]
+        count: usize,
+        #[arg(long, default_value_t = -10.0, allow_hyphen_values = true)]
+        pitch: f32,
+        /// Also look down at the feet.
+        #[arg(long)]
+        down: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -88,7 +104,7 @@ fn main() -> Result<()> {
             let mut hmd = RemoteHmd::connect(&cli.remote)?;
             for yaw in yaws {
                 hmd.set_head(Pose::looking(yaw, pitch, hmd.state.head.position))?;
-                let frame = rendered_at(&mut tap, yaw, pitch)?;
+                let frame = scan::rendered_at(&mut tap, yaw, pitch, Duration::from_secs(3))?;
                 let out = dir.join(format!("yaw{yaw:+.0}_pitch{pitch:+.0}.png"));
                 save_png(&frame, &out)?;
                 println!("{}\n-> {}", describe(&frame), out.display());
@@ -97,6 +113,7 @@ fn main() -> Result<()> {
         Command::Depth { prefix, scale, max_disparity } => {
             depth(&latest(&mut tap)?, &prefix, scale, max_disparity)?
         }
+        Command::Scan { ref prefix, count, pitch, down } => scan_around(&cli, &mut tap, prefix, count, pitch, down)?,
     }
     Ok(())
 }
@@ -205,17 +222,68 @@ fn latest(tap: &mut EyeTap) -> Result<EyeFrame> {
 }
 
 /// The first frame whose eyes look where the head was just turned.
-fn rendered_at(tap: &mut EyeTap, yaw: f32, pitch: f32) -> Result<EyeFrame> {
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(3) {
-        let frame = latest(tap)?;
-        let (y, p) = frame.views[0].pose.yaw_pitch();
-        if (y - yaw).abs() < 0.5 && (p - pitch).abs() < 0.5 {
-            return Ok(frame);
-        }
-        sleep(Duration::from_millis(30));
+/// Head scan: a ring of views (and one looking down at the feet), the
+/// panorama of their left eyes, and a height map from stereo on each.
+fn scan_around(cli: &Cli, tap: &mut EyeTap, prefix: &Path, count: usize, pitch: f32, down: bool) -> Result<()> {
+    if let Some(dir) = prefix.parent() {
+        std::fs::create_dir_all(dir)?;
     }
-    bail!("no frame rendered looking at yaw {yaw}, pitch {pitch} within 3 s")
+    let stem = prefix.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "scan".into());
+    let mut hmd = RemoteHmd::connect(&cli.remote)?;
+    let head = hmd.state.head;
+    let mut views = scan::ring(count, pitch);
+    if down {
+        views.push((0.0, -80.0));
+    }
+    let started = Instant::now();
+    let shots = scan::scan(&mut hmd, tap, &views, Duration::from_secs(2))?;
+    let scan_took = started.elapsed();
+    for s in &shots {
+        println!("  yaw {:+6.1} pitch {:+5.1}: frame {} after {:.0} ms", s.yaw, s.pitch, s.frame.frame_id, s.waited.as_secs_f64() * 1e3);
+    }
+    println!("scan: {} views in {:.0} ms", shots.len(), scan_took.as_secs_f64() * 1e3);
+
+    let started = Instant::now();
+    let frames: Vec<&EyeFrame> = shots.iter().map(|s| &s.frame).collect();
+    let pano = Panorama::stitch(&frames, 2048);
+    println!("panorama: {:.0}% covered in {:.0} ms", pano.coverage * 100.0, started.elapsed().as_secs_f64() * 1e3);
+    write_png(&prefix.with_file_name(format!("{stem}_pano.png")), pano.width, pano.height, &pano.rgb)?;
+
+    let started = Instant::now();
+    let mut points = Vec::new();
+    for s in &shots {
+        let stereo = Stereo::from_frame(&s.frame, 2).context("not an 8-bit frame")?;
+        let disp = stereo.disparity(&SgmParams::default());
+        points.extend(stereo.points(&disp, 1).into_iter().map(|(p, _)| p));
+    }
+    let eye = head.position;
+    let floor = fit_floor(&points, eye, 0.5).context("no floor in the scan")?;
+    let mut map = HeightMap::new(MapParams::default(), [eye[0], eye[2]], floor.height);
+    map.add(&points, eye);
+    let [unknown, free, raised, blocked] = map.census();
+    println!(
+        "stereo + map: {} points in {:.0} ms; floor {:.3} below the eye (tilt {:.2} deg); \
+         cells {}x{} of {:.2}: {free} floor, {blocked} obstacle, {raised} raised, {unknown} unknown",
+        points.len(),
+        started.elapsed().as_secs_f64() * 1e3,
+        eye[1] - floor.height,
+        floor.tilt_deg,
+        map.size,
+        map.size,
+        map.params.cell
+    );
+    let (yaw, _) = head.yaw_pitch();
+    write_png(&prefix.with_file_name(format!("{stem}_map.png")), map.size, map.size, &map.render(eye, yaw))?;
+    println!("-> {}_pano.png, {}_map.png", prefix.display(), prefix.display());
+    Ok(())
+}
+
+fn write_png(path: &Path, w: usize, h: usize, rgb: &[u8]) -> Result<()> {
+    let mut enc = png::Encoder::new(BufWriter::new(File::create(path)?), w as u32, h as u32);
+    enc.set_color(png::ColorType::Rgb);
+    enc.set_depth(png::BitDepth::Eight);
+    enc.write_header()?.write_image_data(rgb)?;
+    Ok(())
 }
 
 fn describe(f: &EyeFrame) -> String {

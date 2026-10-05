@@ -328,7 +328,16 @@ dependencies = [
  "anyhow",
  "clap",
  "png",
+ "vrc-scene",
  "vrc-stereo",
+ "vrc-vr",
+]
+
+[[package]]
+name = "vrc-scene"
+version = "0.1.0"
+dependencies = [
+ "rayon",
  "vrc-vr",
 ]
 

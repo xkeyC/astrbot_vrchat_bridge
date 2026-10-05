@@ -24,10 +24,11 @@
 | 20:4x | Monado 打补丁 0002（不再有隐藏区域，`XRT_REMOTE_FOV_DEG`），配置改为每只眼 1280x1280 正方形，以 100° 视场重启 Monado 和 VRChat | 进入世界后 `vr-probe sweep` 正常：1280x1280，fx = fy = 537.0，cx = cy = 640，四角不再有遮罩。显存：VRChat 1206 MiB，monado 84 MiB，整卡 2078 MiB，GPU 利用率约 13% |
 | 21:xx | 在服务器上编译 `vrc-stereo` 和 `vr-probe`；`look --pitch -20` 后执行 `depth` | 640x640 用时 157 ms（16 核），69% 的像素有深度；中心 5.66 m，下方中心 2.15 m；地面在眼睛下方 1.918 m，倾斜 0.04°。镜面显示的是镜中世界的深度 |
 | 21:xx | 通过 OSCQuery 读取眼高（`/avatar/eyeheight` 为 1.405，缩放未被禁止），再通过 OSC 写入 1.6 和 1.0，最后恢复为 1.405；每次都用双目重新量地面 | 读写都生效（`EyeHeightAsMeters`、`ScaleFactor` 跟着变）；双目测得的眼睛到地面距离始终在 1.913–1.929 之间，说明世界缩放时两眼间距也一起缩放。已恢复原眼高 |
+| 21:xx | Monado 改为每帧都抓（`XRT_NULL_TAP_FPS=0`），合成器先后用 30 fps 和 60 fps 重启（VRChat 跟着重启）；执行 `vr-probe scan --count 5 --pitch -10 --down` | 30 fps：6 个方向 480 ms；60 fps：6 个方向 283 ms，GPU 利用率约 28%。全景覆盖 71%，360° 高度图约 190 万个点，耗时约 1 s。刚重启时 VRChat 还在加载，抓到的帧不随头部姿态变化，扫描会超时，等进入世界后再扫就正常 |
 
 ### 当前服务器状态
 
-- VRChat 以 VR 模式运行，`monado-service` 是临时单元（systemd-run），抓帧已开启。
+- VRChat 以 VR 模式运行，`monado-service` 是临时单元（systemd-run）：合成器 60 fps，每帧都抓，视场 100°。
 - AstrBot 的 `vrchat` 平台和插件已停用，bridge 已停止。
 - 切回桌面模式的步骤：
   1. `echo desktop > ~/.config/vrc-mode`；

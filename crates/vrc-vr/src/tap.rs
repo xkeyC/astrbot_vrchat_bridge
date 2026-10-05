@@ -58,9 +58,14 @@ pub struct EyeFrame {
 }
 
 impl EyeFrame {
+    /// Bytes of one eye's pixels.
+    pub fn eye_bytes(&self) -> usize {
+        (self.width * self.height * self.bytes_per_pixel) as usize
+    }
+
     /// The pixels of eye 0 (left) or 1 (right).
     pub fn eye(&self, i: usize) -> &[u8] {
-        let n = (self.width * self.height * self.bytes_per_pixel) as usize;
+        let n = self.eye_bytes();
         &self.pixels[i * n..(i + 1) * n]
     }
 
@@ -99,6 +104,16 @@ impl EyeTap {
     /// The latest frame; `None` until Monado wrote one. Waits out a frame
     /// being written (up to about a second).
     pub fn read(&mut self) -> Result<Option<EyeFrame>> {
+        self.read_with(true)
+    }
+
+    /// The latest frame without its pixels (`pixels` empty): cheap enough
+    /// to poll for a frame rendered at some pose.
+    pub fn peek(&mut self) -> Result<Option<EyeFrame>> {
+        self.read_with(false)
+    }
+
+    fn read_with(&mut self, pixels: bool) -> Result<Option<EyeFrame>> {
         for _ in 0..200 {
             let len = std::fs::metadata(&self.path)
                 .with_context(|| format!("no tap at {}", self.path.display()))?
@@ -123,16 +138,20 @@ impl EyeTap {
             let seq_cell = unsafe { &*(map.as_ptr().add(8) as *const AtomicU64) };
             let seq = seq_cell.load(Ordering::Acquire);
             if seq == 0 || seq % 2 == 1 {
-                sleep(Duration::from_millis(5));
+                sleep(Duration::from_millis(2));
                 continue;
             }
             let header: [u8; HEADER_SIZE] = map[..HEADER_SIZE].try_into().unwrap();
-            let pixels = map[HEADER_SIZE..].to_vec();
+            let data = if pixels { map[HEADER_SIZE..].to_vec() } else { Vec::new() };
             fence(Ordering::Acquire);
             if seq_cell.load(Ordering::Relaxed) != seq {
                 continue;
             }
-            return parse(seq, &header, pixels).map(Some);
+            let frame = parse(seq, &header, data)?;
+            if pixels && frame.pixels.len() < 2 * frame.eye_bytes() {
+                bail!("tap holds {} bytes of pixels, the header says {}", frame.pixels.len(), 2 * frame.eye_bytes());
+            }
+            return Ok(Some(frame));
         }
         bail!("the tap kept being written")
     }
@@ -161,10 +180,6 @@ fn parse(seq: u64, h: &[u8; HEADER_SIZE], pixels: Vec<u8>) -> Result<EyeFrame> {
         views: [view(56), view(100)],
         pixels,
     };
-    let need = 2 * (frame.width * frame.height * frame.bytes_per_pixel) as usize;
-    if frame.pixels.len() < need {
-        bail!("tap holds {} bytes of pixels, the header says {need}", frame.pixels.len());
-    }
     Ok(frame)
 }
 

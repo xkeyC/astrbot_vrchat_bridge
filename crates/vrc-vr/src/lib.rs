@@ -13,6 +13,7 @@
 
 pub mod pose;
 pub mod remote;
+pub mod scan;
 pub mod tap;
 
 pub use pose::{Fov, Pose};
