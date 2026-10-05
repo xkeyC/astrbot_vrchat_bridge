@@ -14,6 +14,7 @@ bot 以无头方式运行 `monado-service`：
 | 补丁 | 内容 | 原因 |
 |---|---|---|
 | `patches/0001-null-compositor-frame-tap.patch` | 新增 `null_tap.c/.h`：每次提交时（每秒最多 `XRT_NULL_TAP_FPS` 次，默认 10）把第一个投影层的左右眼从应用的交换链拷进主机可见缓冲区，再写入文件 `XRT_NULL_TAP`（512 字节头：帧号、显示时间、每只眼的位姿和视场角；后接像素），用 seqlock 保证读到完整帧。 | null 合成器会丢掉画面，而 bot 需要渲染出的双眼图像以及渲染时的精确位姿（双目深度、OCR、给模型看画面）。 |
+| `patches/0002-remote-hmd-full-view-fov.patch` | remote 头显：① 不再有隐藏区域（隐藏网格为空，可见网格是整个视野，轮廓是矩形边框）；② 水平视场由 `XRT_REMOTE_FOV_DEG` 设定（默认仍是 85）。垂直视场按 `w_meters`/`h_meters` 推出，两眼都设成正方形（米和像素都是），像素就是正方形。 | 默认的八角形遮罩在四角留下黑三角：约占 3% 的像素，而且左右眼完全相同，双目匹配会把它当成视差为 0 的假特征。默认 85° 视场配 960x1080 时像素不是正方形（fx 523.8 / fy 547.2）。 |
 
 抓帧要求应用的交换链带 `TRANSFER_SRC` 用法，见 `../xrizer/patches/0001-swapchain-transfer-src.patch`。拷贝用 `vkCmdCopyImageToBuffer` 同步等待完成（960x1080 双眼每帧 8 MB，GPU 上远不到 1 毫秒）。
 

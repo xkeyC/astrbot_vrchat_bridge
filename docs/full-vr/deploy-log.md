@@ -21,6 +21,7 @@
 | 20:03 | OSC 移动和转向测试 | VR 模式下有效 |
 | 20:03 | 显存 | VRChat 1122 MiB，monado 72 MiB，整卡 1980 MiB，GPU 利用率约 12% |
 | 20:07 | 在服务器上编译本仓库的 `vr-probe`，执行 `sweep --yaws=-90,0,90 --pitch=-15` | 三个方向都等到了按新姿态渲染的帧并存图；内参 fx 523.8、fy 547.2、cx 480、cy 540 |
+| 20:4x | Monado 打补丁 0002（不再有隐藏区域，`XRT_REMOTE_FOV_DEG`），配置改为每只眼 1280x1280 正方形，以 100° 视场重启 Monado 和 VRChat | 进入世界后 `vr-probe sweep` 正常：1280x1280，fx = fy = 537.0，cx = cy = 640，四角不再有遮罩。显存：VRChat 1206 MiB，monado 84 MiB，整卡 2078 MiB，GPU 利用率约 13% |
 
 ### 当前服务器状态
 

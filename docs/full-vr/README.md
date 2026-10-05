@@ -28,9 +28,9 @@ monado-service
 
 - VRChat 用虚拟头显进入 VR 模式。没有 SteamVR，也没有显示器（null 合成器 30 fps）。
 - 通过 remote 驱动转头、低头，渲染出的画面随之改变，抓到的每帧位姿与设定一致。
-- 抓帧：每只眼 960x1080，`R8G8B8A8_SRGB`，基线 0.063 m，水平视场 85°、垂直 89.2°，最多每秒 10 帧。
+- 抓帧：每只眼 1280x1280，`R8G8B8A8_SRGB`，视场 100°x100°，像素为正方形（fx = fy = 537.0，cx = cy = 640），没有遮罩，基线 0.063 m，最多每秒 10 帧。
 - OSC 的 `/input/Vertical`、`/input/LookHorizontal` 在 VR 模式下仍然可以移动和转向。
-- 显存：monado-service 72 MiB，VRChat 约 1.1 GB（VRChat Home，房间里只有自己），整卡约 2.0 GB。
+- 显存：monado-service 84 MiB，VRChat 约 1.2 GB（VRChat Home，房间里只有自己），整卡约 2.1 GB。
 - `vr-probe sweep` 端到端可用：转头、等到按新姿态渲染出的帧、存 PNG。
 
 还没做（见 [decisions.md](decisions.md) 末尾"待定"）：双目深度、手柄姿态与交互、在 VR 下接入 AstrBot 插件、开机自启。

@@ -34,6 +34,13 @@
   - 152：层类型
   - 512 起：像素，先左眼后右眼
 
+### Monado：`third_party/monado/patches/0002-remote-hmd-full-view-fov.patch`
+
+- `src/xrt/drivers/remote/r_hmd.c`：
+  - 新增 `r_hmd_get_visibility_mask`：隐藏网格为空，可见网格是整个视野的四边形，轮廓是矩形；
+  - 水平视场改为读 `XRT_REMOTE_FOV_DEG`（默认 85）。
+- 配置：`ops/vr/config_v0.json` 改为 2560x1280 像素、0.12x0.06 米，也就是每只眼 1280x1280 的正方形；`vrc-monado.service` 加上 `XRT_REMOTE_FOV_DEG=100`。
+
 ### xrizer：`third_party/xrizer/patches/0001-swapchain-transfer-src.patch`
 
 - `src/graphics_backends/vulkan.rs`：眼睛交换链的用法加上 `TRANSFER_SRC`。

@@ -1,0 +1,114 @@
+diff -uN a/src/xrt/drivers/remote/r_hmd.c b/src/xrt/drivers/remote/r_hmd.c
+--- a/src/xrt/drivers/remote/r_hmd.c
++++ b/src/xrt/drivers/remote/r_hmd.c
+@@ -19,8 +19,10 @@
+ 
+ #include "math/m_api.h"
+ #include "math/m_mathinclude.h"
++#include "xrt/xrt_visibility_mask.h"
+ 
+ #include <stdio.h>
++#include <string.h>
+ 
+ 
+ /*
+@@ -74,6 +76,80 @@
+ 	return XRT_SUCCESS;
+ }
+ 
++/*
++ * vrc fork: the horizontal field of view of each eye (degrees); the vertical
++ * one follows from w_meters / h_meters, so square eyes in metres and pixels
++ * give square pixels.
++ */
++DEBUG_GET_ONCE_FLOAT_OPTION(remote_fov_deg, "XRT_REMOTE_FOV_DEG", 85.0f)
++
++/*!
++ * vrc fork: no hidden area. Nobody looks through lenses here, and the default
++ * octagon leaves black corners that are the same in both eyes (false features
++ * at zero disparity for stereo matching). Hidden: nothing; visible: the whole
++ * view; line loop: its border.
++ */
++static xrt_result_t
++r_hmd_get_visibility_mask(struct xrt_device *xdev,
++                          enum xrt_visibility_mask_type type,
++                          uint32_t view_index,
++                          struct xrt_visibility_mask **out_mask)
++{
++	static const struct xrt_vec2 corners[4] = {{-1.f, -1.f}, {1.f, -1.f}, {1.f, 1.f}, {-1.f, 1.f}};
++	static const uint32_t quad[6] = {0, 1, 2, 0, 2, 3};
++	static const uint32_t loop[4] = {0, 1, 2, 3};
++
++	uint32_t nvertices = 0;
++	uint32_t nindices = 0;
++	const uint32_t *indices = NULL;
++	switch (type) {
++	case XRT_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH: break;
++	case XRT_VISIBILITY_MASK_TYPE_VISIBLE_TRIANGLE_MESH:
++		nvertices = 4;
++		nindices = 6;
++		indices = quad;
++		break;
++	case XRT_VISIBILITY_MASK_TYPE_LINE_LOOP:
++		nvertices = 4;
++		nindices = 4;
++		indices = loop;
++		break;
++	}
++
++	const size_t size =
++	    sizeof(struct xrt_visibility_mask) + sizeof(uint32_t) * nindices + sizeof(struct xrt_vec2) * nvertices;
++	struct xrt_visibility_mask *mask = U_CALLOC_WITH_CAST(struct xrt_visibility_mask, size);
++	if (mask == NULL) {
++		return XRT_ERROR_ALLOCATION;
++	}
++	mask->type = type;
++	mask->index_count = nindices;
++	mask->vertex_count = nvertices;
++	if (nindices > 0) {
++		memcpy(xrt_visibility_mask_get_indices(mask), indices, sizeof(uint32_t) * nindices);
++	}
++
++	// Same mapping as u_visibility_mask_get_default: [-1, 1] to tangent space.
++	const struct xrt_fov fov = xdev->hmd->distortion.fov[view_index];
++	const float tan_left = tanf(fov.angle_left);
++	const float tan_right = tanf(fov.angle_right);
++	const float tan_down = tanf(fov.angle_down);
++	const float tan_up = tanf(fov.angle_up);
++	const float tan_width = tan_right - tan_left;
++	const float tan_height = tan_up - tan_down;
++	const float tan_offset_x = ((tan_right + tan_left) - tan_width) / 2;
++	const float tan_offset_y = (-(tan_up + tan_down) - tan_height) / 2;
++
++	struct xrt_vec2 *dst = xrt_visibility_mask_get_vertices(mask);
++	for (uint32_t i = 0; i < nvertices; i++) {
++		dst[i].x = (corners[i].x * 0.5f + 0.5f) * tan_width + tan_offset_x;
++		dst[i].y = (corners[i].y * 0.5f + 0.5f) * tan_height + tan_offset_y;
++	}
++
++	*out_mask = mask;
++	return XRT_SUCCESS;
++}
++
+ static xrt_result_t
+ r_hmd_get_view_poses(struct xrt_device *xdev,
+                      const struct xrt_vec3 *default_eye_relation,
+@@ -126,6 +202,7 @@
+ 	// Setup the basics.
+ 	u_device_populate_function_pointers(&rh->base, r_hmd_get_tracked_pose, r_hmd_destroy);
+ 	rh->base.get_view_poses = r_hmd_get_view_poses;
++	rh->base.get_visibility_mask = r_hmd_get_visibility_mask;
+ 	rh->base.tracking_origin = &r->origin;
+ 	rh->base.supported.orientation_tracking = true;
+ 	rh->base.supported.position_tracking = true;
+@@ -158,8 +235,8 @@
+ 		info.fov[0] = 120.0f * (M_PI / 180.0f);
+ 		ret = u_device_setup_one_eye(&rh->base, &info);
+ 	} else if (rh->r->view_count == 2) {
+-		info.fov[0] = 85.0f * (M_PI / 180.0f);
+-		info.fov[1] = 85.0f * (M_PI / 180.0f);
++		info.fov[0] = debug_get_float_option_remote_fov_deg() * (M_PI / 180.0f);
++		info.fov[1] = debug_get_float_option_remote_fov_deg() * (M_PI / 180.0f);
+ 		ret = u_device_setup_split_side_by_side(&rh->base, &info);
+ 	} else {
+ 		U_LOG_E("Invalid view count");
