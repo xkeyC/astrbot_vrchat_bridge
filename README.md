@@ -2,7 +2,9 @@
 
 让一个 VRChat 客户端成为 AstrBot 的一个平台：bot 以自己的 VRChat 账号待在房间里，用实时语音和房间里的人对话，能环视四周、走到指定的地方、认出并跟随白名单好友、做动作、写 Chatbox，还能按白名单接受邀请、跨房间跟随好友。
 
-> **分支 `feat/full_vr`**：VRChat 以 **VR 模式** 运行在一个虚拟头显上（Monado + xrizer，没有 SteamVR，也不需要显示器）。头部、双眼和手柄的位置都由程序设定；每一帧都能拿到渲染好的左右眼画面，以及渲染时用的精确位姿。主语言是 Rust。起始点、修改点、决策和部署记录见 [docs/full-vr/](docs/full-vr/README.md)。
+VRChat 以 **VR 模式** 运行在一个虚拟头显上（Monado + xrizer，没有 SteamVR，也不需要显示器）。头部、双眼和手柄的位置都由程序设定；每一帧都能拿到渲染好的左右眼画面，以及渲染时用的精确位姿。主语言是 Rust。起始点、修改点、决策和部署记录见 [docs/full-vr/](docs/full-vr/README.md)。
+
+> 旧版实现（VRChat 桌面客户端 + Python bridge）在 [`legacy`](../../tree/legacy) 分支，不再维护。
 
 ## 组成
 
