@@ -28,13 +28,10 @@
 | 22:xx | Monado 打补丁 0003（运行中改帧率，`XRT_NULL_FPS_FILE=/dev/shm/vrc-fps`），抓帧改为 8 槽环形缓冲区；对比逐个方向和流水线扫描、30–120 fps | 改帧率生效，30→90 用时 4–32 ms，VRChat 提交帧率跟随到 119。扫描最快的仍是 30 fps 逐个方向：6 个方向 199–209 ms；90 fps 下约 290–310 ms；流水线方式会漏帧。启动时上报 90 Hz、运行时压到 30 也没有改善。最后恢复为启动 30 fps |
 | 22:xx | 部署 vrc-bridge 的 HTTP 接口（临时端口 6121），环视、编号全景图和地图接口可用；全景和地图转到朝向 | 正常；无 token 返回 401 |
 | 23:xx | Rust bridge 替换 Python bridge：以临时单元 `vrc-rs-bridge` 监听 10.88.0.2:6120（Python 的 `vrc-bridge` 单元一直是停用状态） | Web API 登录成功（cookie 沿用），pipeline 已连上；status、social、聊天框、跳、小步移动（转 30° 后走 0.8 m，实走 1.0 m）、截图、环视均正常；WebSocket 先收到房间状态，1 秒的测试音播进麦克风，游戏音频持续流入；表情返回"当前化身没有表情参数"（和 Python 版的行为一致） |
+| 21:52 | 正式部署（用户同意）：先备份插件目录、`cmd_config.json`、数据库和旧的 bridge 单元及环境文件；Rust bridge 装成 `vrc-bridge` 用户单元（`ops/vr/vrc-bridge.service`）并设为开机启动，环境文件去掉 Python 版独有的 `--depth-url`；插件换成 VR 版，重新启用 vrchat 平台和插件；Mon3tr 人格的文字工具白名单里，`vrchat_view` 换成 `vrchat_look_around`、`vrchat_last_seen`（`vrchat_who` 保留）；重置房间语音线程，让它用上新提示词 | AstrBot 正常运行，插件已加载，平台和 bridge 的音频流已连上；日志里只有原有的两个无关报错（知识库的 `get_dim`、GitHub MCP） |
 
 ### 当前服务器状态
 
 - VRChat 以 VR 模式运行，`monado-service` 是临时单元（systemd-run）：合成器 30 fps（可通过 `/dev/shm/vrc-fps` 临时调整），每帧都抓（8 槽环形缓冲区），视场 100°。
-- AstrBot 的 `vrchat` 平台和插件已停用；Rust bridge 以临时单元 `vrc-rs-bridge` 运行在 10.88.0.2:6120，Python 的 `vrc-bridge` 单元已停用。服务器上的插件还是旧版（桌面），尚未部署。
-- 切回桌面模式的步骤：
-  1. `echo desktop > ~/.config/vrc-mode`；
-  2. 重启 VRChat；
-  3. 在 WebUI 里重新启用插件和平台；
-  4. `systemctl --user enable --now vrc-bridge`。
+- AstrBot 的 `vrchat` 平台和插件已启用（VR 版插件）；Rust bridge 作为 `vrc-bridge` 用户单元运行在 10.88.0.2:6120（开机自启）。`monado-service` 仍是临时单元。
+- 回退：部署前的插件、配置、数据库和 bridge 单元都备份在 AstrBot 的备份目录（`pre-vr-deploy-20261005-2151`）；桌面模式的 Python bridge 已从仓库删除，需要时从 git 历史取回。
