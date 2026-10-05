@@ -13,22 +13,15 @@
 //!
 //! In the way (each view's points, along the way to the target, measured
 //! from the ground just before it): whatever does not reach the eyes is
-//! jumped first, with a run-up (user's rule); what reaches them, or what a
-//! jump did not get past, is walked round, along the path a planner finds
-//! on a height map of the view (`vrc_nav::next_waypoint`, the walks'
-//! planner). Pushing without moving (stuck) jumps once, then backs off and
-//! turns aside.
-//!
-//! No nearer for a while with something in the way (a jump that did not
-//! clear it, a detour that leads nowhere), the bot finds a way round: out
-//! of an enclosure the target is outside of (seen through a window), or in
-//! to one they are inside of, alike. It looks all around (a survey: a
-//! height map of everything in sight) and walks (`vrc_nav::goto`) to the
-//! target if the map reaches them, else to the edge of what it has seen
-//! that makes the shortest way to them (walking there, then straight on),
-//! edges it has been to costing more (so it goes on along the wall, not
-//! back and forth at the window), and looks again; round, it looks for them
-//! where they were last.
+//! jumped first, with a run-up (user's rule). What reaches them, or what a
+//! jump did not get past, is walked round by following it (a "bug"
+//! algorithm, user's rule): keep it on one side (the side away from the
+//! target's way round), each view taking the free heading nearest that
+//! side, round corners, until the straight way to the target is open and
+//! nearer than where the wall began; out of an enclosure or into one alike.
+//! While following a wall the target may be out of sight: the bot keeps
+//! going for where they were. Pushing without moving (stuck) jumps once,
+//! then backs off and turns aside.
 //!
 //! Lost, the bot stands and the eyes look around one view at a time,
 //! starting where the target was last seen and widening both ways; the
@@ -42,9 +35,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use vrc_players::names::match_score;
-use vrc_nav::GotoOptions;
-use vrc_scene::candidates::reachable;
-use vrc_scene::{HeightMap, Kind};
 use vrc_stereo::{SgmParams, Stereo};
 use vrc_vr::osc::Osc;
 use vrc_vr::remote::FLOOR_Y;
@@ -110,7 +100,7 @@ const SAME_PLACE_M: f32 = 0.7;
 const NO_JUMP_FOR: Duration = Duration::from_secs(10);
 const RUN_UP_SPEED: f32 = 1.6;
 const JUMP_EVERY: Duration = Duration::from_millis(1500);
-/// A detour is followed this long after the view that planned it.
+/// A heading chosen by a view is followed this long after it.
 const DETOUR_FOR: Duration = Duration::from_millis(1200);
 /// Stuck: pushing (stick past STUCK_AXIS) yet slower than STUCK_SPEED for STUCK_FOR.
 const STUCK_AXIS: f32 = 0.25;
@@ -120,21 +110,16 @@ const ESCAPE_FOR: Duration = Duration::from_millis(500);
 /// Views judge only ways within this of where they look (degrees).
 const VIEW_HALF_DEG: f32 = 40.0;
 const STEREO_THREADS: usize = 6;
-/// No nearer by NO_PROGRESS_M for NO_PROGRESS_FOR, farther than the
-/// standing distance by ROUTE_BEYOND_M and something in the way: find a
-/// way round with surveys, at most ROUTE_ROUNDS of them.
-const NO_PROGRESS_M: f32 = 0.4;
-const NO_PROGRESS_FOR: Duration = Duration::from_secs(6);
-const ROUTE_BEYOND_M: f32 = 1.0;
-const ROUTE_ROUNDS: usize = 8;
-/// An edge within this of one already walked to costs VISITED_COST_M more.
-const VISITED_M: f32 = 1.2;
-const VISITED_COST_M: f32 = 4.0;
-/// Walks to an edge give up after this many legs; an edge not reached
-/// rules out edges within DEAD_END_M of it for the rest of the way round
-/// (a gap the map shows in a wall that is not there: no trying it again).
-const ROUTE_LEGS: usize = 3;
-const DEAD_END_M: f32 = 1.5;
+/// Following a wall: headings tried this far apart (degrees), each side of
+/// where it looks; a heading is free when nothing stands within FREE_M
+/// along it. The wall is left once the way to the target is open and at
+/// least LEAVE_NEARER_M nearer than where it began; given up after WALL_FOR.
+const WALL_STEP_DEG: f32 = 15.0;
+const WALL_STEPS: i32 = 3;
+const FREE_M: f32 = 1.2;
+const LEAVE_NEARER_M: f32 = 0.3;
+const WALL_FOR: Duration = Duration::from_secs(40);
+const WALL_SPEED: f32 = 1.4;
 
 #[derive(Default)]
 pub struct Follower {
@@ -186,10 +171,17 @@ struct Track {
     jumped: Option<(Instant, [f32; 2])>,
     /// Obstacles a jump did not get past (odometry), until when.
     no_jump: Vec<([f32; 2], Instant)>,
-    /// Finding a way round with surveys: the legs keep only the odometry.
-    routing: bool,
-    /// The nearest the target has been lately, and since when.
-    progress: Option<(Instant, f32)>,
+    /// Following a wall round to the target.
+    wall: Option<Wall>,
+}
+
+/// Following a wall: on which side it is kept (-1 left, +1 right), since
+/// when, and how far the target was then (world metres).
+#[derive(Clone, Copy, Debug)]
+struct Wall {
+    side: f32,
+    since: Instant,
+    gap: f32,
 }
 
 /// Something in the way (world metres).
@@ -433,7 +425,11 @@ impl Follower {
                     1.0
                 }
             };
-            let lost = track.lock().unwrap().target.is_none_or(|f| f.at.elapsed() > LOST_AFTER);
+            // Following a wall, the target may be out of sight a while.
+            let lost = {
+                let t = track.lock().unwrap();
+                t.wall.is_none() && t.target.is_none_or(|f| f.at.elapsed() > LOST_AFTER)
+            };
             let result = if !lost {
                 self.look(&bridge, &track, &target, &room, metres, None).map(|_| ())
             } else if Instant::now() >= next_search {
@@ -456,22 +452,6 @@ impl Follower {
                 bridge.vr.lock().unwrap().reset();
                 std::thread::sleep(Duration::from_millis(500));
             }
-            if self.walled_in(&track) {
-                self.inner.lock().unwrap().state = "routing";
-                bridge.send_event(json!({"type": "follow", "state": "routing", "target": target}));
-                match self.route(&bridge, &track, &target, &stop) {
-                    Ok(out) => tracing::info!("follow: way round {}", if out { "found" } else { "not found" }),
-                    Err(e) => {
-                        tracing::warn!("follow: finding a way round failed: {e:#}");
-                        bridge.vr.lock().unwrap().reset();
-                    }
-                }
-                let mut t = track.lock().unwrap();
-                (t.routing, t.obstacle, t.detour, t.progress) = (false, None, None, None);
-                t.no_jump.clear();
-                drop(t);
-                self.inner.lock().unwrap().state = "following";
-            }
             let seen = track.lock().unwrap().target.is_some_and(|f| f.at.elapsed() < LOST_AFTER);
             if seen && searching {
                 searching = false;
@@ -487,118 +467,6 @@ impl Follower {
         s.moving = 0.0;
         drop(s);
         bridge.notify_state();
-    }
-
-    /// Whether to find a way round: no nearer for a while, well beyond the
-    /// standing distance, something in the way.
-    fn walled_in(&self, track: &Arc<Mutex<Track>>) -> bool {
-        let stand = self.inner.lock().unwrap().stand;
-        let mut t = track.lock().unwrap();
-        let Some(goal) = t.target.filter(|f| f.at.elapsed() < LOST_AFTER).and_then(|_| t.target_now()) else {
-            t.progress = None;
-            return false;
-        };
-        let gap = (goal[0] - t.pos[0]).hypot(goal[1] - t.pos[1]);
-        let now = Instant::now();
-        match t.progress {
-            Some((_, best)) if gap > best - NO_PROGRESS_M => {}
-            _ => t.progress = Some((now, gap)),
-        }
-        let (since, _) = t.progress.unwrap();
-        t.obstacle.is_some() && gap > stand + ROUTE_BEYOND_M && now - since > NO_PROGRESS_FOR
-    }
-
-    /// Finds a way round to the target with surveys and walks (see the
-    /// module's notes); whether the target could be reached.
-    fn route(&self, bridge: &Arc<Bridge>, track: &Arc<Mutex<Track>>, target: &str, stop: &AtomicBool) -> anyhow::Result<bool> {
-        track.lock().unwrap().routing = true;
-        let whitelist = bridge.social.whitelist_names();
-        let stand = self.inner.lock().unwrap().stand;
-        // Edges walked to, and those not reached (odometry).
-        let mut visited: Vec<[f32; 2]> = Vec::new();
-        let mut dead: Vec<[f32; 2]> = Vec::new();
-        for round in 0..ROUTE_ROUNDS {
-            if stop.load(Ordering::SeqCst) {
-                return Ok(false);
-            }
-            let mut vr = bridge.vr.lock().unwrap();
-            vr.survey(&whitelist, true)?;
-            let s = vr.survey.take().ok_or_else(|| anyhow::anyhow!("no survey"))?;
-            let m = s.metres;
-            let at = Instant::now();
-            // Where they are: in this survey, else where the odometry puts them.
-            let goal = {
-                let mut t = track.lock().unwrap();
-                let pos = t.pos;
-                let seen = s.players.iter().filter(|p| match_score(&p.name, target) >= 0.6).max_by(|a, b| a.score.total_cmp(&b.score));
-                if let Some(p) = seen {
-                    t.add_fix(at, [pos[0] + (p.feet[0] - s.eye[0]) * m, pos[1] + (p.feet[2] - s.eye[2]) * m]);
-                    self.inner.lock().unwrap().last_seen = Some(at);
-                    [p.feet[0], p.feet[2]]
-                } else {
-                    let Some(g) = t.target_now() else { return Ok(false) };
-                    [s.eye[0] + (g[0] - pos[0]) / m, s.eye[2] + (g[1] - pos[1]) / m]
-                }
-            };
-            let dist = reachable(&s.map, s.eye, vrc_nav::CLEARANCE_M / m);
-            let near_goal = cells_within(&s.map, goal, 1.0 / m).any(|i| dist[i].is_some());
-            let pos = track.lock().unwrap().pos;
-            // A point of this survey in the odometry.
-            let odo = |p: [f32; 2]| [pos[0] + (p[0] - s.eye[0]) * m, pos[1] + (p[1] - s.eye[2]) * m];
-            let (to, arrive) = if near_goal {
-                (goal, stand)
-            } else {
-                // The edge of what is seen that makes the shortest way: walk
-                // there, then straight on to them; edges been to cost more.
-                let cost = |c: &vrc_scene::Candidate| {
-                    let o = odo([c.position[0], c.position[2]]);
-                    let been = visited.iter().any(|v| (v[0] - o[0]).hypot(v[1] - o[1]) < VISITED_M);
-                    c.path * m + (c.position[0] - goal[0]).hypot(c.position[2] - goal[1]) * m + if been { VISITED_COST_M } else { 0.0 }
-                };
-                let alive = |c: &vrc_scene::Candidate| {
-                    let o = odo([c.position[0], c.position[2]]);
-                    !dead.iter().any(|d| (d[0] - o[0]).hypot(d[1] - o[1]) < DEAD_END_M)
-                };
-                let best = s
-                    .candidates
-                    .iter()
-                    .filter(|c| matches!(c.kind, Kind::Frontier | Kind::Open) && c.path.is_finite() && c.distance * m > 0.6 && alive(c))
-                    .min_by(|a, b| cost(a).total_cmp(&cost(b)));
-                let Some(c) = best else {
-                    tracing::info!("follow: way round, round {round}: no edge to walk to");
-                    return Ok(false);
-                };
-                visited.push(odo([c.position[0], c.position[2]]));
-                ([c.position[0], c.position[2]], 0.5)
-            };
-            let goal_odo = odo(to);
-            let opts = GotoOptions { arrive, max_legs: if near_goal { 6 } else { ROUTE_LEGS }, ..Default::default() };
-            tracing::info!(
-                "follow: way round, round {round}: {} {:.1} m off at {:.0} deg ({} candidates)",
-                if near_goal { "to them," } else { "to an edge," },
-                (to[0] - s.eye[0]).hypot(to[1] - s.eye[2]) * m,
-                (to[0] - s.eye[0]).atan2(-(to[1] - s.eye[2])).to_degrees(),
-                s.candidates.len()
-            );
-            let report = vrc_nav::goto(vr.rig(&whitelist)?, s, to, &opts)?;
-            tracing::info!(
-                "follow: way round, round {round}: arrived {}, {:.1} m left, {} legs{}",
-                report.arrived,
-                report.remaining,
-                report.legs.len(),
-                report.reason.as_deref().map(|r| format!(" ({r})")).unwrap_or_default()
-            );
-            let yaw = vr.yaw;
-            drop(vr);
-            track.lock().unwrap().facing = yaw;
-            if near_goal && report.arrived {
-                return Ok(true);
-            }
-            if !report.arrived && !near_goal {
-                dead.push(goal_odo);
-            }
-        }
-        Ok(false)
     }
 
     /// The search: one view at a time, from where the target was last seen
@@ -681,19 +549,45 @@ impl Follower {
         } else {
             false
         };
-        // The way to them, as far as this view shows it.
-        let Some(goal) = t.target.filter(|f| f.at.elapsed() < LOST_AFTER).and_then(|_| t.target_now()) else {
+        // The way to them, as far as this view shows it (following a wall,
+        // where they were).
+        let goal = if t.wall.is_some() { t.target_now() } else { t.target.filter(|f| f.at.elapsed() < LOST_AFTER).and_then(|_| t.target_now()) };
+        let Some(goal) = goal else {
             return Ok(found);
         };
         let direct = bearing(then, goal);
         let gap = (goal[0] - then[0]).hypot(goal[1] - then[1]);
-        if angle_diff(direct, yaw).abs() > VIEW_HALF_DEG {
-            return Ok(found); // not in view: the detour (or the turn) goes on
-        }
+        let in_view = angle_diff(direct, yaw).abs() <= VIEW_HALF_DEG;
         // Their own body (within half a metre of their feet) is not in the way.
-        let blocked = corridor(&points, eye, direct, metres, floor).filter(|b| b.distance < gap - 0.5 && b.distance < 3.0);
+        let blocked = if in_view { corridor(&points, eye, direct, metres, floor).filter(|b| b.distance < gap - 0.5 && b.distance < 3.0) } else { None };
+        let free = |h: f32| corridor(&points, eye, h, metres, floor).is_none_or(|b| b.distance > FREE_M);
         let mut s = self.inner.lock().unwrap();
         s.obstacle = blocked.map_or(f32::INFINITY, |b| b.distance);
+        if let Some(w) = t.wall {
+            let open = in_view && blocked.is_none();
+            if open && gap < w.gap - LEAVE_NEARER_M {
+                t.wall = None;
+                t.detour = None;
+                s.avoiding = "";
+                return Ok(found);
+            }
+            if at - w.since > WALL_FOR {
+                // Round and round: try the other way next time.
+                t.wall = None;
+                t.detour = None;
+                s.avoiding = "";
+                return Ok(found);
+            }
+            // A hand on the wall: the free heading nearest its side.
+            let pick = (-WALL_STEPS..=WALL_STEPS).rev().map(|k| wrap(yaw + w.side * k as f32 * WALL_STEP_DEG)).find(|&h| free(h));
+            let heading = pick.unwrap_or_else(|| wrap(yaw - w.side * 70.0)); // boxed in: turn away
+            t.detour = Some((at + DETOUR_FOR, heading));
+            s.avoiding = "wall";
+            return Ok(found);
+        }
+        if !in_view {
+            return Ok(found); // not in view: the turn goes on
+        }
         let Some(b) = blocked else {
             t.obstacle = None;
             t.detour = None;
@@ -712,25 +606,32 @@ impl Follower {
             }
         }
         t.no_jump.retain(|&(_, until)| at < until);
-        obstacle.jump = !b.tall && !t.no_jump.iter().any(|&(q, _)| near(q));
-        t.obstacle = Some(obstacle);
-        // A way round, on a height map of this view.
-        let to = [eye[0] + (goal[0] - then[0]) / metres, eye[2] + (goal[1] - then[1]) / metres];
-        let mut map = HeightMap::new(vrc_nav::world_params().in_units(metres), [eye[0], eye[2]], floor);
-        map.add(&points, eye);
-        let round = vrc_nav::next_waypoint(&map, eye, to, vrc_nav::CLEARANCE_M / metres, 2.0 / metres)
-            .map(|(yaw, _)| yaw)
-            .filter(|&w| angle_diff(w, direct).abs() > 5.0);
         // Not up to the eyes, and not failed yet: over it, first.
-        let over = obstacle.jump;
-        t.detour = if over { None } else { round.map(|w| (at + DETOUR_FOR, w)) };
-        s.avoiding = if over {
-            "jump"
-        } else if t.detour.is_some() {
-            "detour"
-        } else {
-            "blocked"
-        };
+        obstacle.jump = !b.tall && !t.no_jump.iter().any(|&(q, _)| near(q));
+        if obstacle.jump {
+            t.obstacle = Some(obstacle);
+            t.detour = None;
+            s.avoiding = "jump";
+            return Ok(found);
+        }
+        // Else round it, following it: go the side with a free heading
+        // nearest the way to them, keeping the wall on the other side.
+        t.obstacle = None;
+        let side = (1..=4)
+            .find_map(|k| {
+                let (r, l) = (wrap(direct + k as f32 * WALL_STEP_DEG), wrap(direct - k as f32 * WALL_STEP_DEG));
+                if free(r) {
+                    Some(-1.0) // round to the right: the wall on the left
+                } else if free(l) {
+                    Some(1.0)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(1.0);
+        t.wall = Some(Wall { side, since: at, gap });
+        t.detour = None;
+        s.avoiding = "wall";
         Ok(found)
     }
 
@@ -784,14 +685,8 @@ impl Follower {
             while t.history.front().is_some_and(|h| now - h.0 > ODOMETRY_KEPT) {
                 t.history.pop_front();
             }
-            if t.routing {
-                // The walks of the way round have the stick.
-                drop(t);
-                axis = 0.0;
-                aimed = f32::NAN;
-                continue;
-            }
-            let fresh = t.target.is_some_and(|f| f.at.elapsed() < LOST_AFTER);
+            let fresh = t.wall.is_some() || t.target.is_some_and(|f| f.at.elapsed() < LOST_AFTER);
+            let walling = t.wall.is_some();
             let mut jump = false;
             let want = match t.target_now() {
                 _ if escape.is_some_and(|e| now < e) => BACK_AXIS,
@@ -823,6 +718,9 @@ impl Follower {
                         let mut v = (2.0 * BRAKE * left.max(0.0)).sqrt().min(MAX_SPEED);
                         if over.is_some() {
                             v = v.max(RUN_UP_SPEED); // a run-up
+                        }
+                        if walling {
+                            v = v.clamp(MIN_SPEED * 2.0, WALL_SPEED); // along it, out of reach or not
                         }
                         if v >= MIN_SPEED { AXIS_DEAD + v / SPEED_PER_AXIS } else { 0.0 }
                     } else if gap < stand - BACK_MARGIN || (axis < 0.0 && gap < stand - BACK_UNTIL) {
@@ -929,15 +827,6 @@ pub fn corridor_report(frame: &EyeFrame, yaw: Option<f32>, metres: f32) -> anyho
         "blocker": corridor(&points, eye, yaw, metres, FLOOR_Y).map(|b| json!({"distance": r(b.distance), "top": r(b.top), "tall": b.tall})),
         "bins": bins.iter().enumerate().filter(|(_, b)| b.0 > 0).map(|(i, b)| json!([r(0.3 + 0.1 * i as f32), b.0, r(b.1), r(b.2)])).collect::<Vec<_>>(),
     }))
-}
-
-/// The cells of `map` within `radius` of `at` (x, z).
-fn cells_within(map: &HeightMap, at: [f32; 2], radius: f32) -> impl Iterator<Item = usize> + '_ {
-    let n = (radius / map.params.cell).ceil() as i32;
-    (-n..=n).flat_map(move |dx| (-n..=n).map(move |dz| (dx, dz))).filter_map(move |(dx, dz)| {
-        let (x, z) = (at[0] + dx as f32 * map.params.cell, at[1] + dz as f32 * map.params.cell);
-        ((x - at[0]).hypot(z - at[1]) <= radius).then(|| map.index(x, z)).flatten()
-    })
 }
 
 /// The middle of the eyes of `frame` (tracking space, stereo units).
