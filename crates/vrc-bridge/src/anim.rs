@@ -31,6 +31,8 @@ pub struct Anim {
     path: PathBuf,
     /// The bot's voice: (when it plays, loudness 0..1) per window.
     voice: Mutex<VecDeque<(Instant, f32)>>,
+    /// What the last tick saw (speed, talking, holding still), for `/v1/anim`.
+    pub live: Mutex<Value>,
 }
 
 impl Anim {
@@ -39,7 +41,7 @@ impl Anim {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).map_err(|e| tracing::warn!("{}: {e}", path.display())).ok())
             .unwrap_or_default();
-        Anim { params: Mutex::new(params), path, voice: Mutex::new(VecDeque::new()) }
+        Anim { params: Mutex::new(params), path, voice: Mutex::new(VecDeque::new()), live: Mutex::new(Value::Null) }
     }
 
     pub fn params(&self) -> AnimParams {
@@ -142,7 +144,11 @@ impl Anim {
             let enabled = animator.params.enabled;
             // Glances only when nobody else is using the head.
             let idle = bridge.follower.is_idle() && bridge.vr.try_lock().is_ok();
-            let overlay = animator.update(&AnimInput { dt, owner: owner.state, speed, voice: self.voice_now(now), idle });
+            let voice = self.voice_now(now);
+            let overlay = animator.update(&AnimInput { dt, owner: owner.state, speed, voice, idle });
+            if tick.is_multiple_of(SPEED_EVERY) {
+                *self.live.lock().unwrap() = serde_json::json!({"speed": speed, "talking": voice.is_some(), "idle": idle, "still": owner.still});
+            }
             let link = link.as_ref().unwrap();
             let sent = if enabled {
                 off_sent = false;

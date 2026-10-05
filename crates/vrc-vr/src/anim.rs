@@ -62,6 +62,11 @@ pub struct AnimParams {
     /// (m, peak to peak, walking; twice that running).
     pub swing: f32,
     pub bob_m: f32,
+    /// Leaning into the walk: the head ahead of the hands (m) and tipped
+    /// down (degrees) at a full walk; twice that running. With only head
+    /// and hands, VRChat's IK reads the torso's tilt from them.
+    pub lean_m: f32,
+    pub lean_deg: f32,
     /// Gestures and nods while talking.
     pub talk: bool,
     /// The head's height above the tracking floor (m): where VRChat's
@@ -75,7 +80,7 @@ impl Default for AnimParams {
     fn default() -> Self {
         AnimParams {
             enabled: true,
-            rest: [0.155, -0.48, 0.04],
+            rest: [0.155, -0.48, 0.0],
             grip: [85.0, 0.0, -90.0],
             hand_tracking: true,
             curl: [0.40, 0.35, 0.30, 0.25, 0.25],
@@ -86,6 +91,8 @@ impl Default for AnimParams {
             glances: true,
             swing: 1.0,
             bob_m: 0.025,
+            lean_m: 0.04,
+            lean_deg: 4.0,
             talk: true,
             head_height: 1.56,
         }
@@ -291,11 +298,12 @@ impl Animator {
         let (bs, bc) = body_yaw.to_radians().sin_cos();
         let (right, ahead) = ([bc, 0.0, bs], [bs, 0.0, -bc]);
         let side_m = w(&self.wobble[W_HEAD]) * 0.012 * k * still + shift + 0.015 * k * walking * step.sin();
-        let ahead_m = w(&self.wobble[W_HEAD + 1]) * 0.008 * k * still;
+        let lean = smoothstep(0.3, 1.5, v) + run;
+        let ahead_m = w(&self.wobble[W_HEAD + 1]) * 0.008 * k * still + p.lean_m * k * lean;
         let up_m = breath * p.breath_m * k - bob * 0.5 * (1.0 + (2.0 * step).cos());
         let head_offset = HeadOffset {
             yaw: w(&self.wobble[W_HEAD + 2]) * 2.5 * still + self.glance_yaw.at(t),
-            pitch: w(&self.wobble[W_HEAD + 3]) * 1.5 * still - 0.3 * breath + self.glance_pitch.at(t) - 6.0 * nod,
+            pitch: w(&self.wobble[W_HEAD + 3]) * 1.5 * still - 0.3 * breath + self.glance_pitch.at(t) - 6.0 * nod - p.lean_deg * lean,
             roll: w(&self.wobble[W_HEAD + 4]) * 1.0 * still + shift / (0.04 * k) * 1.5,
             position: std::array::from_fn(|i| right[i] * side_m + ahead[i] * ahead_m + if i == 1 { up_m } else { 0.0 }),
         };

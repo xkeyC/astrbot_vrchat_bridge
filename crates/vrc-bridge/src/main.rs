@@ -414,7 +414,9 @@ async fn social_config(State(b): State<App>, Body(body): Body) -> Reply {
 }
 
 async fn anim_params(State(b): State<App>) -> Json<Value> {
-    Json(serde_json::to_value(b.anim.params()).unwrap_or_default())
+    let mut v = serde_json::to_value(b.anim.params()).unwrap_or_default();
+    v["live"] = b.anim.live.lock().unwrap().clone();
+    Json(v)
 }
 
 async fn anim_tune(State(b): State<App>, Body(body): Body) -> Reply {
