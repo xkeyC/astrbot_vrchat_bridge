@@ -98,11 +98,14 @@ const TURN_RATE: f32 = 200.0;
 const PREDICT_S: f32 = 1.0;
 const ODOMETRY_KEPT: Duration = Duration::from_secs(4);
 /// Obstacles: standing more than STEP_M over the ground before them (lower
-/// ones are walked up), with at least OBSTACLE_POINTS points; reaching
+/// ones are walked up), with at least OBSTACLE_POINTS points (NEAR_POINTS
+/// nearer than 0.9 m; stray points of stereo come in ones and twos, a box
+/// 0.4 m high 3 m off gives some 400); reaching
 /// within EYE_MARGIN_M of the eyes, walked round, else jumped first, this
 /// far before them, after a run-up at least RUN_UP_SPEED fast.
 const STEP_M: f32 = 0.3;
-const OBSTACLE_POINTS: usize = 4;
+const OBSTACLE_POINTS: usize = 25;
+const NEAR_POINTS: usize = 40;
 const EYE_MARGIN_M: f32 = 0.25;
 const JUMP_AT_M: f32 = 0.5;
 /// A jump that left the same obstacle (within this) in the way failed:
@@ -246,14 +249,17 @@ struct Blocker {
 /// metre wide out to 4 m; `None` when the way is clear. The ground is
 /// followed along the corridor (slopes, steps), so a raised floor is not in
 /// the way; something stands in the way when it rises more than a step
-/// over the ground before it. Points nearer than 0.9 m are the bot's own
-/// body (arms swinging forward, a gesture, props such as a weapon on the
-/// back that reaches over the shoulder; the walks' maps leave out 0.8 m):
-/// nearer obstacles were seen from farther, and the odometry counts down to
-/// them.
+/// over the ground before it. Nearer than 0.9 m the bot's own body is in
+/// view too (arms swinging forward, a gesture, props such as a weapon on the
+/// back that reaches over the shoulder, all below about 1.1 m): there only
+/// points from NEAR_UP of the eye height up count, so a wall (which reaches
+/// that high) is seen however near; a low thing that near was seen from
+/// farther, and the odometry counts down to it.
 fn corridor(points: &[[f32; 3]], eye: [f32; 3], yaw: f32, metres: f32, floor: f32) -> Option<Blocker> {
     const BIN: f32 = 0.1;
     const FROM: f32 = 0.9;
+    const NEAR_FROM: f32 = 0.35;
+    const NEAR_UP: f32 = 0.85;
     const BINS: usize = 31;
     let (s, c) = yaw.to_radians().sin_cos();
     let eye_m = (eye[1] - floor) * metres;
@@ -268,6 +274,19 @@ fn corridor(points: &[[f32; 3]], eye: [f32; 3], yaw: f32, metres: f32, floor: f3
                 bins[i].push((ahead, up));
             }
         }
+    }
+    // Near: only what reaches up toward the eyes (a wall), not the body.
+    let near: Vec<f32> = points
+        .iter()
+        .filter_map(|p| {
+            let (dx, dz) = (p[0] - eye[0], p[2] - eye[2]);
+            let (ahead, side, up) = ((dx * s - dz * c) * metres, (dx * c + dz * s) * metres, (p[1] - floor) * metres);
+            (ahead > NEAR_FROM && ahead <= FROM && side.abs() < 0.25 && up > NEAR_UP * eye_m && up < eye_m + 0.3).then_some(ahead)
+        })
+        .collect();
+    if near.len() >= NEAR_POINTS {
+        let distance = near.iter().copied().fold(f32::INFINITY, f32::min);
+        return Some(Blocker { distance, top: eye_m, tall: true });
     }
     let mut ground = 0.0f32;
     for (i, bin) in bins.iter().enumerate() {
@@ -971,9 +990,10 @@ mod tests {
         // Floor, then a box 0.4 m high from 1.0 m ahead (-z).
         let mut points = Vec::new();
         floor_to(&mut points, 0.4, 1.0, 0.0);
-        for j in 0..9 {
-            for i in 0..5 {
-                points.push([-0.2 + 0.1 * i as f32, 0.05 * j as f32, -1.0]);
+        // Its face, as densely as stereo samples it (2 cm).
+        for j in 0..21 {
+            for i in 0..20 {
+                points.push([-0.2 + 0.02 * i as f32, 0.02 * j as f32, -1.0]);
             }
         }
         let b = corridor(&points, eye, 0.0, 1.0, 0.0).unwrap();
@@ -1001,6 +1021,22 @@ mod tests {
             z += 0.05;
         }
         assert!(corridor(&ramp, eye, 0.0, 1.0, 0.0).is_none());
+        // Near: the bot's own weapon at 0.6 m (up to 1.1 m high) is not in
+        // the way; a wall there (up past the eyes) is.
+        let mut prop = Vec::new();
+        for j in 0..10 {
+            for i in 0..5 {
+                prop.push([-0.2 + 0.1 * i as f32, 0.6 + 0.05 * j as f32, -0.6]);
+            }
+        }
+        assert!(corridor(&prop, eye, 0.0, 1.0, 0.0).is_none());
+        for j in 0..34 {
+            for i in 0..10 {
+                prop.push([-0.2 + 0.05 * i as f32, 0.05 * j as f32, -0.7]);
+            }
+        }
+        let b = corridor(&prop, eye, 0.0, 1.0, 0.0).unwrap();
+        assert!((b.distance - 0.7).abs() < 0.05 && b.tall, "{b:?}");
         // Walking up to an obstacle along its heading brings it nearer; another way, it is not ahead.
         let o = Obstacle { yaw: 0.0, then: [0.0, 0.0], distance: 1.0, jump: true };
         assert!((o.ahead([0.0, -0.4], 0.0).unwrap() - 0.6).abs() < 1e-4);
