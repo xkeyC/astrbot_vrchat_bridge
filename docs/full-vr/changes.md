@@ -12,6 +12,12 @@
 | `crates/vrc-scene` | 新增。`Panorama::stitch`：用每帧的位姿把多张左眼图拼成等距柱状全景。`HeightMap`：2.5 维栅格，以拟合出的地面为基准，把每个格子分为地面、障碍、高台、未知，并能画成俯视图。 |
 | `vr-probe scan` | 新增。头部扫描后输出全景图和高度图；`--boost N` 扫描期间临时提高帧率，扫完恢复原帧率；`--hold-ms` 改用流水线扫描 |
 | `crates/vrc-vr` 的 `fps` 模块、`scan_pipelined` | 新增。`FpsControl` 读写 Monado 的帧率控制文件；`scan_pipelined` 不等每个方向的画面回来就转到下一个方向，再按位姿从环形缓冲区里认领画面，漏掉的方向最后逐个补拍 |
+| `crates/vrc-players` | 新增。名牌 OCR 客户端（infra 的 `/v1/ocr/lines`）、房间玩家名单（VRChat 日志）、名字匹配（和桌面 bridge 同一规则）、名牌的双目定位；自动跟随和 LLM 工具共用 |
+| `crates/vrc-nav` | 新增。`survey`（环视、双目、高度图、玩家、候选点、换算成世界米、编号全景图和地图）、`goto`（分段走、每段后重新环视和规划、被挡住时标记障碍） |
+| `crates/vrc-bridge` | 新增。Python bridge 的 Rust 移植，见 decisions D20 |
+| `crates/vrc-vr` 的 `osc`、`walk` | 新增。OSC 发送（任意参数）和 OSCQuery 读取（眼高、速度）；按角色自身速度计量的一段行走，推着却走不动时判为被挡住 |
+| `ops/vr/vrc-bridge.service` | 新增。Rust bridge 的用户单元 |
+| `astrbot_plugin/` | 改为只支持 VR：删掉桌面导航工具，新增 look_around、walk_to、step、last_seen；VR 版提示词 |
 | `astrbot_plugin/` | 由根目录移入：`main.py`、`vrchat_adapter.py`、`metadata.yaml`、`logo.svg`，内容未改 |
 | `legacy/bridge/` | 由 `bridge/` 移入，内容未改（桌面模式仍可用） |
 | `third_party/` | Monado、xrizer 的基础提交说明和补丁 |

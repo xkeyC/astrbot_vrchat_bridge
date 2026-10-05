@@ -43,10 +43,13 @@ monado-service
 Cargo.toml              Rust workspace（主语言）
 crates/vrc-vr/          虚拟头显：remote 驱动协议、抓帧读取、位姿/内参
 crates/vrc-stereo/      双目深度：census SGM、真实尺度的深度、点云、地面拟合
-crates/vrc-scene/       全景拼接、2.5 维高度图
+crates/vrc-scene/       全景拼接、多层 2.5 维高度图、候选点（地点和玩家）、编号标注
+crates/vrc-players/     名牌 OCR、房间玩家名单、名字匹配、双目定位玩家（跟随和工具共用）
+crates/vrc-nav/         环视（survey）和走到某点（goto）
+crates/vrc-bridge/      bridge：HTTP/WebSocket 给 AstrBot 插件（音频、状态、输入、Web API、跟随、VR 能力）
 crates/vr-probe/        手动调试工具：info / grab / look / sweep / depth / scan
-astrbot_plugin/         AstrBot 插件（Python，AstrBot 只认 Python 插件）
-legacy/bridge/          桌面模式的 Python bridge（替换完成前继续使用）
+astrbot_plugin/         AstrBot 插件（Python，AstrBot 只认 Python 插件；本分支只支持 VR）
+legacy/bridge/          桌面模式的 Python bridge（已由 vrc-bridge 取代，仅作参考）
 third_party/monado/     上游基础提交 + 补丁
 third_party/xrizer/     上游基础提交 + 补丁
 ops/vr/                 构建、安装脚本和配置（已脱敏，路径和用户用参数传入）

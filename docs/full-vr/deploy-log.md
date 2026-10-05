@@ -26,11 +26,13 @@
 | 21:xx | 通过 OSCQuery 读取眼高（`/avatar/eyeheight` 为 1.405，缩放未被禁止），再通过 OSC 写入 1.6 和 1.0，最后恢复为 1.405；每次都用双目重新量地面 | 读写都生效（`EyeHeightAsMeters`、`ScaleFactor` 跟着变）；双目测得的眼睛到地面距离始终在 1.913–1.929 之间，说明世界缩放时两眼间距也一起缩放。已恢复原眼高 |
 | 21:xx | Monado 改为每帧都抓（`XRT_NULL_TAP_FPS=0`），合成器先后用 30 fps 和 60 fps 重启（VRChat 跟着重启）；执行 `vr-probe scan --count 5 --pitch -10 --down` | 30 fps：6 个方向 480 ms；60 fps：6 个方向 283 ms，GPU 利用率约 28%。全景覆盖 71%，360° 高度图约 190 万个点，耗时约 1 s。刚重启时 VRChat 还在加载，抓到的帧不随头部姿态变化，扫描会超时，等进入世界后再扫就正常 |
 | 22:xx | Monado 打补丁 0003（运行中改帧率，`XRT_NULL_FPS_FILE=/dev/shm/vrc-fps`），抓帧改为 8 槽环形缓冲区；对比逐个方向和流水线扫描、30–120 fps | 改帧率生效，30→90 用时 4–32 ms，VRChat 提交帧率跟随到 119。扫描最快的仍是 30 fps 逐个方向：6 个方向 199–209 ms；90 fps 下约 290–310 ms；流水线方式会漏帧。启动时上报 90 Hz、运行时压到 30 也没有改善。最后恢复为启动 30 fps |
+| 22:xx | 部署 vrc-bridge 的 HTTP 接口（临时端口 6121），环视、编号全景图和地图接口可用；全景和地图转到朝向 | 正常；无 token 返回 401 |
+| 23:xx | Rust bridge 替换 Python bridge：以临时单元 `vrc-rs-bridge` 监听 10.88.0.2:6120（Python 的 `vrc-bridge` 单元一直是停用状态） | Web API 登录成功（cookie 沿用），pipeline 已连上；status、social、聊天框、跳、小步移动（转 30° 后走 0.8 m，实走 1.0 m）、截图、环视均正常；WebSocket 先收到房间状态，1 秒的测试音播进麦克风，游戏音频持续流入；表情返回"当前化身没有表情参数"（和 Python 版的行为一致） |
 
 ### 当前服务器状态
 
 - VRChat 以 VR 模式运行，`monado-service` 是临时单元（systemd-run）：合成器 30 fps（可通过 `/dev/shm/vrc-fps` 临时调整），每帧都抓（8 槽环形缓冲区），视场 100°。
-- AstrBot 的 `vrchat` 平台和插件已停用，bridge 已停止。
+- AstrBot 的 `vrchat` 平台和插件已停用；Rust bridge 以临时单元 `vrc-rs-bridge` 运行在 10.88.0.2:6120，Python 的 `vrc-bridge` 单元已停用。服务器上的插件还是旧版（桌面），尚未部署。
 - 切回桌面模式的步骤：
   1. `echo desktop > ~/.config/vrc-mode`；
   2. 重启 VRChat；
