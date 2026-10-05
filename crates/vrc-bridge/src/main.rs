@@ -45,6 +45,29 @@ use serde_json::{json, Value};
 
 use crate::bridge::Bridge;
 
+/// A std mutex taken whatever a panicking holder left: the state behind
+/// these locks stays usable, and one panic must not turn every later
+/// request into an error (or kill the animation and the follower).
+pub trait Lock<T> {
+    fn lk(&self) -> std::sync::MutexGuard<'_, T>;
+    /// Taken if free now.
+    fn try_lk(&self) -> Option<std::sync::MutexGuard<'_, T>>;
+}
+
+impl<T> Lock<T> for std::sync::Mutex<T> {
+    fn lk(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn try_lk(&self) -> Option<std::sync::MutexGuard<'_, T>> {
+        match self.try_lock() {
+            Ok(g) => Some(g),
+            Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+}
+
 const LOG_DIR: &str =
     "~/.local/share/Steam/steamapps/compatdata/438100/pfx/drive_c/users/steamuser/AppData/LocalLow/VRChat/VRChat";
 /// VRCEmote values of VRChat's default emote menu.
@@ -125,6 +148,8 @@ async fn main() -> Result<()> {
     }
     let addr = format!("{}:{}", args.listen, args.port);
     let (bridge, chat_rx) = Bridge::new(args, token);
+    // A bridge before this one may have died walking or talking.
+    bridge.let_go();
     tokio::spawn(bridge.clone().capture());
     tokio::spawn(bridge.clone().log_tail());
     tokio::spawn(bridge.clone().watchdog());
@@ -167,15 +192,33 @@ async fn main() -> Result<()> {
     let shutdown = bridge.clone();
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
-            let _ = tokio::signal::ctrl_c().await;
+            stopping().await;
             shutdown.follower.stop();
+            vrc_vr::walk::stop_all();
             shutdown.release_voice().await;
+            // A tick for the legs to see the stop, then nothing pushed.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            shutdown.let_go();
         })
         .await?;
     Ok(())
 }
 
 // -- plumbing -------------------------------------------------------------------
+
+/// Ctrl-C, or systemd stopping the unit (SIGTERM).
+async fn stopping() {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("a SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
+}
 
 async fn auth(State(b): State<App>, req: Request, next: Next) -> Response {
     let given = req
@@ -236,7 +279,7 @@ fn num(v: &Value, key: &str, default: f64) -> f64 {
 async fn on_headset<T: Send + 'static>(b: &App, f: impl FnOnce(&mut vr::VrCore, &App) -> Result<T> + Send + 'static) -> Result<T> {
     let b = b.clone();
     tokio::task::spawn_blocking(move || {
-        let mut core = b.vr.lock().unwrap();
+        let mut core = b.vr.lk();
         let r = f(&mut core, &b);
         if r.is_err() {
             core.reset(); // a failure may leave the connection in a bad state
@@ -292,6 +335,7 @@ async fn chatbox(State(b): State<App>, Body(body): Body) -> Reply {
 
 async fn stop(State(b): State<App>) -> Json<Value> {
     b.follower.stop();
+    vrc_vr::walk::stop_all();
     for axis in ["/input/Vertical", "/input/Horizontal"] {
         let _ = b.osc.send_f32(axis, 0.0);
     }
@@ -314,6 +358,7 @@ async fn step(State(b): State<App>, Body(body): Body) -> Reply {
     let direction = body["direction"].as_str().unwrap_or("forward").to_string();
     let jump = body["jump"].as_bool().unwrap_or(false);
     b.follower.stop();
+    let since = vrc_vr::walk::stops();
     let v = on_headset(&b, move |vr, b| {
         let osc = &b.osc;
         vr.step(
@@ -326,6 +371,7 @@ async fn step(State(b): State<App>, Body(body): Body) -> Reply {
             &direction,
             meters,
             jump,
+            since,
         )
     })
     .await?;
@@ -383,7 +429,7 @@ async fn follow(State(b): State<App>, Body(body): Body) -> Reply {
     let mut name = body["name"].as_str().unwrap_or("").trim().to_string();
     if name.is_empty() {
         // The whitelisted player in the room with the highest priority.
-        let here = b.game.lock().unwrap().others();
+        let here = b.game.lk().others();
         name = b
             .social
             .whitelist_ids()
@@ -416,7 +462,7 @@ async fn social_config(State(b): State<App>, Body(body): Body) -> Reply {
 
 async fn anim_params(State(b): State<App>) -> Json<Value> {
     let mut v = serde_json::to_value(b.anim.params()).unwrap_or_default();
-    v["live"] = b.anim.live.lock().unwrap().clone();
+    v["live"] = b.anim.live.lk().clone();
     Json(v)
 }
 
@@ -432,7 +478,7 @@ async fn anim_tune(State(b): State<App>, Body(body): Body) -> Reply {
 async fn screenshot(State(b): State<App>, Query(q): Query<std::collections::HashMap<String, String>>) -> std::result::Result<Response, Fail> {
     b.require_game()?;
     let width: u32 = q.get("width").and_then(|w| w.parse().ok()).unwrap_or(0).min(3840);
-    let pitch: Option<f32> = q.get("pitch").and_then(|p| p.parse().ok());
+    let pitch: Option<f32> = q.get("pitch").and_then(|p| p.parse().ok()).filter(|p: &f32| p.is_finite());
     let jpeg = on_headset(&b, move |vr, _| {
         let frame = match pitch {
             Some(pitch) => vr.frame_looking(pitch)?,
@@ -499,6 +545,8 @@ async fn game_stop(State(_b): State<App>) -> Reply {
 
 async fn vr_survey(State(b): State<App>, Body(body): Body) -> Reply {
     let players = body["players"].as_bool().unwrap_or(true);
+    // The scan turns the head, and a follow walks where the head looks.
+    b.follower.stop();
     let whitelist = b.social.whitelist_names();
     Ok(Json(on_headset(&b, move |vr, _| vr.survey(&whitelist, players)).await?))
 }
@@ -507,7 +555,8 @@ async fn vr_goto(State(b): State<App>, Body(body): Body) -> Reply {
     b.require_game()?;
     b.follower.stop();
     let whitelist = b.social.whitelist_names();
-    Ok(Json(on_headset(&b, move |vr, _| vr.goto(&whitelist, &body)).await?))
+    let since = vrc_vr::walk::stops();
+    Ok(Json(on_headset(&b, move |vr, _| vr.goto(&whitelist, &body, since)).await?))
 }
 
 async fn vr_height(State(b): State<App>) -> Json<Value> {
@@ -537,11 +586,13 @@ async fn vr_set_height(State(b): State<App>, Body(body): Body) -> Reply {
 /// level ahead with the hands at rest, and recenters Monado's local spaces.
 async fn vr_reset(State(b): State<App>) -> Reply {
     b.follower.stop();
+    vrc_vr::walk::stop_all();
     for axis in ["/input/Vertical", "/input/Horizontal"] {
         let _ = b.osc.send_f32(axis, 0.0);
     }
     let yaw = on_headset(&b, |vr, _| {
         let yaw = vr.yaw;
+        vr.forget_places();
         vr.reset();
         vr.face(yaw, 0.0)?;
         Ok(yaw)
@@ -560,7 +611,7 @@ async fn vr_reset(State(b): State<App>) -> Reply {
 /// The corridor ahead as the follower sees it (tuning): `yaw` to look along
 /// another way than the head's.
 async fn vr_corridor(State(b): State<App>, Query(q): Query<std::collections::HashMap<String, String>>) -> Reply {
-    let yaw: Option<f32> = q.get("yaw").and_then(|v| v.parse().ok());
+    let yaw: Option<f32> = q.get("yaw").and_then(|v| v.parse().ok()).filter(|y: &f32| y.is_finite());
     let height = b.osc_query().and_then(|o| o.eye_height()).unwrap_or(0.0) as f32;
     let metres = if height > 0.0 { height / (b.anim.params().head_height - vrc_vr::remote::FLOOR_Y) } else { 1.0 };
     let frame = on_headset(&b, |vr, _| vr.frame()).await?;

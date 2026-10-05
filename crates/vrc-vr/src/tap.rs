@@ -156,10 +156,11 @@ impl EyeTap {
                 return Ok(None);
             }
             let slot = ((n - 1) % ring.slots as u64) as usize;
-            if let Some(frame) = ring.slot(slot, pixels)? {
-                if frame.seq == 2 * n {
-                    return Ok(Some(frame));
-                }
+            match ring.slot(slot, pixels)? {
+                Some(frame) if frame.seq == 2 * n => return Ok(Some(frame)),
+                Some(_) => {}
+                // Being written, or the slots just laid out anew: a moment.
+                None => std::thread::sleep(std::time::Duration::from_millis(2)),
             }
             // Overwritten while reading, or a newer frame meanwhile: again.
         }
@@ -177,8 +178,9 @@ impl EyeTap {
         if self.map.as_ref().map(|m| m.len()) != Some(len) {
             let file = File::open(&self.path)?;
             // SAFETY: Monado only writes a slot inside its seqlock, which
-            // the reads check; it resizes the file only when the eyes change
-            // size, and a size change is noticed here and mapped again.
+            // the reads check; it lays the slots out anew only when the eyes
+            // change size, and then only grows the file (patch 0001), so a
+            // mapping of the old size never reaches past its end.
             self.map = Some(unsafe { Mmap::map(&file)? });
         }
         let map = self.map.as_ref().unwrap();

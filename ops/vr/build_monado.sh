@@ -14,8 +14,16 @@ if [ "${SRC%.zip}" != "$SRC" ]; then
   SRC=$VR_ROOT/monado
 fi
 cd "$SRC"
+# Each patch applied once: one already in is skipped, one that applies
+# neither way (an older version of it in the tree) stops the build - start
+# from a fresh source (the .zip) then.
 for p in "$HERE"/third_party/monado/patches/*.patch; do
-  patch -p1 -N --dry-run < "$p" >/dev/null 2>&1 && patch -p1 -N < "$p"
+  if patch -p1 -R -s -f --dry-run < "$p" >/dev/null 2>&1; then
+    echo "already applied: $(basename "$p")"
+  else
+    patch -p1 -N -s -t --dry-run < "$p" >/dev/null || { echo "patch $(basename "$p") does not apply" >&2; exit 1; }
+    patch -p1 -N < "$p"
+  fi
 done
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_INSTALL_PREFIX="$VR_ROOT/prefix"
 ninja -C build install

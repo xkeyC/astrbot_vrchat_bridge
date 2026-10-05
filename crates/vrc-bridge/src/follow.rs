@@ -49,6 +49,7 @@ use vrc_vr::scan::{self, angle_diff};
 use vrc_vr::tap::EyeFrame;
 
 use crate::bridge::Bridge;
+use crate::Lock;
 
 /// Standing distance (world metres) by default, and its limits.
 const STAND_M: f32 = 1.5;
@@ -118,6 +119,8 @@ const SAME_PLACE_M: f32 = 0.7;
 const NO_JUMP_FOR: Duration = Duration::from_secs(10);
 const RUN_UP_SPEED: f32 = 1.6;
 const JUMP_EVERY: Duration = Duration::from_millis(1500);
+/// After a jump the run goes on this long (in the air, over it).
+const JUMP_CARRY: Duration = Duration::from_millis(900);
 /// A heading chosen by a view is followed this long after it.
 const DETOUR_FOR: Duration = Duration::from_millis(1200);
 /// Stuck: pushing (stick past STUCK_AXIS) yet slower than STUCK_SPEED for STUCK_FOR.
@@ -147,6 +150,8 @@ pub struct Follower {
     inner: Mutex<State>,
     /// The running follow's stop flag (a new one per follow).
     stop: Mutex<Arc<AtomicBool>>,
+    /// The running follow's thread: the next waits for it to end.
+    runner: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 #[derive(Default, Clone)]
@@ -369,7 +374,7 @@ impl Track {
 
 impl Follower {
     pub fn status(&self) -> Value {
-        let s = self.inner.lock().unwrap();
+        let s = self.inner.lk();
         json!({
             "target": s.target,
             "state": if s.state.is_empty() { "idle" } else { s.state },
@@ -385,16 +390,17 @@ impl Follower {
     }
 
     pub fn is_idle(&self) -> bool {
-        !self.inner.lock().unwrap().running
+        !self.inner.lk().running
     }
 
     /// Follows `name`, standing `distance` world metres away.
     pub fn start(self: &Arc<Self>, bridge: &Arc<Bridge>, name: &str, distance: Option<f32>) {
-        self.stop();
         let stop = Arc::new(AtomicBool::new(false));
-        *self.stop.lock().unwrap() = stop.clone();
+        // Swapped under the lock: a start at the same moment cannot leave
+        // a flag nobody sets.
+        std::mem::replace(&mut *self.stop.lk(), stop.clone()).store(true, Ordering::SeqCst);
         {
-            let mut s = self.inner.lock().unwrap();
+            let mut s = self.inner.lk();
             *s = State {
                 target: name.to_string(),
                 state: "following",
@@ -405,14 +411,32 @@ impl Follower {
                 ..Default::default()
             };
         }
+        // After the follow before has let go of the stick and the headset.
+        let mut runner = self.runner.lk();
+        let before = runner.take();
         let (me, b) = (self.clone(), bridge.clone());
-        std::thread::spawn(move || me.run(b, stop));
+        *runner = Some(std::thread::spawn(move || {
+            if let Some(before) = before {
+                let _ = before.join();
+            }
+            if !stop.load(Ordering::SeqCst) {
+                me.run(b, stop);
+            }
+        }));
+        drop(runner);
         bridge.notify_state();
     }
 
+    /// The follow's state to write, while `stop` is the running follow's
+    /// (a stopped one, still finishing a look, writes nothing).
+    fn inner_for(&self, stop: &AtomicBool) -> Option<std::sync::MutexGuard<'_, State>> {
+        let s = self.inner.lk();
+        (!stop.load(Ordering::SeqCst)).then_some(s)
+    }
+
     pub fn stop(&self) {
-        self.stop.lock().unwrap().store(true, Ordering::SeqCst);
-        let mut s = self.inner.lock().unwrap();
+        self.stop.lk().store(true, Ordering::SeqCst);
+        let mut s = self.inner.lk();
         s.running = false;
         s.state = "idle";
         s.moving = 0.0;
@@ -420,7 +444,7 @@ impl Follower {
 
     /// closer / farther / stay / resume.
     pub fn adjust(&self, change: &str) -> anyhow::Result<()> {
-        let mut s = self.inner.lock().unwrap();
+        let mut s = self.inner.lk();
         if !s.running {
             anyhow::bail!("not following anyone");
         }
@@ -435,12 +459,23 @@ impl Follower {
     }
 
     fn run(self: Arc<Self>, bridge: Arc<Bridge>, stop: Arc<AtomicBool>) {
-        let target = self.inner.lock().unwrap().target.clone();
-        let track = Arc::new(Mutex::new(Track { facing: bridge.vr.lock().unwrap().yaw, ..Default::default() }));
+        let target = self.inner.lk().target.clone();
+        let facing = {
+            let mut vr = bridge.vr.lk();
+            if stop.load(Ordering::SeqCst) {
+                return; // stopped while it waited for the headset
+            }
+            vr.forget_places(); // following moves the bot
+            vr.yaw
+        };
+        let track = Arc::new(Mutex::new(Track { facing, ..Default::default() }));
         let legs = {
             let (me, b, t, s) = (self.clone(), bridge.clone(), track.clone(), stop.clone());
             std::thread::spawn(move || me.legs(&b, &t, &s))
         };
+        // However the follow ends (a panic too): the legs stop, the stick
+        // is let go, and the state says so if no other follow took over.
+        let _done = Done { me: self.clone(), bridge: bridge.clone(), stop: stop.clone(), legs: Some(legs) };
         let mut last_here = Instant::now();
         let mut searching = false;
         let mut next_search = Instant::now();
@@ -448,7 +483,7 @@ impl Follower {
         let mut osc: Option<Osc> = None;
         while !stop.load(Ordering::SeqCst) {
             let (running, here, room) = {
-                let g = bridge.game.lock().unwrap();
+                let g = bridge.game.lk();
                 let room: Vec<String> = g.others().into_iter().map(|(_, n)| n).collect();
                 (g.running, room.iter().any(|n| match_score(n, &target) >= 0.8), room)
             };
@@ -458,7 +493,9 @@ impl Follower {
             if here || room.is_empty() {
                 last_here = Instant::now();
             } else if last_here.elapsed() > GONE_AFTER {
-                bridge.send_event(json!({"type": "follow", "state": "gone", "target": target}));
+                if !stop.load(Ordering::SeqCst) {
+                    bridge.send_event(json!({"type": "follow", "state": "gone", "target": target}));
+                }
                 break;
             }
             if osc.is_none() {
@@ -473,7 +510,7 @@ impl Follower {
             };
             // Following a wall, the target may be out of sight a while.
             let lost = {
-                let mut t = track.lock().unwrap();
+                let mut t = track.lk();
                 let unseen = t.target.map_or(Duration::MAX, |f| f.at.elapsed());
                 if t.wall.is_some() && unseen > WALL_UNSEEN {
                     t.wall = None; // round a wall long out of sight: look for them
@@ -484,7 +521,7 @@ impl Follower {
             };
             // Along a wall, now and then a view the target's way.
             let glance = {
-                let t = track.lock().unwrap();
+                let t = track.lk();
                 match (t.wall, t.target_now()) {
                     (Some(_), Some(goal)) if last_glance.elapsed() > GLANCE_EVERY => {
                         let to = bearing(t.pos, goal);
@@ -495,20 +532,22 @@ impl Follower {
             };
             let result = if let Some(to) = glance {
                 last_glance = Instant::now();
-                self.look(&bridge, &track, &target, &room, metres, Some(to)).map(|_| ())
+                self.look(&bridge, &track, &target, &room, metres, Some(to), &stop).map(|_| ())
             } else if !lost {
-                self.look(&bridge, &track, &target, &room, metres, None).map(|_| ())
+                self.look(&bridge, &track, &target, &room, metres, None, &stop).map(|_| ())
             } else if Instant::now() >= next_search {
                 if !searching {
                     searching = true;
-                    self.inner.lock().unwrap().state = "searching";
-                    bridge.send_event(json!({"type": "follow", "state": "searching", "target": target}));
+                    if let Some(mut s) = self.inner_for(&stop) {
+                        s.state = "searching";
+                        bridge.send_event(json!({"type": "follow", "state": "searching", "target": target}));
+                    }
                 }
                 let found = self.search(&bridge, &track, &target, &room, metres, &stop);
                 if !matches!(found, Ok(true)) {
                     // Nobody all round: walk toward where they were a while.
-                    let mut t = track.lock().unwrap();
-                    let far = t.target_now().is_some_and(|g| (g[0] - t.pos[0]).hypot(g[1] - t.pos[1]) > self.inner.lock().unwrap().stand + 0.5);
+                    let mut t = track.lk();
+                    let far = t.target_now().is_some_and(|g| (g[0] - t.pos[0]).hypot(g[1] - t.pos[1]) > self.inner.lk().stand + 0.5);
                     if far {
                         t.seek = Some(Instant::now() + SEEK_FOR);
                         next_search = Instant::now() + SEEK_FOR;
@@ -523,31 +562,25 @@ impl Follower {
             };
             if let Err(e) = result {
                 tracing::warn!("follow round failed: {e:#}");
-                bridge.vr.lock().unwrap().reset();
+                bridge.vr.lk().reset();
                 std::thread::sleep(Duration::from_millis(500));
             }
-            let seen = track.lock().unwrap().target.is_some_and(|f| f.at.elapsed() < LOST_AFTER);
+            let seen = track.lk().target.is_some_and(|f| f.at.elapsed() < LOST_AFTER);
             if seen && searching {
                 searching = false;
-                self.inner.lock().unwrap().state = "following";
-                bridge.send_event(json!({"type": "follow", "state": "found", "target": target}));
+                if let Some(mut s) = self.inner_for(&stop) {
+                    s.state = "following";
+                    bridge.send_event(json!({"type": "follow", "state": "found", "target": target}));
+                }
             }
         }
-        stop.store(true, Ordering::SeqCst);
-        let _ = legs.join();
-        let mut s = self.inner.lock().unwrap();
-        s.running = false;
-        s.state = "idle";
-        s.moving = 0.0;
-        drop(s);
-        bridge.notify_state();
     }
 
     /// The search: one view at a time, from where the target was last seen
     /// outwards; true as soon as a view finds them.
     fn search(&self, bridge: &Arc<Bridge>, track: &Arc<Mutex<Track>>, target: &str, room: &[String], metres: f32, stop: &AtomicBool) -> anyhow::Result<bool> {
         let from = {
-            let t = track.lock().unwrap();
+            let t = track.lk();
             match t.target_now() {
                 Some(p) => bearing(t.pos, p),
                 None => t.facing,
@@ -558,7 +591,7 @@ impl Follower {
                 return Ok(false);
             }
             let yaw = wrap(from + offset);
-            if self.look(bridge, track, target, room, metres, Some(yaw))? {
+            if self.look(bridge, track, target, room, metres, Some(yaw), stop)? {
                 return Ok(true);
             }
         }
@@ -568,21 +601,26 @@ impl Follower {
     /// One look: the newest frame (or, with `aim`, the first one looking
     /// that way, the whole bot turned there), its name tags placed; whether
     /// the target was among them.
-    fn look(&self, bridge: &Arc<Bridge>, track: &Arc<Mutex<Track>>, target: &str, room: &[String], metres: f32, aim: Option<f32>) -> anyhow::Result<bool> {
+    #[allow(clippy::too_many_arguments)]
+    fn look(&self, bridge: &Arc<Bridge>, track: &Arc<Mutex<Track>>, target: &str, room: &[String], metres: f32, aim: Option<f32>, stop: &AtomicBool) -> anyhow::Result<bool> {
         // Along a wall a look elsewhere is a glance: the head alone.
-        let glance = aim.is_some() && track.lock().unwrap().wall.is_some();
+        let glance = aim.is_some() && track.lk().wall.is_some();
         let whitelist = bridge.social.whitelist_names();
         let (frame, ocr) = {
-            let mut vr = bridge.vr.lock().unwrap();
+            let mut vr = bridge.vr.lk();
             let frame = match aim {
                 Some(yaw) => {
                     // Exactly that way: the animation's sway would miss it.
                     vr.rig(&whitelist)?.hmd.hold_still(true)?;
                     let turned = if glance { vr.aim(yaw, PITCH) } else { vr.face(yaw, PITCH) };
                     let frame = turned.and_then(|()| scan::rendered_at(&mut vr.rig(&whitelist)?.tap, yaw, PITCH, Duration::from_secs(1)));
+                    // The head back the way the walk goes: walking follows
+                    // the head, and the next view judges from it.
+                    let back = if glance { vr.aim(track.lk().facing, PITCH) } else { Ok(()) };
                     vr.rig(&whitelist)?.hmd.hold_still(false)?;
+                    back?;
                     if !glance {
-                        track.lock().unwrap().facing = yaw;
+                        track.lk().facing = yaw;
                     }
                     frame?
                 }
@@ -610,21 +648,22 @@ impl Follower {
         for s in &seen {
             if s.whitelist_rank.is_some() {
                 if let Ok(jpeg) = crate::vr::eye_jpeg(&frame, 640) {
-                    bridge.sightings.saw(&s.name, &bridge.game.lock().unwrap().world_name, jpeg);
+                    bridge.sightings.saw(&s.name, &bridge.game.lk().world_name, jpeg);
                 }
             }
         }
         let points: Vec<[f32; 3]> = stereo.points(&disp, 2).into_iter().map(|(p, _)| p).collect();
         let hit = seen.iter().filter(|s| match_score(&s.name, target) >= 0.6).max_by(|a, b| a.score.total_cmp(&b.score));
-        let mut t = track.lock().unwrap();
+        let mut t = track.lk();
         let then = t.pos_at(at);
         let found = if let Some(hit) = hit {
             let rel = [(hit.feet[0] - eye[0]) * metres, (hit.feet[2] - eye[2]) * metres];
             t.add_fix(at, [then[0] + rel[0], then[1] + rel[1]]);
             t.seek = None;
-            let mut s = self.inner.lock().unwrap();
-            s.last_seen = Some(at);
-            s.distance = rel[0].hypot(rel[1]);
+            if let Some(mut s) = self.inner_for(stop) {
+                s.last_seen = Some(at);
+                s.distance = rel[0].hypot(rel[1]);
+            }
             true
         } else {
             false
@@ -641,7 +680,12 @@ impl Follower {
         // Their own body (within half a metre of their feet) is not in the way.
         let blocked = if in_view { corridor(&points, eye, direct, metres, floor).filter(|b| b.distance < gap - 0.5 && b.distance < 3.0) } else { None };
         let free = |h: f32| corridor(&points, eye, h, metres, floor).is_none_or(|b| b.distance > FREE_M);
-        let mut s = self.inner.lock().unwrap();
+        let mut guard = self.inner_for(stop);
+        let mut scratch = State::default(); // a stopped follow's: not kept
+        let s: &mut State = match guard.as_deref_mut() {
+            Some(s) => s,
+            None => &mut scratch,
+        };
         s.obstacle = blocked.map_or(f32::INFINITY, |b| b.distance);
         if let Some(w) = t.wall {
             // Nothing up to the eyes the straight way, nor a low thing a
@@ -749,22 +793,30 @@ impl Follower {
             let Some((vx, vz)) = velocity else {
                 osc = None;
                 self.set_axis(bridge, &mut axis, 0.0);
+                if strafe != 0.0 {
+                    strafe = 0.0;
+                    let _ = bridge.osc.send_f32("/input/Horizontal", 0.0);
+                }
                 continue;
             };
             let now = Instant::now();
             let dt = (now - last).as_secs_f32().min(0.2);
             last = now;
             let (stand, hold) = {
-                let s = self.inner.lock().unwrap();
+                let s = self.inner.lk();
                 (s.stand, s.hold)
             };
             // The way the head looks (walking follows it): from the headset
             // itself, as walks of a way round turn it too.
             if link.is_none() {
-                link = bridge.vr.try_lock().ok().and_then(|vr| vr.link());
+                link = bridge.vr.try_lk().and_then(|vr| vr.link());
             }
-            let heading = link.as_ref().and_then(|l| l.owner()).map(|o| o.state.head.yaw_pitch().0);
-            let mut t = track.lock().unwrap();
+            let owner = link.as_ref().and_then(|l| l.owner());
+            if owner.is_none() {
+                link = None; // the headset connected again since: its new link next tick
+            }
+            let heading = owner.map(|o| o.state.head.yaw_pitch().0);
+            let mut t = track.lk();
             // Odometry: the avatar's velocity is its own (z ahead, x right).
             let (fs, fc) = heading.unwrap_or(t.facing).to_radians().sin_cos();
             let (ahead, right) = ([fs, -fc], [fc, fs]);
@@ -786,7 +838,10 @@ impl Follower {
                     let (gx, gz) = (goal[0] - pos[0], goal[1] - pos[1]);
                     let gap = gx.hypot(gz);
                     // Round something, or straight to them.
-                    let detour = t.detour.filter(|d| now < d.0).map(|d| d.1);
+                    // Along a wall the last way a view chose holds until the
+                    // next view (one may take longer than DETOUR_FOR): never
+                    // straight at them through the wall meanwhile.
+                    let detour = t.detour.filter(|d| now < d.0 || walling).map(|d| d.1);
                     if gap > 0.3 || detour.is_some() {
                         let to = detour.unwrap_or_else(|| bearing(pos, goal));
                         let step = angle_diff(to, t.facing).clamp(-TURN_RATE * dt, TURN_RATE * dt);
@@ -796,10 +851,15 @@ impl Follower {
                     let left = gap - stand - speed * LAG_S;
                     // Something in the way, nearer than they are?
                     let facing = t.facing;
+                    if t.obstacle.and_then(|o| o.ahead(pos, facing)).is_some_and(|d| d < -0.3) {
+                        t.obstacle = None; // over it, past it
+                    }
                     let ob = t.obstacle.and_then(|o| o.ahead(pos, facing).map(|d| (o, d))).filter(|&(_, d)| d < gap - 0.3);
-                    let over = ob.filter(|(o, d)| o.jump && *d < 2.0 && last_jump.is_none_or(|j| now - j > JUMP_EVERY));
+                    // In the air after a jump at it, the run goes on over it.
+                    let airborne = last_jump.is_some_and(|j| now - j < JUMP_CARRY);
+                    let over = ob.filter(|(o, d)| o.jump && *d < 2.0 && (airborne || last_jump.is_none_or(|j| now - j > JUMP_EVERY)));
                     let blocked = ob.is_some_and(|(_, d)| d < OBSTACLE_M) && over.is_none();
-                    if let Some((o, d)) = over {
+                    if let Some((o, d)) = over.filter(|_| !airborne) {
                         jump = d < JUMP_AT_M + speed * 0.1;
                         if jump {
                             t.jumped = Some((now, o.place()));
@@ -837,7 +897,9 @@ impl Follower {
                             aside = -aside;
                             let yaw = wrap(t.facing + aside * 60.0);
                             t.detour = Some((now + ESCAPE_FOR + DETOUR_FOR, yaw));
-                            self.inner.lock().unwrap().avoiding = "stuck";
+                            if let Some(mut s) = self.inner_for(stop) {
+                                s.avoiding = "stuck";
+                            }
                         }
                     }
                 } else {
@@ -877,11 +939,13 @@ impl Follower {
                     std::thread::sleep(Duration::from_millis(100));
                     let _ = b.osc.send_i32("/input/Jump", 0);
                 });
-                self.inner.lock().unwrap().jumps += 1;
+                if let Some(mut s) = self.inner_for(stop) {
+                    s.jumps += 1;
+                }
             }
             if fresh && (aimed.is_nan() || angle_diff(facing, aimed).abs() >= 1.0) {
                 // The eyes may hold the headset a moment: next tick then.
-                if let Ok(mut vr) = bridge.vr.try_lock() {
+                if let Some(mut vr) = bridge.vr.try_lk() {
                     if vr.face(facing, PITCH).is_ok() {
                         aimed = facing;
                     }
@@ -896,8 +960,37 @@ impl Follower {
         if *axis != value {
             let _ = bridge.osc.send_f32("/input/Vertical", value);
             *axis = value;
-            self.inner.lock().unwrap().moving = (value * 100.0).round() / 100.0;
+            self.inner.lk().moving = (value * 100.0).round() / 100.0;
         }
+    }
+}
+
+/// The end of a follow (see `Follower::run`).
+struct Done {
+    me: Arc<Follower>,
+    bridge: Arc<Bridge>,
+    stop: Arc<AtomicBool>,
+    legs: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Done {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(legs) = self.legs.take() {
+            let _ = legs.join();
+        }
+        // The legs let go when they end; a panic in them may not have.
+        for axis in ["/input/Vertical", "/input/Horizontal"] {
+            let _ = self.bridge.osc.send_f32(axis, 0.0);
+        }
+        let current = Arc::ptr_eq(&self.me.stop.lk(), &self.stop);
+        if current {
+            let mut s = self.me.inner.lk();
+            s.running = false;
+            s.state = "idle";
+            s.moving = 0.0;
+        }
+        self.bridge.notify_state();
     }
 }
 

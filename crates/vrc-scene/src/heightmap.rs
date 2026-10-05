@@ -186,6 +186,11 @@ impl HeightMap {
         }
     }
 
+    /// Whether a walk was stopped at cell `i` ([`HeightMap::mark_blocked`]).
+    pub fn is_blocked(&self, i: usize) -> bool {
+        self.blocked[i]
+    }
+
     /// Cell `i`: what it is, and its ground height if it has one.
     pub fn cell(&self, i: usize) -> (Cell, Option<f32>) {
         let p = self.params;
@@ -200,6 +205,14 @@ impl HeightMap {
         // The ground: the lowest bin holding a fair share of the points.
         let enough = ((n as f32 * 0.15).ceil() as u16).max(2);
         let Some(g) = hist.iter().position(|&c| c >= enough) else {
+            // Points spread up and down with no ground among them: a wall
+            // seen at a glance (its foot hidden), when most of them stand
+            // over the bot's floor by more than a step.
+            let over = ((self.floor + p.step - self.base) / BIN).ceil().max(0.0) as usize;
+            let high: u32 = hist[over.min(self.bins)..].iter().map(|&c| c as u32).sum();
+            if n >= 3 * p.min_points && high as f32 >= 0.6 * n as f32 {
+                return (Cell::Obstacle, None);
+            }
             return (Cell::Unknown, None);
         };
         let step_bins = (p.step / BIN).ceil() as usize;
@@ -306,5 +319,24 @@ mod tests {
         assert_eq!(sunk, Cell::Floor);
         assert!((h.unwrap() + 0.2).abs() < 0.05, "{h:?}");
         assert_eq!(at(0.1, 0.1).0, Cell::Unknown); // own feet
+    }
+
+    #[test]
+    fn a_wall_without_its_foot_is_an_obstacle() {
+        let mut m = HeightMap::new(MapParams { radius: 3.0, ..Default::default() }, [0.0, 0.0], 0.0);
+        let eye = [0.0, 1.6, 0.0];
+        // Points all the way up a wall at z = -2.05, a few on its foot.
+        let mut pts = Vec::new();
+        for k in 0..40 {
+            pts.push([0.05, 0.05 * k as f32, -2.05]);
+        }
+        pts.push([0.05, 0.0, -2.05]);
+        // And a few stray points up in the air elsewhere: still unknown.
+        for k in 0..4 {
+            pts.push([1.05, 0.5 * k as f32, -1.05]);
+        }
+        m.add(&pts, eye);
+        assert_eq!(m.cell(m.index(0.05, -2.05).unwrap()).0, Cell::Obstacle);
+        assert_eq!(m.cell(m.index(1.05, -1.05).unwrap()).0, Cell::Unknown);
     }
 }

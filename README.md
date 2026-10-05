@@ -40,6 +40,7 @@
 | `vrchat_last_seen` | 最后一次看到某位白名单好友时的画面 |
 | `vrchat_emote`、`vrchat_jump`、`vrchat_stop`、`vrchat_chatbox`、`vrchat_who` | 表情、跳、停下、头顶文字、房间里有谁 |
 | `vrchat_status`、`vrchat_social`、`vrchat_follow_rooms`、`vrchat_join` | 文字会话用：状态、白名单好友情况、跨房间跟随开关、去白名单好友所在的房间 |
+| `vrchat_height`、`vrchat_vr_reset` | 调整头显高度（身高）、VR 重置（重新居中） |
 
 ## 依赖
 
@@ -56,11 +57,11 @@
 ## 安装
 
 1. 构建 Monado 和 xrizer：运行 `ops/vr/build_monado.sh` 和 `build_xrizer.sh`。
-2. 运行 `ops/vr/install_vr.sh`：写入 Monado 配置和 xrizer 的路径文件，安装启动包装脚本和用户单元。然后把 VRChat 在 Steam 里的启动参数设为 `/usr/local/lib/vrc/vrc-launch.sh %command%`，再执行 `echo vr > ~/.config/vrc-mode`。
+2. 以 root 运行 `ops/vr/install_vr.sh <bot 用户> <VR_ROOT> [仓库路径]`：写入 Monado 配置和 xrizer 的路径文件，安装启动包装脚本和 `vrc-monado`、`vrc-bridge` 两个用户单元。bridge 单元运行 `<仓库路径>/target/release/vrc-bridge`，仓库路径默认是脚本所在的仓库，也可以在 `~/.config/vrc-bridge/env` 里用 `VRC_BRIDGE_BIN=` 改。然后把 VRChat 在 Steam 里的启动参数设为 `/usr/local/lib/vrc/vrc-launch.sh %command%`，再执行 `echo vr > ~/.config/vrc-mode`。
 3. 以 bot 用户编译 bridge：`cargo build --release -p vrc-bridge`。
 4. 生成至少 16 个字符的访问 token，写入 `~/.config/vrc-bridge/token`。
 5. 本机特有的参数写在 `~/.config/vrc-bridge/env` 的 `VRC_BRIDGE_ARGS` 里，比如监听地址、infra 的 OCR 地址、音频设备。可用参数见 `vrc-bridge --help`，默认都是本机地址。
-6. 安装 `ops/vr/vrc-monado.service` 和 `ops/vr/vrc-bridge.service` 两个用户单元。bot 用户需要开启 lingering：`loginctl enable-linger <用户>`。
+6. 启用两个用户单元（第 2 步已安装）。bot 用户需要开启 lingering：`loginctl enable-linger <用户>`。
 7. 登录 VRChat Web API。会依次询问账号、密码和两步验证码，只保存 cookie：
 
    ```sh

@@ -3,7 +3,7 @@
 //! `{"lines": [{"text", "confidence", "bbox": {"x", "y", "width", "height"}}]}`.
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -47,9 +47,16 @@ impl OcrClient {
 
     /// The lines of an encoded image.
     pub fn lines(&self, image: &[u8], content_type: &str) -> Result<Vec<OcrLine>> {
-        let mut s = TcpStream::connect((self.host.as_str(), self.port))
-            .with_context(|| format!("OCR at {}:{} is not up", self.host, self.port))?;
+        let up = || format!("OCR at {}:{} is not up", self.host, self.port);
+        // A host gone quiet fails in seconds, not the system's minutes (a
+        // caller may hold the headset meanwhile).
+        let mut s = (self.host.as_str(), self.port)
+            .to_socket_addrs()
+            .with_context(up)?
+            .find_map(|addr| TcpStream::connect_timeout(&addr, Duration::from_secs(3)).ok())
+            .with_context(up)?;
         s.set_read_timeout(Some(Duration::from_secs(10)))?;
+        s.set_write_timeout(Some(Duration::from_secs(10)))?;
         let auth = self.token.as_ref().map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
         write!(
             s,

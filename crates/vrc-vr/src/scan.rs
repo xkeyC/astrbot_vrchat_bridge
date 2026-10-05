@@ -49,8 +49,10 @@ pub fn scan(hmd: &mut RemoteHmd, tap: &mut EyeTap, views: &[(f32, f32)], timeout
         }
         Ok(())
     })();
-    hmd.set_head(home)?;
+    // Back home, and the overlay let go, whatever failed.
+    let back = hmd.set_head(home);
     hmd.hold_still(false)?;
+    back?;
     result.map(|()| shots)
 }
 
@@ -119,8 +121,10 @@ pub fn scan_pipelined(
         }
         Ok(())
     })();
-    hmd.set_head(home)?;
+    // Back home, and the overlay let go, whatever failed.
+    let back = hmd.set_head(home);
     hmd.hold_still(false)?;
+    back?;
     result.map(|()| got.into_iter().flatten().collect())
 }
 

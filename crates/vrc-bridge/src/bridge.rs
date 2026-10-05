@@ -19,6 +19,7 @@ use crate::sightings::Sightings;
 use crate::social::Social;
 use crate::vr::VrCore;
 use crate::Args;
+use crate::Lock;
 
 pub const SAMPLE_RATE: u32 = 48_000;
 /// 20 ms of 16-bit mono.
@@ -63,6 +64,8 @@ struct Player {
     /// When the bot's queued audio has played out.
     speech_until: Option<Instant>,
     release_pending: bool,
+    /// The odd byte of a frame, ahead of the next one.
+    odd_byte: Option<u8>,
 }
 
 impl Bridge {
@@ -100,7 +103,7 @@ impl Bridge {
     /// Sends a text event to the stream client, if any.
     pub fn send_event(&self, data: Value) {
         let follow = data["type"] == "follow";
-        if let Some((_, tx)) = self.client.lock().unwrap().as_ref() {
+        if let Some((_, tx)) = self.client.lk().as_ref() {
             let _ = tx.try_send(Message::Text(data.to_string().into()));
         }
         if follow {
@@ -112,7 +115,7 @@ impl Bridge {
     /// list) and by their whitelist rank (1 first, 0 not on it), and whom the
     /// avatar follows (null when nobody).
     pub fn room_state(&self) -> Value {
-        let mut snap = self.game.lock().unwrap().snapshot();
+        let mut snap = self.game.lk().snapshot();
         let ranks = self.social.whitelist_ids();
         let friends = self.social.friend_ids();
         if let Some(players) = snap["players"].as_array_mut() {
@@ -130,7 +133,7 @@ impl Bridge {
 
     /// Pushes the room state (and guards the instance).
     pub fn notify_state(&self) {
-        if let Some((_, tx)) = self.client.lock().unwrap().as_ref() {
+        if let Some((_, tx)) = self.client.lk().as_ref() {
             let _ = tx.try_send(Message::Text(json!({"type": "state", "state": self.room_state()}).to_string().into()));
         }
     }
@@ -145,7 +148,7 @@ impl Bridge {
     /// can take it anywhere.
     fn guard_instance(self: &Arc<Self>) {
         let (running, instance) = {
-            let g = self.game.lock().unwrap();
+            let g = self.game.lk();
             (g.running, g.instance.clone())
         };
         if !running || instance.is_empty() || crate::api::joinable(&instance) || self.leaving.swap(true, Ordering::SeqCst) {
@@ -163,7 +166,7 @@ impl Bridge {
     }
 
     pub fn require_game(&self) -> anyhow::Result<()> {
-        if !self.game.lock().unwrap().running {
+        if !self.game.lk().running {
             anyhow::bail!("VRChat is not running");
         }
         Ok(())
@@ -171,7 +174,7 @@ impl Bridge {
 
     /// An OSC handle that can also query OSCQuery (on the port the log names).
     pub fn osc_query(&self) -> anyhow::Result<Osc> {
-        let port = self.game.lock().unwrap().oscquery_port;
+        let port = self.game.lk().oscquery_port;
         if port == 0 {
             anyhow::bail!("the game is not running");
         }
@@ -185,14 +188,14 @@ impl Bridge {
         let id = self.client_ids.fetch_add(1, Ordering::SeqCst) + 1;
         let (tx, rx) = mpsc::channel(CLIENT_QUEUE);
         let _ = tx.try_send(Message::Text(json!({"type": "state", "state": self.room_state()}).to_string().into()));
-        if let Some((_, old)) = self.client.lock().unwrap().replace((id, tx)) {
+        if let Some((_, old)) = self.client.lk().replace((id, tx)) {
             let _ = old.try_send(Message::Close(None));
         }
         (id, rx)
     }
 
     pub fn detach_client(&self, id: u64) {
-        let mut c = self.client.lock().unwrap();
+        let mut c = self.client.lk();
         if c.as_ref().is_some_and(|(cid, _)| *cid == id) {
             *c = None;
         }
@@ -221,7 +224,7 @@ impl Bridge {
                     let mut out = child.stdout.take().unwrap();
                     let mut buf = vec![0u8; FRAME_BYTES];
                     while out.read_exact(&mut buf).await.is_ok() {
-                        if let Some((_, tx)) = self.client.lock().unwrap().as_ref() {
+                        if let Some((_, tx)) = self.client.lk().as_ref() {
                             let _ = tx.try_send(Message::Binary(buf.clone().into())); // a full queue drops it
                         }
                     }
@@ -237,6 +240,14 @@ impl Bridge {
     /// Plays the bot's voice into the microphone, holding push-to-talk.
     pub async fn play(self: &Arc<Self>, pcm: &[u8]) {
         let mut p = self.player.lock().await;
+        // Whole samples only: an odd byte waits for the next frame.
+        let mut joined = Vec::with_capacity(pcm.len() + 1);
+        joined.extend(p.odd_byte.take());
+        joined.extend_from_slice(pcm);
+        if joined.len() % 2 == 1 {
+            p.odd_byte = joined.pop();
+        }
+        let pcm = joined.as_slice();
         let dead = match &mut p.child {
             Some(c) => c.try_wait().map(|s| s.is_some()).unwrap_or(true),
             None => true,
@@ -281,18 +292,30 @@ impl Bridge {
 
     async fn release_ptt(self: Arc<Self>) {
         let tail = PTT_TAIL + Duration::from_millis(PLAYBACK_LATENCY_MS);
-        loop {
-            let until = self.player.lock().await.speech_until;
-            let wait = until.map(|u| (u + tail).saturating_duration_since(Instant::now())).unwrap_or_default();
+        // Checked again under the lock it lets go under: more speech may
+        // have come while it waited for it.
+        let mut p = loop {
+            let p = self.player.lock().await;
+            let wait = p.speech_until.map(|u| (u + tail).saturating_duration_since(Instant::now())).unwrap_or_default();
             if wait.is_zero() {
-                break;
+                break p;
             }
+            drop(p);
             tokio::time::sleep(wait).await;
-        }
-        let mut p = self.player.lock().await;
+        };
         let _ = self.osc.send_i32("/input/Voice", 0);
         p.ptt_held = false;
         p.release_pending = false;
+    }
+
+    /// Lets go of every input VRChat keeps the last value of (the stick,
+    /// jump, push-to-talk): at start, and on the way out.
+    pub fn let_go(&self) {
+        for axis in ["/input/Vertical", "/input/Horizontal"] {
+            let _ = self.osc.send_f32(axis, 0.0);
+        }
+        let _ = self.osc.send_i32("/input/Jump", 0);
+        let _ = self.osc.send_i32("/input/Voice", 0);
     }
 
     pub async fn release_voice(&self) {
@@ -328,7 +351,7 @@ impl Bridge {
         let mut tail = LogTail::new(game::expand(&self.args.log_dir));
         loop {
             let changed = {
-                let mut g = self.game.lock().unwrap();
+                let mut g = self.game.lk();
                 tail.poll(&mut g).unwrap_or_else(|e| {
                     tracing::warn!("log tail failed: {e}");
                     false
@@ -356,7 +379,7 @@ impl Bridge {
                 None => (0, 0),
             };
             let changed = {
-                let mut g = self.game.lock().unwrap();
+                let mut g = self.game.lk();
                 let mut changed = running != g.running;
                 g.running = running;
                 g.vram_mib = vram;

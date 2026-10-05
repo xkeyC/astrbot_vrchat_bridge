@@ -2,7 +2,8 @@
 //! from when it decides where the bot walks ("go to 3").
 //!
 //! - Reachable floor: a flood fill over floor cells from around the eyes,
-//!   keeping a body's width off obstacles and unknown cells.
+//!   keeping a body's width off obstacles (unknown cells are not walked on,
+//!   but not kept off: what is not seen of a floor is mostly more floor).
 //! - Frontiers: reachable cells next to the unknown, grouped; one point per
 //!   group (where looking further would show more).
 //! - Open: per sector around the bot, the farthest reachable cell (where
@@ -104,12 +105,25 @@ pub fn walkable(map: &HeightMap, clearance: f32) -> Vec<bool> {
     (0..n * n).map(|i| cells[i] == Cell::Floor && !blocked[i]).collect()
 }
 
+/// Cells a walk was stopped at ([`HeightMap::mark_blocked`]): not even
+/// the cells around the bot, which count as its floor, are walked through
+/// there. (Not grown: the bot stands close to them.)
+pub fn stopped(map: &HeightMap) -> Vec<bool> {
+    (0..map.size * map.size).map(|i| map.is_blocked(i)).collect()
+}
+
 fn inflate(map: &HeightMap, cells: &[Cell], clearance: f32) -> Vec<bool> {
+    let obstacles: Vec<bool> = cells.iter().map(|c| *c == Cell::Obstacle).collect();
+    grow(map, &obstacles, clearance)
+}
+
+/// `cells` grown by `clearance`.
+fn grow(map: &HeightMap, cells: &[bool], clearance: f32) -> Vec<bool> {
     let n = map.size;
     let r = (clearance / map.params.cell).ceil() as isize;
     let mut blocked = vec![false; n * n];
     for (i, c) in cells.iter().enumerate() {
-        if *c == Cell::Obstacle {
+        if *c {
             let (row, col) = ((i / n) as isize, (i % n) as isize);
             for dr in -r..=r {
                 for dc in -r..=r {
@@ -129,8 +143,15 @@ fn inflate(map: &HeightMap, cells: &[Cell], clearance: f32) -> Vec<bool> {
 /// cells, stepping up at most `step` and down at most `drop` between
 /// neighbours (the map's parameters).
 pub fn reachable(map: &HeightMap, eye: [f32; 3], clearance: f32) -> Vec<Option<u32>> {
+    paths(map, eye, clearance).0
+}
+
+/// [`reachable`], and each reached cell's previous cell on its shortest
+/// walk (`usize::MAX` for the start).
+pub fn paths(map: &HeightMap, eye: [f32; 3], clearance: f32) -> (Vec<Option<u32>>, Vec<usize>) {
     let n = map.size;
     let free = walkable(map, clearance);
+    let halt = stopped(map);
     let ground = map.grounds();
     let (step, drop) = (map.params.step, map.params.drop);
 
@@ -138,6 +159,7 @@ pub fn reachable(map: &HeightMap, eye: [f32; 3], clearance: f32) -> Vec<Option<u
     // are its floor whatever stereo made of them (its own body, a coat or a
     // tail reaching past `self_radius`, reads as raised ground).
     let mut dist: Vec<Option<u32>> = vec![None; n * n];
+    let mut prev = vec![usize::MAX; n * n];
     let mut height: Vec<f32> = ground.iter().map(|g| g.unwrap_or(f32::NAN)).collect();
     let mut queue = BinaryHeap::new();
     let start_r = map.params.self_radius + 2.0 * map.params.cell;
@@ -152,7 +174,9 @@ pub fn reachable(map: &HeightMap, eye: [f32; 3], clearance: f32) -> Vec<Option<u
                 }
                 let i = rr as usize * n + cc as usize;
                 let inside = (dr * dr + dc * dc) as f32 * map.params.cell * map.params.cell <= start_r * start_r;
-                if inside {
+                // Not past where a walk was stopped (a mirror, glass).
+                let to = map.centre(i);
+                if inside && !crosses(map, &halt, [eye[0], eye[2]], to) {
                     height[i] = map.floor;
                     dist[i] = Some(0);
                     queue.push(Reverse((0u32, i)));
@@ -181,11 +205,22 @@ pub fn reachable(map: &HeightMap, eye: [f32; 3], clearance: f32) -> Vec<Option<u
             let nd = d + if dr != 0 && dc != 0 { 14 } else { 10 };
             if dist[j].is_none_or(|best| nd < best) {
                 dist[j] = Some(nd);
+                prev[j] = i;
                 queue.push(Reverse((nd, j)));
             }
         }
     }
-    dist
+    (dist, prev)
+}
+
+/// Whether the straight line `from`-`to` (x, z) passes a cell of `cells`.
+pub fn crosses(map: &HeightMap, cells: &[bool], from: [f32; 2], to: [f32; 2]) -> bool {
+    let (dx, dz) = (to[0] - from[0], to[1] - from[1]);
+    let steps = (dx.hypot(dz) / (map.params.cell * 0.5)).ceil().max(1.0) as usize;
+    (0..=steps).any(|k| {
+        let t = k as f32 / steps as f32;
+        map.index(from[0] + dx * t, from[1] + dz * t).is_some_and(|i| cells[i])
+    })
 }
 
 /// Candidates around `eye`, numbered from the heading `yaw_deg`: `people`
@@ -258,9 +293,10 @@ pub fn candidates(
         ));
     }
 
-    // Frontiers: reachable cells touching the unknown, grouped 8-connected.
+    // Frontiers: reachable cells touching the unknown, grouped 8-connected
+    // (not the ring the bot stands in, next to its own unseen disc).
     let is_frontier: Vec<bool> = (0..n * n)
-        .map(|i| dist[i].is_some() && neighbours(i).any(|j| cells[j] == Cell::Unknown))
+        .map(|i| dist[i].is_some_and(|d| d > 0) && neighbours(i).any(|j| cells[j] == Cell::Unknown))
         .collect();
     let mut seen = vec![false; n * n];
     for s in 0..n * n {

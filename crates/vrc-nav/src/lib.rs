@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use vrc_players::{OcrClient, Sighting};
-use vrc_scene::candidates::{reachable, walkable};
+use vrc_scene::candidates::{paths, stopped, walkable};
 use vrc_scene::{candidates, Candidate, CandidateParams, HeightMap, MapParams, Person};
 use vrc_stereo::{fit_floor, Disparity, Floor, SgmParams, Stereo};
 use vrc_vr::osc::Osc;
@@ -151,16 +151,19 @@ pub fn survey(rig: &mut Rig, opts: &SurveyOptions, blocked: &[[f32; 2]]) -> Resu
     }
     timings.ocr = t.elapsed();
 
+    // World metres per stereo unit; a floor found nonsense (at or over
+    // the eyes) or an eye height not read leaves it 1.
     let metres = match rig.osc.as_ref().map(|o| o.eye_height()) {
-        Some(Ok(h)) if h > 0.0 => h as f32 / (eye[1] - floor.height),
+        Some(Ok(h)) if h > 0.0 && eye[1] - floor.height > 0.1 => h as f32 / (eye[1] - floor.height),
         _ => 1.0,
-    };
+    }
+    .clamp(0.1, 10.0);
 
     let t = Instant::now();
     let mut map = HeightMap::new(world_params().in_units(metres), [eye[0], eye[2]], floor.height);
     map.add(&points, eye);
     for &[x, z] in blocked {
-        map.mark_blocked(x, z, 0.25);
+        map.mark_blocked(x, z, 0.15 / metres);
     }
     let people: Vec<Person> = players
         .iter()
@@ -206,11 +209,14 @@ pub struct GotoOptions {
     pub leg: f32,
     pub max_legs: usize,
     pub walk: WalkParams,
+    /// [`walk::stops`] when the walk was asked for (a stop since ends it);
+    /// `None`: when `goto` starts.
+    pub since: Option<u64>,
 }
 
 impl Default for GotoOptions {
     fn default() -> Self {
-        GotoOptions { arrive: 0.6, leg: 1.6, max_legs: 12, walk: WalkParams::default() }
+        GotoOptions { arrive: 0.6, leg: 1.6, max_legs: 12, walk: WalkParams::default(), since: None }
     }
 }
 
@@ -243,6 +249,7 @@ pub fn goto(rig: &mut Rig, first: Survey, target: [f32; 2], opts: &GotoOptions) 
     let osc = rig.osc.as_ref().context("walking needs VRChat's OSC")?;
     let osc = Osc::with_ports_from(osc)?;
     let started = Instant::now();
+    let begun = opts.since.unwrap_or_else(walk::stops);
     let mut target = target;
     let mut blocked: Vec<[f32; 2]> = Vec::new();
     let mut legs = Vec::new();
@@ -265,7 +272,10 @@ pub fn goto(rig: &mut Rig, first: Survey, target: [f32; 2], opts: &GotoOptions) 
             });
         };
         let planned = (wp_dist * m).min(opts.leg);
-        let leg = walk::leg(&mut rig.hmd, &osc, yaw, planned, &opts.walk)?;
+        if walk::stopped_since(begun) {
+            return Ok(GotoReport { arrived: false, remaining: left, legs, took: started.elapsed(), reason: Some("stopped".into()) });
+        }
+        let leg = walk::leg_since(&mut rig.hmd, &osc, yaw, planned, &opts.walk, begun)?;
         // The world moved past the head: so did the target and what blocked us.
         let d = leg.walked / m;
         let (sy, cy) = yaw.to_radians().sin_cos();
@@ -275,10 +285,18 @@ pub fn goto(rig: &mut Rig, first: Survey, target: [f32; 2], opts: &GotoOptions) 
             *b = [b[0] - dx, b[1] - dz];
         }
         if leg.blocked {
-            // Something we could not see is just ahead.
-            blocked.push([eye[0] + sy * 0.4 / m, eye[2] - cy * 0.4 / m]);
+            // Something we could not see is just ahead: a wall across the
+            // way (a mirror, glass), not a post to walk round.
+            for k in -4..=4 {
+                let (ahead, across) = (0.4 / m, k as f32 * 0.15 / m);
+                blocked.push([eye[0] + sy * ahead + cy * across, eye[2] - cy * ahead + sy * across]);
+            }
         }
         legs.push(LegReport { yaw, planned, walked: leg.walked, blocked: leg.blocked, before: left });
+        if leg.stopped {
+            let remaining = (left - leg.walked).max(0.0);
+            return Ok(GotoReport { arrived: false, remaining, legs, took: started.elapsed(), reason: Some("stopped".into()) });
+        }
         s = survey(rig, &survey_opts, &blocked)?;
     }
     let left = (target[0] - s.eye[0]).hypot(target[1] - s.eye[2]) * s.metres;
@@ -297,8 +315,10 @@ pub fn goto(rig: &mut Rig, first: Survey, target: [f32; 2], opts: &GotoOptions) 
 /// reachable cell when the target itself is not reachable.
 pub fn next_waypoint(map: &HeightMap, eye: [f32; 3], target: [f32; 2], clearance: f32, max_leg: f32) -> Option<(f32, f32)> {
     let n = map.size;
-    let dist = reachable(map, eye, clearance);
+    let (dist, prev) = paths(map, eye, clearance);
     let free = walkable(map, clearance);
+    let halt = stopped(map);
+    let ground = map.grounds();
     let centre = |i: usize| {
         let half = n as f32 / 2.0;
         [
@@ -316,42 +336,37 @@ pub fn next_waypoint(map: &HeightMap, eye: [f32; 3], target: [f32; 2], clearance
                 ((pa[0] - target[0]).hypot(pa[1] - target[1])).total_cmp(&(pb[0] - target[0]).hypot(pb[1] - target[1]))
             })
         })?;
-    // The path back from the goal, down the distance field.
+    // The path back from the goal, the way the walk distances came.
     let mut path = vec![goal];
     let mut at = goal;
-    while dist[at] != Some(0) {
-        let (row, col) = ((at / n) as isize, (at % n) as isize);
-        let mut best = (dist[at].unwrap(), at);
-        for dr in -1..=1 {
-            for dc in -1..=1 {
-                let (rr, cc) = (row + dr, col + dc);
-                if rr < 0 || cc < 0 || rr as usize >= n || cc as usize >= n {
-                    continue;
-                }
-                let j = rr as usize * n + cc as usize;
-                if let Some(d) = dist[j] {
-                    if d < best.0 {
-                        best = (d, j);
-                    }
-                }
-            }
-        }
-        if best.1 == at {
-            break;
-        }
-        at = best.1;
+    while prev[at] != usize::MAX && path.len() <= n * n {
+        at = prev[at];
         path.push(at);
     }
     path.reverse(); // from the start ring to the goal
-    // The farthest path cell within reach and in a straight line of sight.
+    // The farthest path cell within reach and in a straight line of sight:
+    // over walkable cells, no step up or down on the way more than the
+    // walk takes, and not through where a walk was stopped.
+    let (step, drop) = (map.params.step, map.params.drop);
     let line_clear = |to: [f32; 2]| {
         let (dx, dz) = (to[0] - eye[0], to[1] - eye[2]);
         let steps = ((dx.hypot(dz)) / (map.params.cell * 0.5)).ceil() as usize;
+        let mut last = map.floor;
         (0..=steps).all(|k| {
             let t = k as f32 / steps.max(1) as f32;
             let (x, z) = (eye[0] + dx * t, eye[2] + dz * t);
+            let Some(i) = map.index(x, z) else { return false };
+            if halt[i] {
+                return false;
+            }
             let near = (x - eye[0]).hypot(z - eye[2]) < map.params.self_radius + 2.0 * map.params.cell;
-            near || map.index(x, z).is_some_and(|i| free[i])
+            if near {
+                return true;
+            }
+            let Some(h) = ground[i].filter(|_| free[i]) else { return false };
+            let rise = h - last;
+            last = h;
+            rise <= step && -rise <= drop
         })
     };
     let mut pick = None;
@@ -395,5 +410,42 @@ impl Rig {
             whitelist,
             log_dir: PathBuf::from(home).join(vrc_vr::osc::LOG_DIR),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Flat floor all round, 3 m each way (stereo units = metres).
+    fn floor() -> (HeightMap, [f32; 3]) {
+        let eye = [0.0, 1.6, 0.0];
+        let mut m = HeightMap::new(MapParams { radius: 4.0, ..world_params() }, [0.0, 0.0], 0.0);
+        let mut pts = Vec::new();
+        for i in 0..240 {
+            for j in 0..240 {
+                pts.push([i as f32 / 40.0 - 3.0 + 0.01, 0.0, j as f32 / 40.0 - 3.0 + 0.01]);
+            }
+        }
+        m.add(&pts, eye);
+        (m, eye)
+    }
+
+    #[test]
+    fn straight_ahead_on_open_floor() {
+        let (m, eye) = floor();
+        let (yaw, d) = next_waypoint(&m, eye, [0.0, -2.5], CLEARANCE_M, 1.6).unwrap();
+        assert!(yaw.abs() < 5.0 && d > 1.2, "{yaw} {d}");
+    }
+
+    #[test]
+    fn a_stopped_walk_turns_the_next_one_aside() {
+        let (mut m, eye) = floor();
+        // As goto marks a leg blocked 0.4 ahead (glass across the way).
+        for k in -4..=4 {
+            m.mark_blocked(k as f32 * 0.15, -0.4, 0.15);
+        }
+        let (yaw, _) = next_waypoint(&m, eye, [0.0, -2.5], CLEARANCE_M, 1.6).unwrap();
+        assert!(yaw.abs() > 20.0, "walks into the glass again: {yaw}");
     }
 }

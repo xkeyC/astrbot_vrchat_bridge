@@ -4,6 +4,7 @@
 //! `VelocityX/Z`, world m/s) until the leg is walked, or the avatar stops
 //! moving while pushed (something in the way: the collision sensor).
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -13,6 +14,25 @@ use crate::osc::Osc;
 use crate::pose::Pose;
 use crate::remote::RemoteHmd;
 
+/// Stops so far: a walk started before the latest one ends.
+static STOPS: AtomicU64 = AtomicU64::new(0);
+
+/// Stops every walk going on (its leg lets go of the stick at once; a walk
+/// of several legs takes no further one).
+pub fn stop_all() {
+    STOPS.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Where the stops are now: give it to [`stopped_since`].
+pub fn stops() -> u64 {
+    STOPS.load(Ordering::SeqCst)
+}
+
+/// Whether a stop came after `stops` was taken.
+pub fn stopped_since(stops: u64) -> bool {
+    STOPS.load(Ordering::SeqCst) != stops
+}
+
 /// How a leg went.
 #[derive(Clone, Debug)]
 pub struct Leg {
@@ -20,6 +40,8 @@ pub struct Leg {
     pub walked: f32,
     /// Stopped by something while pushing.
     pub blocked: bool,
+    /// Stopped by [`stop_all`].
+    pub stopped: bool,
     pub took: Duration,
     /// (seconds, VelocityX, VelocityZ) samples, for tuning.
     pub samples: Vec<(f32, f32, f32)>,
@@ -54,6 +76,13 @@ impl Default for WalkParams {
 
 /// Faces `yaw_deg` (head, level) and walks `metres` (world) forward.
 pub fn leg(hmd: &mut RemoteHmd, osc: &Osc, yaw_deg: f32, metres: f32, p: &WalkParams) -> Result<Leg> {
+    leg_since(hmd, osc, yaw_deg, metres, p, stops())
+}
+
+/// [`leg`], stopped by any stop after `begun` ([`stops`] when the walk was
+/// asked for: a stop while it waited counts).
+pub fn leg_since(hmd: &mut RemoteHmd, osc: &Osc, yaw_deg: f32, metres: f32, p: &WalkParams, begun: u64) -> Result<Leg> {
+    anyhow::ensure!(yaw_deg.is_finite() && metres.is_finite(), "a walk needs a finite way and length");
     let head = hmd.state.head.position;
     // The whole body faces the way: the hands too.
     hmd.state.hands_at_rest(head, yaw_deg);
@@ -65,10 +94,19 @@ pub fn leg(hmd: &mut RemoteHmd, osc: &Osc, yaw_deg: f32, metres: f32, p: &WalkPa
     let mut slow_since: Option<Instant> = None;
     let mut samples = Vec::new();
     let mut blocked = false;
+    let mut stopped = false;
     let result = (|| -> Result<()> {
+        if stopped_since(begun) {
+            stopped = true;
+            return Ok(());
+        }
         osc.send_f32("/input/Vertical", p.axis)?;
         loop {
             sleep(Duration::from_millis(40));
+            if stopped_since(begun) {
+                stopped = true;
+                return Ok(());
+            }
             let now = Instant::now();
             let vx = osc.query("/avatar/parameters/VelocityX").unwrap_or(0.0) as f32;
             let vz = osc.query("/avatar/parameters/VelocityZ").unwrap_or(0.0) as f32;
@@ -111,5 +149,5 @@ pub fn leg(hmd: &mut RemoteHmd, osc: &Osc, yaw_deg: f32, metres: f32, p: &WalkPa
             break;
         }
     }
-    Ok(Leg { walked, blocked, took: started.elapsed(), samples })
+    Ok(Leg { walked, blocked, stopped, took: started.elapsed(), samples })
 }

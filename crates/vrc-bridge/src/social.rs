@@ -17,6 +17,7 @@ use serde_json::{json, Value};
 use crate::api::{instance_kind, joinable, launch_url, redact, AuthRequired, VrcApi};
 use crate::bridge::Bridge;
 use crate::game;
+use crate::Lock;
 
 /// A friend's new location is acted on once it held this long.
 const FOLLOW_SETTLE: Duration = Duration::from_secs(8);
@@ -83,7 +84,7 @@ impl Social {
 
     pub fn set_config(&self, bridge: &Arc<Bridge>, update: &Value) -> anyhow::Result<()> {
         {
-            let mut s = self.inner.lock().unwrap();
+            let mut s = self.inner.lk();
             if let Some(w) = update.get("whitelist") {
                 let entries: Vec<String> = match w {
                     Value::String(text) => text.replace('，', ",").replace('\n', ",").split(',').map(String::from).collect(),
@@ -113,14 +114,14 @@ impl Social {
 
     /// The whitelist as user ids, in priority order (unknown names left out).
     pub fn whitelist_ids(&self) -> Vec<String> {
-        let s = self.inner.lock().unwrap();
+        let s = self.inner.lk();
         ids_of(&s)
     }
 
     /// The whitelist as display names, in priority order (ids resolved through
     /// the friend list).
     pub fn whitelist_names(&self) -> Vec<String> {
-        let s = self.inner.lock().unwrap();
+        let s = self.inner.lk();
         s.whitelist
             .iter()
             .map(|e| if e.starts_with("usr_") { s.friends.get(e).map(|f| f.name.clone()).unwrap_or_default() } else { e.clone() })
@@ -129,15 +130,15 @@ impl Social {
     }
 
     pub fn friend_ids(&self) -> Vec<String> {
-        self.inner.lock().unwrap().friends.keys().cloned().collect()
+        self.inner.lk().friends.keys().cloned().collect()
     }
 
     pub fn friend_location(&self, id: &str) -> Option<String> {
-        self.inner.lock().unwrap().friends.get(id).map(|f| f.location.clone())
+        self.inner.lk().friends.get(id).map(|f| f.location.clone())
     }
 
     pub fn status(&self) -> Value {
-        let s = self.inner.lock().unwrap();
+        let s = self.inner.lk();
         let by_name: BTreeMap<&str, &str> = s.friends.iter().map(|(id, f)| (f.name.as_str(), id.as_str())).collect();
         let entries: Vec<Value> = s
             .whitelist
@@ -178,7 +179,7 @@ impl Social {
                 }
                 let me = self.api.lock().await.me().await?;
                 {
-                    let mut s = self.inner.lock().unwrap();
+                    let mut s = self.inner.lk();
                     if !s.logged_in {
                         tracing::info!("logged in as {}", me["displayName"].as_str().unwrap_or("?"));
                     }
@@ -212,14 +213,14 @@ impl Social {
             if let Err(e) = result {
                 if let Some(auth) = e.downcast_ref::<AuthRequired>() {
                     let was = {
-                        let s = self.inner.lock().unwrap();
+                        let s = self.inner.lk();
                         s.logged_in || s.me.get("id").is_none()
                     };
                     if was {
                         tracing::warn!("VRChat login required: {}", auth.0);
                         bridge.send_event(json!({"type": "auth_required", "reason": auth.0}));
                     }
-                    self.inner.lock().unwrap().logged_in = false;
+                    self.inner.lk().logged_in = false;
                 } else {
                     tracing::warn!("VRChat API failed: {}", redact(&format!("{e:#}")));
                 }
@@ -231,7 +232,7 @@ impl Social {
     async fn refresh(&self, bridge: &Arc<Bridge>) -> anyhow::Result<()> {
         let friends = self.api.lock().await.friends().await?;
         {
-            let mut s = self.inner.lock().unwrap();
+            let mut s = self.inner.lk();
             s.friends = friends
                 .iter()
                 .filter_map(|f| {
@@ -268,7 +269,7 @@ impl Social {
         match kind {
             "friend-location" | "friend-online" | "friend-active" | "friend-update" => {
                 {
-                    let mut s = self.inner.lock().unwrap();
+                    let mut s = self.inner.lk();
                     let f = s.friends.entry(uid).or_insert(Friend { name: String::new(), location: String::new() });
                     if let Some(n) = content["user"]["displayName"].as_str() {
                         f.name = n.to_string();
@@ -284,7 +285,7 @@ impl Social {
                 self.evaluate(bridge);
             }
             "friend-offline" => {
-                if let Some(f) = self.inner.lock().unwrap().friends.get_mut(&uid) {
+                if let Some(f) = self.inner.lk().friends.get_mut(&uid) {
                     f.location = "offline".into();
                 }
             }
@@ -297,7 +298,7 @@ impl Social {
 
     fn on_invite(self: &Arc<Self>, bridge: &Arc<Bridge>, sender: &str, location: &str, sender_name: &str) {
         let verdict = {
-            let s = self.inner.lock().unwrap();
+            let s = self.inner.lk();
             let ids = ids_of(&s);
             if !ids.iter().any(|i| i == sender) {
                 "ignored: not whitelisted".to_string()
@@ -327,11 +328,11 @@ impl Social {
     /// (as VRCX's auto-accept of invite requests does).
     async fn on_request_invite(&self, bridge: &Arc<Bridge>, sender: &str, sender_name: &str) {
         let (here, running) = {
-            let g = bridge.game.lock().unwrap();
+            let g = bridge.game.lk();
             (g.instance.clone(), g.running)
         };
         let (listed, auto) = {
-            let s = self.inner.lock().unwrap();
+            let s = self.inner.lk();
             (ids_of(&s).iter().any(|i| i == sender), s.auto_accept)
         };
         let verdict = if !listed {
@@ -353,7 +354,7 @@ impl Social {
     /// Follows the follow target if it is elsewhere.
     fn evaluate(self: &Social, bridge: &Arc<Bridge>) {
         let plan = {
-            let s = self.inner.lock().unwrap();
+            let s = self.inner.lk();
             if !s.follow {
                 return;
             }
@@ -361,9 +362,9 @@ impl Social {
             let f = &s.friends[&target];
             (f.location.clone(), f.name.clone())
         };
-        let here = bridge.game.lock().unwrap().instance.clone();
+        let here = bridge.game.lk().instance.clone();
         if same_instance(&plan.0, &here) {
-            let mut s = self.inner.lock().unwrap();
+            let mut s = self.inner.lk();
             s.pending = None;
             s.generation += 1;
             return;
@@ -375,7 +376,7 @@ impl Social {
 
     fn schedule(self: &Arc<Self>, bridge: &Arc<Bridge>, location: String, reason: String, settle: Duration) {
         let generation = {
-            let mut s = self.inner.lock().unwrap();
+            let mut s = self.inner.lk();
             if s.pending.as_ref().is_some_and(|(l, _)| *l == location) {
                 return; // already planned
             }
@@ -389,22 +390,22 @@ impl Social {
 
     async fn join(self: Arc<Self>, bridge: Arc<Bridge>, location: String, reason: String, settle: Duration, generation: u64) {
         let cooldown = {
-            let s = self.inner.lock().unwrap();
+            let s = self.inner.lk();
             s.last_join.map(|t| (t + JOIN_COOLDOWN).saturating_duration_since(Instant::now())).unwrap_or_default()
         };
         tokio::time::sleep(settle.max(cooldown)).await;
         {
-            let mut s = self.inner.lock().unwrap();
+            let mut s = self.inner.lk();
             if s.generation != generation {
                 return; // replaced or cancelled
             }
             s.pending = None;
         }
-        let here = bridge.game.lock().unwrap().instance.clone();
+        let here = bridge.game.lk().instance.clone();
         if same_instance(&location, &here) || !joinable(&location) {
             return;
         }
-        self.inner.lock().unwrap().last_join = Some(Instant::now());
+        self.inner.lk().last_join = Some(Instant::now());
         tracing::info!("joining {location} ({reason})");
         bridge.send_event(json!({"type": "joining", "location": location, "reason": reason}));
         // The restart finishes once begun, whatever is planned meanwhile.

@@ -254,7 +254,7 @@ VR_RESET_DESCRIPTION = ("Resets your virtual headset, like SteamVR's reset: stop
 
 
 def vr_reset_words(data: dict) -> str:
-    recentered = {True: " and recentered", False: " (recentering failed)", None: ""}[data.get("recentered")]
+    recentered = {True: " (recentering asked of Monado)", False: " (recentering failed)", None: ""}[data.get("recentered")]
     return (f"Headset reset{recentered}: looking level ahead, arms at rest, "
             f"standing {data.get('head_height', 0):.2f} m high.")
 
@@ -317,13 +317,17 @@ def step_words(result: dict) -> str:
                          f"{abs(right)} m {'right' if right > 0 else 'left'}" if right else "") if p]
     if parts:
         done += f"You went {' and '.join(parts)} (of where you faced)."
-    if result.get("blocked"):
+    if result.get("stopped"):
+        done += " You were told to stop."
+    elif result.get("blocked"):
         done += " Something stopped you."
     return done or "Done."
 
 
 def vr_goto_body(a: dict) -> dict:
     if a.get("place") is not None:
+        if int(a["place"]) < 1:
+            raise RuntimeError("places are numbered from 1")
         return {"candidate": int(a["place"])}
     if a.get("bearing") is not None:
         return {"bearing": float(a["bearing"]), "distance": float(a.get("distance") or 2.0)}
@@ -415,6 +419,9 @@ class VRChatPlatformAdapter(Platform):
         # The room context last given to the voice session (room_context).
         self._room_context = ""
         self._moving = asyncio.Lock()  # MOVING_PATHS one at a time
+        # The look around each caller ("voice", "text") last saw: its place
+        # numbers are what it walks to.
+        self._seen: dict[str, int] = {}
         self._running = True
 
     def meta(self) -> PlatformMetadata:
@@ -429,38 +436,59 @@ class VRChatPlatformAdapter(Platform):
     def _headers(self) -> dict:
         return {"Authorization": f"Bearer {self.token}"}
 
-    async def vr_survey(self, players: bool = True) -> tuple[dict, bytes, bytes]:
+    async def vr_survey(self, players: bool = True, who: str = "voice") -> tuple[dict, bytes, bytes]:
         """Looks all around: the numbered places and players, the numbered
-        panorama (JPEG) and map (PNG)."""
-        data = await self.request("POST", "/v1/vr/survey", {"players": players}, timeout=60)
-        return data, await self.request("GET", "/v1/vr/survey/pano.jpg"), await self.request("GET", "/v1/vr/survey/map.png")
+        panorama (JPEG) and map (PNG), all of the same look around."""
+        async with self._moving:
+            data = await self._call("POST", "/v1/vr/survey", {"players": players}, timeout=60)
+            self._seen[who] = data.get("survey")
+            return data, *await self._survey_pictures()
 
-    async def vr_goto(self, body: dict) -> tuple[dict, bytes, bytes]:
-        """Walks to a place of the last look around, or by bearing and
-        distance; how it went, and the new look around's pictures."""
-        data = await self.request("POST", "/v1/vr/goto", body, timeout=150)
-        return data, await self.request("GET", "/v1/vr/survey/pano.jpg"), await self.request("GET", "/v1/vr/survey/map.png")
+    async def vr_goto(self, body: dict, who: str = "voice") -> tuple[dict, bytes, bytes]:
+        """Walks to a place of the last look around ``who`` saw, or by
+        bearing and distance; how it went, and the new look around's
+        pictures."""
+        async with self._moving:
+            if "candidate" in body and self._seen.get(who) is not None:
+                body = {**body, "survey": self._seen[who]}
+            data = await self._call("POST", "/v1/vr/goto", body, timeout=150)
+            self._seen[who] = data["after"].get("survey")
+            return data, *await self._survey_pictures()
 
-    def _in_turn(self, path: str) -> asyncio.Lock | contextlib.nullcontext:
-        """What a call to ``path`` waits for: the moves before it finished."""
-        return self._moving if path.startswith(MOVING_PATHS) else contextlib.nullcontext()
+    async def _survey_pictures(self) -> tuple[bytes, bytes]:
+        return (await self._call("GET", "/v1/vr/survey/pano.jpg"),
+                await self._call("GET", "/v1/vr/survey/map.png"))
+
+    def _in_turn(self, method: str, path: str) -> asyncio.Lock | contextlib.nullcontext:
+        """What a call to ``path`` waits for: the moves before it finished
+        (looking needs none, and a reset, like a stop, cuts in)."""
+        moves = method != "GET" and path.startswith(MOVING_PATHS) and path != "/v1/vr/reset"
+        return self._moving if moves else contextlib.nullcontext()
 
     async def request(self, method: str, path: str, body: dict | None = None, timeout: float = 60) -> Any:
         """Calls the bridge's HTTP API; returns its JSON (or bytes for images)."""
+        async with self._in_turn(method, path):
+            return await self._call(method, path, body, timeout)
+
+    async def _call(self, method: str, path: str, body: dict | None = None, timeout: float = 60) -> Any:
         if self._http is None:
             raise RuntimeError("VRChat bridge 未连接")
-        async with self._in_turn(path), self._http.request(
+        async with self._http.request(
             method,
             self.base_url + path,
             json=body,
             headers=self._headers(),
             timeout=aiohttp.ClientTimeout(total=timeout),
         ) as resp:
-            if resp.content_type.startswith("image/"):
+            if resp.status < 300 and resp.content_type.startswith("image/"):
                 return await resp.read()
-            data = await resp.json(content_type=None)
+            try:
+                data = await resp.json(content_type=None)
+            except ValueError:
+                data = None
             if resp.status >= 300:
-                raise RuntimeError(data.get("error") or f"HTTP {resp.status}")
+                error = data.get("error") if isinstance(data, dict) else None
+                raise RuntimeError(error or f"HTTP {resp.status}")
             return data
 
     async def run(self) -> None:
@@ -519,13 +547,14 @@ class VRChatPlatformAdapter(Platform):
         kind = data.get("type")
         if kind == "state":
             old = {p["id"] for p in self.state.get("players", [])}
+            had_world = bool(self.state.get("running") and self.state.get("world"))
             self.state = data.get("state") or {}
             new = {p["id"]: p["name"] for p in self.state.get("players", [])}
             joined = [name for pid, name in new.items() if pid not in old]
             if joined:
                 logger.info("VRChat: %s joined %s", ", ".join(joined), self.state.get("world"))
             self._refresh_context()
-            if set(new) != old:
+            if set(new) != old or bool(self.state.get("running") and self.state.get("world")) != had_world:
                 self._people_changed()
         elif kind in ("alert", "auth_required", "join_failed"):
             logger.warning("VRChat bridge: %s", data)
@@ -537,8 +566,10 @@ class VRChatPlatformAdapter(Platform):
         that one other player says, else only what calls the bot)."""
         session = self.session
         if session is not None and hasattr(session, "set_people"):
+            # Not in a room yet (or between rooms): unknown, wake words.
+            known = self.state.get("running") and self.state.get("world")
             task = asyncio.get_running_loop().create_task(
-                session.set_people(len(self.players()))
+                session.set_people(len(self.players()) if known else None)
             )
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
@@ -575,7 +606,7 @@ class VRChatPlatformAdapter(Platform):
                      distance: float | None = None) -> dict:
         """Follows a player in the room by their name tag (by default the
         highest-priority whitelisted one here), standing ``distance`` metres
-        away (default about 2.7), or stops following."""
+        away (default 1.5), or stops following."""
         if stop:
             return await self.request("POST", "/v1/follow", {"stop": True})
         body: dict = {"name": name.strip()}

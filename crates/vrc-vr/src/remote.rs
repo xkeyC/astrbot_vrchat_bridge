@@ -18,7 +18,7 @@
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -232,7 +232,13 @@ impl Link {
             (Some(o), true) => [s.left, s.right] = o.rest,
             (None, _) => {}
         }
-        self.stream.write_all(&s.encode()).context("sending to the remote driver")
+        let sent = self.stream.write_all(&s.encode());
+        if sent.is_err() {
+            // A packet maybe half sent: nothing after it would make sense.
+            self.closed = true;
+            let _ = self.stream.shutdown(Shutdown::Both);
+        }
+        sent.context("sending to the remote driver")
     }
 }
 
@@ -252,13 +258,13 @@ impl HmdLink {
     /// The owner's state; `None` once the connection is gone (the owner
     /// dropped it).
     pub fn owner(&self) -> Option<Owner> {
-        let l = self.0.lock().unwrap();
+        let l = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         (!l.closed).then_some(Owner { state: l.base, still: l.still })
     }
 
     /// Sets the overlay (`None`: the owner's state alone) and sends.
     pub fn set_overlay(&self, overlay: Option<Overlay>) -> Result<()> {
-        let mut l = self.0.lock().unwrap();
+        let mut l = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         if l.closed {
             bail!("the headset connection is closed");
         }
@@ -272,6 +278,9 @@ impl RemoteHmd {
         let mut stream = TcpStream::connect(addr).context("connecting to Monado's remote driver")?;
         stream.set_nodelay(true)?;
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        // Monado stuck (alive, not reading): fail, not block every holder
+        // of the link for good.
+        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
         let mut buf = [0u8; PACKET_SIZE];
         stream.read_exact(&mut buf).context("reading the reset state")?;
         let reset = State::decode(&buf)?;
@@ -284,7 +293,10 @@ impl RemoteHmd {
 
     /// Sends [`RemoteHmd::state`] (with an animator's overlay, if any).
     pub fn send(&mut self) -> Result<()> {
-        let mut l = self.link.lock().unwrap();
+        let mut l = self.link.lock().unwrap_or_else(PoisonError::into_inner);
+        if l.closed {
+            bail!("the headset connection is closed");
+        }
         l.base = self.state;
         l.send()
     }
@@ -297,7 +309,7 @@ impl RemoteHmd {
     /// Holds still (`true`): only [`RemoteHmd::state`] is sent, no overlay,
     /// until released.
     pub fn hold_still(&mut self, still: bool) -> Result<()> {
-        let mut l = self.link.lock().unwrap();
+        let mut l = self.link.lock().unwrap_or_else(PoisonError::into_inner);
         if l.still != still {
             l.still = still;
             l.base = self.state;
@@ -315,7 +327,7 @@ impl RemoteHmd {
 
 impl Drop for RemoteHmd {
     fn drop(&mut self) {
-        let mut l = self.link.lock().unwrap();
+        let mut l = self.link.lock().unwrap_or_else(PoisonError::into_inner);
         l.closed = true;
         let _ = l.stream.shutdown(Shutdown::Both);
     }

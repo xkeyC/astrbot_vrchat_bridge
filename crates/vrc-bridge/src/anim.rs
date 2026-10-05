@@ -19,6 +19,7 @@ use vrc_vr::osc::Osc;
 use vrc_vr::remote::HmdLink;
 
 use crate::bridge::{Bridge, SAMPLE_RATE};
+use crate::Lock;
 
 const TICK: Duration = Duration::from_millis(22);
 /// The speed is read every few ticks (an HTTP request each).
@@ -39,18 +40,19 @@ impl Anim {
     pub fn new(path: PathBuf) -> Anim {
         let params = std::fs::read(&path)
             .ok()
-            .and_then(|b| serde_json::from_slice(&b).map_err(|e| tracing::warn!("{}: {e}", path.display())).ok())
+            .and_then(|b| serde_json::from_slice::<AnimParams>(&b).map_err(|e| tracing::warn!("{}: {e}", path.display())).ok())
+            .and_then(|p| p.check().map(|()| p).map_err(|e| tracing::warn!("{}: {e}", path.display())).ok())
             .unwrap_or_default();
         Anim { params: Mutex::new(params), path, voice: Mutex::new(VecDeque::new()), live: Mutex::new(Value::Null) }
     }
 
     pub fn params(&self) -> AnimParams {
-        self.params.lock().unwrap().clone()
+        self.params.lk().clone()
     }
 
     /// Merges `patch` into the parameters (and keeps them).
     pub fn tune(&self, patch: &Value) -> anyhow::Result<AnimParams> {
-        let mut p = self.params.lock().unwrap();
+        let mut p = self.params.lk();
         let mut v = serde_json::to_value(&*p)?;
         let (Some(dst), Some(src)) = (v.as_object_mut(), patch.as_object()) else {
             anyhow::bail!("expected a JSON object of parameters");
@@ -64,7 +66,9 @@ impl Anim {
                 }
                 dst.insert(k.clone(), val.clone());
             }
-            *p = serde_json::from_value(v)?;
+            let tuned: AnimParams = serde_json::from_value(v)?;
+            tuned.check().map_err(anyhow::Error::msg)?;
+            *p = tuned;
         }
         std::fs::write(&self.path, serde_json::to_vec_pretty(&*p)?)?;
         Ok(p.clone())
@@ -73,7 +77,7 @@ impl Anim {
     /// The bot's voice `pcm` (s16le mono), playing from `at`.
     pub fn heard_bot(&self, pcm: &[u8], at: Instant) {
         let per_window = (SAMPLE_RATE as f64 * WINDOW.as_secs_f64()) as usize * 2;
-        let mut voice = self.voice.lock().unwrap();
+        let mut voice = self.voice.lk();
         for (i, chunk) in pcm.chunks(per_window).enumerate() {
             let n = chunk.len() / 2;
             if n == 0 {
@@ -92,7 +96,7 @@ impl Anim {
 
     /// The bot's voice now: `None` while silent.
     fn voice_now(&self, now: Instant) -> Option<f32> {
-        let mut voice = self.voice.lock().unwrap();
+        let mut voice = self.voice.lk();
         while voice.len() > 1 && voice[1].0 <= now {
             voice.pop_front();
         }
@@ -124,7 +128,7 @@ impl Anim {
             // The headset connection, once the rig is up (and again after a reset).
             let owner = link.as_ref().and_then(HmdLink::owner);
             let Some(owner) = owner else {
-                link = bridge.vr.try_lock().ok().and_then(|vr| vr.link());
+                link = bridge.vr.try_lk().and_then(|vr| vr.link());
                 off_sent = false;
                 continue;
             };
@@ -143,11 +147,11 @@ impl Anim {
             animator.params = self.params();
             let enabled = animator.params.enabled;
             // Glances only when nobody else is using the head.
-            let idle = bridge.follower.is_idle() && bridge.vr.try_lock().is_ok();
+            let idle = bridge.follower.is_idle() && bridge.vr.try_lk().is_some();
             let voice = self.voice_now(now);
             let overlay = animator.update(&AnimInput { dt, owner: owner.state, speed, voice, idle });
             if tick.is_multiple_of(SPEED_EVERY) {
-                *self.live.lock().unwrap() = serde_json::json!({"speed": speed, "talking": voice.is_some(), "idle": idle, "still": owner.still});
+                *self.live.lk() = serde_json::json!({"speed": speed, "talking": voice.is_some(), "idle": idle, "still": owner.still});
             }
             let link = link.as_ref().unwrap();
             let sent = if enabled {

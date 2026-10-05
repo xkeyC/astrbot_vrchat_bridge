@@ -133,7 +133,7 @@ class VRChatPlugin(Star):
         """
 
         async def look(adapter):
-            data, pano, top = await adapter.vr_survey(bool(players))
+            data, pano, top = await adapter.vr_survey(bool(players), who="text")
             return survey_words(data), pano, top
 
         return await self._vr(event, look)
@@ -150,13 +150,13 @@ class VRChatPlugin(Star):
         """
 
         async def walk(adapter):
-            if place >= 0:
+            if place >= 1:
                 body = {"candidate": int(place)}
             elif distance > 0 or bearing:
                 body = {"bearing": float(bearing), "distance": float(distance or 2.0)}
             else:
                 raise RuntimeError("给一个地点编号，或者方位和距离")
-            data, pano, top = await adapter.vr_goto(body)
+            data, pano, top = await adapter.vr_goto(body, who="text")
             return goto_words(data) + " " + survey_words(data["after"]), pano, top
 
         return await self._vr(event, walk)

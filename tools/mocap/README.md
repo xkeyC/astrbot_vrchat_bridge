@@ -26,3 +26,5 @@
 - 左右腕的位置、pitch、twist，以及手轴和掌心法向。
 
 相位 0 为左脚触地，0.5 为右脚触地。注意 `head_pitch` 含 CMU 头骨的静息偏置（约 −15°），只能用它的波动部分。
+
+The data used in this project was obtained from mocap.cs.cmu.edu. The database was created with funding from NSF EIA-0196217.

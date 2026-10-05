@@ -64,7 +64,7 @@ diff -ruN a/src/xrt/compositor/null/null_compositor.h b/src/xrt/compositor/null/
 diff -ruN a/src/xrt/compositor/null/null_tap.c b/src/xrt/compositor/null/null_tap.c
 --- a/src/xrt/compositor/null/null_tap.c
 +++ b/src/xrt/compositor/null/null_tap.c
-@@ -0,0 +1,377 @@
+@@ -0,0 +1,393 @@
 +// Copyright 2026, xkeyC.
 +// SPDX-License-Identifier: BSL-1.0
 +/*!
@@ -118,6 +118,7 @@ diff -ruN a/src/xrt/compositor/null/null_tap.c b/src/xrt/compositor/null/null_ta
 +#include <stdatomic.h>
 +#include <string.h>
 +#include <sys/mman.h>
++#include <sys/stat.h>
 +#include <unistd.h>
 +
 +DEBUG_GET_ONCE_OPTION(tap_path, "XRT_NULL_TAP", NULL)
@@ -201,7 +202,7 @@ diff -ruN a/src/xrt/compositor/null/null_tap.c b/src/xrt/compositor/null/null_ta
 +	if (path == NULL || path[0] == '\0') {
 +		return NULL;
 +	}
-+	int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
++	int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
 +	if (fd < 0) {
 +		U_LOG_E("null tap: cannot open '%s'", path);
 +		return NULL;
@@ -220,16 +221,28 @@ diff -ruN a/src/xrt/compositor/null/null_tap.c b/src/xrt/compositor/null/null_ta
 +static bool
 +ensure_map(struct null_tap *tap, size_t slot_size)
 +{
-+	size_t size = TAP_HEADER_SIZE + slot_size * tap->slots;
-+	if (tap->map_size == size) {
++	if (tap->map != NULL && tap->slot_size == slot_size) {
 +		return true;
 +	}
++	// Frames go on counting across a new layout: a reader never takes a
++	// new frame for one it has seen.
++	uint64_t written = 0;
 +	if (tap->map != NULL) {
++		written = atomic_load(&((struct tap_file *)tap->map)->written);
 +		munmap(tap->map, tap->map_size);
 +		tap->map = NULL;
 +		tap->map_size = 0;
 +	}
-+	if (ftruncate(tap->fd, (off_t)size) != 0) {
++	// The file only grows: a reader still mapping the old size must not
++	// touch pages past its end (SIGBUS).
++	size_t size = TAP_HEADER_SIZE + slot_size * tap->slots;
++	struct stat st;
++	if (fstat(tap->fd, &st) != 0) {
++		return false;
++	}
++	if ((size_t)st.st_size > size) {
++		size = (size_t)st.st_size;
++	} else if (ftruncate(tap->fd, (off_t)size) != 0) {
 +		return false;
 +	}
 +	void *map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, tap->fd, 0);
@@ -248,7 +261,7 @@ diff -ruN a/src/xrt/compositor/null/null_tap.c b/src/xrt/compositor/null/null_ta
 +	struct tap_file *file = (struct tap_file *)tap->map;
 +	file->slots = tap->slots;
 +	file->slot_size = slot_size;
-+	atomic_store(&file->written, 0);
++	atomic_store(&file->written, written);
 +	memcpy(file->magic, "MNDTAP02", 8);
 +	return true;
 +}
@@ -404,7 +417,10 @@ diff -ruN a/src/xrt/compositor/null/null_tap.c b/src/xrt/compositor/null/null_ta
 +	uint8_t *slot = tap->map + TAP_HEADER_SIZE + tap->slot_size * (n % tap->slots);
 +	struct tap_header *hdr = (struct tap_header *)slot;
 +	uint64_t seq = 2 * n; // frame n + 1 ends at 2 (n + 1)
-+	atomic_store(&hdr->seq, seq + 1);
++	// Odd before any of the slot changes (the release fence keeps the
++	// writes below after it), even after all of it.
++	atomic_store_explicit(&hdr->seq, seq + 1, memory_order_relaxed);
++	atomic_thread_fence(memory_order_release);
 +	hdr->frame_id = frame_id;
 +	hdr->display_time_ns = accum->data.display_time_ns;
 +	hdr->capture_ns = now_ns;
@@ -418,7 +434,7 @@ diff -ruN a/src/xrt/compositor/null/null_tap.c b/src/xrt/compositor/null/null_ta
 +	}
 +	hdr->layer_type = (uint32_t)layer->data.type;
 +	memcpy(slot + TAP_HEADER_SIZE, tap->buffer_ptr, (size_t)eye_bytes * 2);
-+	atomic_store(&hdr->seq, seq + 2);
++	atomic_store_explicit(&hdr->seq, seq + 2, memory_order_release);
 +	atomic_store(&file->written, n + 1);
 +	tap->last_ns = now_ns;
 +}

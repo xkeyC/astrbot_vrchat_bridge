@@ -1,16 +1,17 @@
 # User unit of the bot user: ~/.config/systemd/user/vrc-bridge.service
 # The Rust bridge (crates/vrc-bridge).
 # Machine-specific arguments (listen address, infra's OCR) go in
-# ~/.config/vrc-bridge/env as VRC_BRIDGE_ARGS=...
+# ~/.config/vrc-bridge/env as VRC_BRIDGE_ARGS=...; the binary is
+# VRC_BRIDGE_BIN (install_vr.sh sets it from the checkout it is run from).
 [Unit]
 Description=VRChat bridge for AstrBot (audio, inputs, state, VR capabilities)
 After=vrc-monado.service
 
 [Service]
-Environment=VR_ROOT=%h/vr
+Environment=VRC_BRIDGE_BIN=%h/vr/fullvr/target/release/vrc-bridge
 Environment=RUST_LOG=info
 EnvironmentFile=-%h/.config/vrc-bridge/env
-ExecStart=/bin/sh -c 'exec "$VR_ROOT/fullvr/target/release/vrc-bridge" $VRC_BRIDGE_ARGS'
+ExecStart=/bin/sh -c 'exec "$VRC_BRIDGE_BIN" $VRC_BRIDGE_ARGS'
 Restart=on-failure
 RestartSec=5
 

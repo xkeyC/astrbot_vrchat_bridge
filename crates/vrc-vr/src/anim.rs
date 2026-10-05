@@ -108,6 +108,43 @@ impl Default for AnimParams {
     }
 }
 
+/// The head heights (m) the avatar stands at at all.
+pub const MIN_HEAD_HEIGHT: f32 = 1.2;
+pub const MAX_HEAD_HEIGHT: f32 = 1.9;
+
+impl AnimParams {
+    /// Whether these can drive the headset: every number finite, and in
+    /// a range a body has (else a hand flung off, a NaN pose to Monado).
+    pub fn check(&self) -> Result<(), String> {
+        let within = |name: &str, v: f32, lo: f32, hi: f32| {
+            if v.is_finite() && (lo..=hi).contains(&v) {
+                Ok(())
+            } else {
+                Err(format!("{name} must be within {lo}..{hi}, not {v}"))
+            }
+        };
+        for v in self.rest {
+            within("rest", v, -1.0, 1.0)?;
+        }
+        for v in self.grip {
+            within("grip", v, -360.0, 360.0)?;
+        }
+        for v in self.curl {
+            within("curl", v, 0.0, 1.0)?;
+        }
+        within("breath_hz", self.breath_hz, 0.0, 2.0)?;
+        within("breath_m", self.breath_m, 0.0, 0.05)?;
+        within("sway", self.sway, 0.0, 5.0)?;
+        within("arm_sway_m", self.arm_sway_m, 0.0, 0.2)?;
+        within("swing", self.swing, 0.0, 3.0)?;
+        within("bob_m", self.bob_m, 0.0, 0.1)?;
+        within("lean_m", self.lean_m, 0.0, 0.2)?;
+        within("lean_deg", self.lean_deg, 0.0, 30.0)?;
+        within("nod_deg", self.nod_deg, 0.0, 20.0)?;
+        within("head_height", self.head_height, MIN_HEAD_HEIGHT, MAX_HEAD_HEIGHT)
+    }
+}
+
 /// The hand on `side` (-1 left, +1 right) at rest under `head` for a body
 /// facing `body_yaw` (degrees), moved by `offset` (body frame, tracking
 /// metres) and turned by `turn` (body frame, after the rest turn).
@@ -178,6 +215,9 @@ pub struct Animator {
     beats: Vec<(f32, bool)>,
 }
 
+/// The clock goes back by this much when it gets there (seconds).
+const EPOCH: f32 = 1000.0;
+
 /// Indices into [`Animator::wobble`].
 const W_HEAD: usize = 0; // x, z, yaw, pitch, roll: 0..5
 const W_HAND: usize = 5; // left x, y, z, right x, y, z: 5..11
@@ -217,6 +257,26 @@ impl Animator {
         a
     }
 
+    /// Moves the clock back by `by` seconds, every time kept with it, so
+    /// that it stays small: an f32 clock of days steps coarsely, then
+    /// stops (and the motion with it). The sines go on where they were.
+    fn rebase(&mut self, by: f32) {
+        self.t -= by;
+        self.shift_next -= by;
+        self.glance_next -= by;
+        self.glance_back = self.glance_back.map(|b| b - by);
+        self.last_voice -= by;
+        for b in &mut self.beats {
+            b.0 -= by;
+        }
+        for e in [&mut self.shift, &mut self.glance_yaw, &mut self.glance_pitch] {
+            e.start -= by;
+        }
+        for w in &mut self.wobble {
+            w.advance(by);
+        }
+    }
+
     fn uniform(&mut self, lo: f32, hi: f32) -> f32 {
         lo + (hi - lo) * next(&mut self.rng)
     }
@@ -227,6 +287,9 @@ impl Animator {
         let p = self.params.clone();
         let dt = input.dt.clamp(0.0, 0.2);
         self.t += dt;
+        if self.t > EPOCH {
+            self.rebase(EPOCH);
+        }
         let t = self.t;
         let k = EYE_HEIGHT / 1.6;
         let head = input.owner.head.position;
@@ -433,6 +496,14 @@ impl Wobble {
     fn at(&self, t: f32) -> f32 {
         self.0.iter().map(|&(f, ph, a)| a * (2.0 * PI * f * t + ph).sin()).sum()
     }
+
+    /// The same curve on a clock `by` seconds behind.
+    fn advance(&mut self, by: f32) {
+        for (f, ph, _) in &mut self.0 {
+            let turn = (*f as f64 * by as f64).fract() as f32;
+            *ph = (*ph + 2.0 * PI * turn).rem_euclid(2.0 * PI);
+        }
+    }
 }
 
 /// A value moving to a target along a minimum-jerk curve.
@@ -489,6 +560,28 @@ mod tests {
             assert!(o.head.yaw.abs() < 40.0 && o.head.pitch.abs() < 15.0);
         }
         assert!(most > 0.01 && most < 0.09, "{most}");
+    }
+
+    #[test]
+    fn the_defaults_pass_their_check_and_nonsense_does_not() {
+        assert_eq!(AnimParams::default().check(), Ok(()));
+        assert!(AnimParams { breath_hz: f32::INFINITY, ..Default::default() }.check().is_err());
+        assert!(AnimParams { curl: [0.4, f32::NAN, 0.3, 0.2, 0.2], ..Default::default() }.check().is_err());
+        assert!(AnimParams { head_height: -0.32, ..Default::default() }.check().is_err());
+    }
+
+    #[test]
+    fn the_clock_going_back_is_seamless() {
+        let mut a = Animator::new(AnimParams::default(), 7);
+        a.t = EPOCH - 0.5;
+        let mut last = a.update(&input(0.0, None));
+        for _ in 0..45 {
+            let o = a.update(&input(0.0, None));
+            let d: f32 = (0..3).map(|i| (o.right.pose.position[i] - last.right.pose.position[i]).powi(2)).sum::<f32>().sqrt();
+            assert!(d < 0.005, "jumped {d} at {}", a.t);
+            last = o;
+        }
+        assert!(a.t < 1.0);
     }
 
     #[test]

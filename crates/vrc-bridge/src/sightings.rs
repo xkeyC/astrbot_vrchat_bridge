@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 use vrc_players::names::{match_score, MATCH_RATIO};
 
 use crate::bridge::Bridge;
+use crate::Lock;
 
 const WATCH_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -32,7 +33,7 @@ fn now() -> f64 {
 
 impl Sightings {
     pub fn saw(&self, name: &str, world: &str, jpeg: Vec<u8>) {
-        self.last.lock().unwrap().insert(name.to_string(), Sighting { at: now(), world: world.to_string(), jpeg });
+        self.last.lk().insert(name.to_string(), Sighting { at: now(), world: world.to_string(), jpeg });
     }
 
     pub fn listing(&self) -> Vec<Value> {
@@ -50,7 +51,7 @@ impl Sightings {
 
     /// The newest sighting of `name` (best match), or of anyone.
     pub fn latest(&self, name: &str) -> Option<(String, Sighting)> {
-        let last = self.last.lock().unwrap();
+        let last = self.last.lk();
         if name.is_empty() {
             return last.iter().max_by(|a, b| a.1.at.total_cmp(&b.1.at)).map(|(n, s)| (n.clone(), s.clone()));
         }
@@ -63,7 +64,7 @@ impl Sightings {
         loop {
             tokio::time::sleep(WATCH_INTERVAL).await;
             let (running, room, world) = {
-                let g = bridge.game.lock().unwrap();
+                let g = bridge.game.lk();
                 (g.running, g.others().into_iter().map(|(_, n)| n).collect::<Vec<_>>(), g.world_name.clone())
             };
             let whitelist = bridge.social.whitelist_names();
@@ -73,7 +74,7 @@ impl Sightings {
             }
             let (me, b) = (self.clone(), bridge.clone());
             let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                let Ok(mut vr) = b.vr.try_lock() else { return Ok(()) }; // busy moving: next round
+                let Some(mut vr) = b.vr.try_lk() else { return Ok(()) }; // busy moving: next round
                 let frame = vr.frame()?;
                 let rig = vr.rig(&whitelist)?;
                 let Some(ocr) = rig.ocr.as_ref() else { return Ok(()) };

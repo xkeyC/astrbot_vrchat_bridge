@@ -17,8 +17,7 @@ use vrc_vr::Pose;
 use crate::Args;
 
 pub const STEP_MAX_M: f32 = 5.0;
-pub const MIN_HEAD_HEIGHT: f32 = 1.2;
-pub const MAX_HEAD_HEIGHT: f32 = 1.9;
+pub use vrc_vr::anim::{MAX_HEAD_HEIGHT, MIN_HEAD_HEIGHT};
 
 pub struct VrCore {
     remote: String,
@@ -99,6 +98,7 @@ impl VrCore {
 
     /// Points the head (degrees; pitch clamped to +-80).
     pub fn aim(&mut self, yaw: f32, pitch: f32) -> Result<()> {
+        anyhow::ensure!(yaw.is_finite() && pitch.is_finite(), "angles must be finite numbers");
         let rig = self.rig(&[])?;
         let head = rig.hmd.state.head.position;
         let pitch = pitch.clamp(-80.0, 80.0);
@@ -129,7 +129,16 @@ impl VrCore {
         Ok(v)
     }
 
-    pub fn goto(&mut self, whitelist: &[String], input: &Value) -> Result<Value> {
+    /// Walks to a place of the last look around or a bearing; `since`: the
+    /// stops when it was asked for ([`walk::stops`]).
+    pub fn goto(&mut self, whitelist: &[String], input: &Value, since: u64) -> Result<Value> {
+        // A place number of a look around the caller did not see (another
+        // caller looked since) would lead elsewhere.
+        if input["candidate"].is_u64() {
+            if let Some(seen) = input["survey"].as_u64() {
+                anyhow::ensure!(seen == self.serial, "the numbered places no longer hold (you moved, or looked around again since): look around again");
+            }
+        }
         // A fresh survey to plan from (people move, and so may the bot).
         let s = vrc_nav::survey(self.rig(whitelist)?, &SurveyOptions { players: false, ..Default::default() }, &[])?;
         let target = if let Some(id) = input["candidate"].as_u64() {
@@ -139,11 +148,15 @@ impl VrCore {
         } else {
             let bearing = input["bearing"].as_f64().context("a candidate, or a bearing and a distance")? as f32;
             let distance = input["distance"].as_f64().unwrap_or(2.0) as f32;
+            anyhow::ensure!(bearing.is_finite() && distance.is_finite() && (0.0..=30.0).contains(&distance), "a bearing, and a distance of at most 30 m");
             let yaw = (s.yaw + bearing).to_radians();
             let d = distance / s.metres;
             [s.eye[0] + yaw.sin() * d, s.eye[2] - yaw.cos() * d]
         };
-        let report = vrc_nav::goto(self.rig(whitelist)?, s, target, &GotoOptions::default())?;
+        // Moving: the places' numbers stop holding (here and on failure). A
+        // stop since it was asked for ends it before the first leg.
+        self.forget_places();
+        let report = vrc_nav::goto(self.rig(whitelist)?, s, target, &GotoOptions { since: Some(since), ..Default::default() })?;
         let after = vrc_nav::survey(self.rig(whitelist)?, &SurveyOptions::default(), &[])?;
         self.serial += 1;
         self.yaw = after.yaw;
@@ -166,10 +179,20 @@ impl VrCore {
 
     // -- small moves ------------------------------------------------------------------
 
+    /// The numbered places of the last look around no longer hold (the bot
+    /// moved, or the headset was reset): a walk to a number needs a new
+    /// look around.
+    pub fn forget_places(&mut self) {
+        self.serial += 1;
+        self.survey = None;
+    }
+
     /// /v1/step: turns by `turn` degrees, then walks `meters` (world) a way
     /// (forward, back, left, right of where it then faces; the head turns
-    /// to the way walked), jumping as it starts if asked.
-    pub fn step(&mut self, osc_jump: impl Fn(), turn: f32, direction: &str, meters: f32, jump: bool) -> Result<Value> {
+    /// to the way walked), jumping as it starts if asked. `since`: the
+    /// stops when it was asked for ([`walk::stops`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn step(&mut self, osc_jump: impl Fn(), turn: f32, direction: &str, meters: f32, jump: bool, since: u64) -> Result<Value> {
         let offset = match direction {
             "forward" => 0.0,
             "back" => 180.0,
@@ -191,12 +214,14 @@ impl VrCore {
         let rig = self.rig(&[])?;
         let osc = rig.osc.as_ref().context("walking needs VRChat's OSC")?;
         let osc = Osc::with_ports_from(osc)?;
-        let leg = walk::leg(&mut rig.hmd, &osc, way, meters.min(STEP_MAX_M), &WalkParams::default())?;
+        let leg = walk::leg_since(&mut rig.hmd, &osc, way, meters.min(STEP_MAX_M), &WalkParams::default(), since);
+        self.forget_places();
+        let leg = leg?;
         self.yaw = (way + 540.0).rem_euclid(360.0) - 180.0;
         self.pitch = 0.0;
         let (s, c) = offset.to_radians().sin_cos();
         Ok(json!({
-            "ok": true, "turned": turn, "blocked": leg.blocked,
+            "ok": true, "turned": turn, "blocked": leg.blocked, "stopped": leg.stopped,
             "moved": {"ahead_m": r1(leg.walked * c), "right_m": r1(leg.walked * s)},
         }))
     }
