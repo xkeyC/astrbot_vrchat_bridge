@@ -27,6 +27,8 @@
 | `crates/vrc-vr` 的 `anim`、`remote` | 程序化动画（待机、走路摆臂、说话手势）；`HmdLink` 叠加动画、`hold_still` 扫描时保持静止（D23） |
 | `crates/vrc-bridge` 的 `anim` | 动画线程（45 Hz）、bot 语音响度、`/v1/anim` 调参接口；`/v1/vr/height`、`/v1/vr/reset` |
 | `astrbot_plugin/` | 新工具 `vrchat_height`、`vrchat_vr_reset`（语音和文字） |
+| `tools/mocap/` | 从 CMU 动作捕捉数据统计头和双腕运动的脚本，以及按相位平均的曲线（D25） |
+| `crates/vrc-bridge` 的 `follow` | 绕障、跳过矮障碍、卡住时脱困；跟随的双目匹配限 6 线程（D25） |
 | `docs/full-vr/` | 本文档集 |
 
 ## 其他项目

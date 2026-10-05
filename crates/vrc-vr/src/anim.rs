@@ -7,10 +7,14 @@
 //! - **idle**: breathing, a slow sway of head and hands (smooth noise), a
 //!   shift of weight every 8-20 s, a glance aside every 4-10 s when nothing
 //!   else drives the head;
-//! - **walking**: the arms swing opposite each other at half the step rate
-//!   (cadence ~ 1.65 sqrt(v) Hz walking), wider the faster, more forward
-//!   than back, rising and turning in as they come forward; running bends
-//!   the elbows and closes the fists; the head bobs with the steps;
+//! - **walking**: fitted to CMU motion capture (181 strides of walks and
+//!   runs, scaled to a 1.6 m eye height; D25): the arms swing opposite each
+//!   other once a stride, about a mean a little ahead, the hand tipping
+//!   forward and turning palm-back as it comes forward, rising with it;
+//!   running bends the elbows (hands up, fingers ahead) and closes the
+//!   fists. The head bobs twice a stride (lowest just after each heel
+//!   strike), sways to the standing foot, turns and rolls a little with the
+//!   chest, and nods;
 //! - **talking**: driven by the loudness of the bot's own voice: the right
 //!   hand comes up in front, beats down on accents (a jump in loudness),
 //!   the head nods on some of them.
@@ -59,7 +63,8 @@ pub struct AnimParams {
     /// Glances aside when nothing else drives the head.
     pub glances: bool,
     /// Scale of the arm swing when walking (0: none), and the head's bob
-    /// (m, peak to peak, walking; twice that running).
+    /// (m, half its rise and fall each step, walking; running bobs 3.3
+    /// times that).
     pub swing: f32,
     pub bob_m: f32,
     /// Leaning into the walk: the head ahead of the hands (m) and tipped
@@ -67,6 +72,9 @@ pub struct AnimParams {
     /// and hands, VRChat's IK reads the torso's tilt from them.
     pub lean_m: f32,
     pub lean_deg: f32,
+    /// The head's nod with each step (degrees either way; up just after
+    /// each heel strike). Motion capture has 0.5; more reads better.
+    pub nod_deg: f32,
     /// Gestures and nods while talking.
     pub talk: bool,
     /// The head's height above the tracking floor (m): where VRChat's
@@ -90,9 +98,10 @@ impl Default for AnimParams {
             arm_sway_m: 0.02,
             glances: true,
             swing: 1.0,
-            bob_m: 0.025,
-            lean_m: 0.04,
-            lean_deg: 4.0,
+            bob_m: 0.018,
+            lean_m: 0.03,
+            lean_deg: 3.0,
+            nod_deg: 1.5,
             talk: true,
             head_height: 1.56,
         }
@@ -249,14 +258,21 @@ impl Animator {
         let beat = self.beats.iter().map(|b| bump(t - b.0, 0.25)).fold(0.0f32, f32::max);
         let nod = self.beats.iter().filter(|b| b.1).map(|b| bump(t - b.0, 0.4)).fold(0.0f32, f32::max);
 
-        // -- walking: speed eased in and out, the arms' phase.
+        // -- walking: speed eased in and out; the stride's phase (0: the
+        // left heel strikes, 0.5: the right). Steps per second from motion
+        // capture: walking 0.83 + 0.75 v, running 1.49 + 0.355 v.
         let v = input.speed.abs();
         self.speed += (v - self.speed) * (dt / 0.3).min(1.0);
         let v = self.speed;
-        let cadence = if v < 2.0 { (1.65 * v.sqrt()).clamp(1.4, 2.2) } else { 2.5 + 0.1 * (v - 2.0) };
-        self.gait = (self.gait + cadence / 2.0 * dt).fract();
         let walking = smoothstep(0.15, 0.5, v);
-        let run = smoothstep(1.8, 2.6, v);
+        let run = smoothstep(2.0, 2.8, v);
+        let mix = |walk: f32, running: f32| walk + (running - walk) * run;
+        let cadence = mix(0.83 + 0.75 * v.min(2.4), 1.49 + 0.355 * v);
+        self.gait = (self.gait + cadence / 2.0 * dt).fract();
+        let g = self.gait;
+        // Once a stride, twice a stride: largest at phase `at`.
+        let once = |at: f32| (2.0 * PI * (g - at)).cos();
+        let twice = |at: f32| (4.0 * PI * (g - at)).cos();
         let amp = swing_amplitude(v) * p.swing * k;
 
         // -- weight shifts and glances.
@@ -293,18 +309,22 @@ impl Animator {
         let w = |a: &Wobble| a.at(t);
         let still = (1.0 - walking) * p.sway * if talking { 2.0 } else { 1.0 };
         let shift = self.shift.at(t) * p.sway * k;
-        let step = 2.0 * PI * self.gait;
-        let bob = p.bob_m * k * (1.0 + run) * walking;
         let (bs, bc) = body_yaw.to_radians().sin_cos();
         let (right, ahead) = ([bc, 0.0, bs], [bs, 0.0, -bc]);
-        let side_m = w(&self.wobble[W_HEAD]) * 0.012 * k * still + shift + 0.015 * k * walking * step.sin();
+        // Over the standing foot: furthest right at 0.81 (right stance).
+        let sway = mix(0.024, 0.017) * k * once(mix(0.81, 0.74));
+        let side_m = w(&self.wobble[W_HEAD]) * 0.012 * k * still + shift + walking * sway;
         let lean = smoothstep(0.3, 1.5, v) + run;
         let ahead_m = w(&self.wobble[W_HEAD + 1]) * 0.008 * k * still + p.lean_m * k * lean;
-        let up_m = breath * p.breath_m * k - bob * 0.5 * (1.0 + (2.0 * step).cos());
+        // Lowest just after each heel strike, highest mid-stance.
+        let bob = p.bob_m * mix(1.0, 3.3) * k * twice(mix(0.31, 0.41));
+        let up_m = breath * p.breath_m * k + walking * bob;
         let head_offset = HeadOffset {
-            yaw: w(&self.wobble[W_HEAD + 2]) * 2.5 * still + self.glance_yaw.at(t),
-            pitch: w(&self.wobble[W_HEAD + 3]) * 1.5 * still - 0.3 * breath + self.glance_pitch.at(t) - 6.0 * nod - p.lean_deg * lean,
-            roll: w(&self.wobble[W_HEAD + 4]) * 1.0 * still + shift / (0.04 * k) * 1.5,
+            // Turned and rolled with the chest (left at the left heel strike).
+            yaw: w(&self.wobble[W_HEAD + 2]) * 2.5 * still + self.glance_yaw.at(t) - walking * mix(2.0, 6.4) * once(mix(0.05, 0.98)),
+            pitch: w(&self.wobble[W_HEAD + 3]) * 1.5 * still - 0.3 * breath + self.glance_pitch.at(t) - 6.0 * nod - p.lean_deg * lean
+                + walking * p.nod_deg * twice(0.16),
+            roll: w(&self.wobble[W_HEAD + 4]) * 1.0 * still + shift / (0.04 * k) * 1.5 - walking * mix(1.5, 0.3) * once(0.04),
             position: std::array::from_fn(|i| right[i] * side_m + ahead[i] * ahead_m + if i == 1 { up_m } else { 0.0 }),
         };
 
@@ -313,18 +333,26 @@ impl Animator {
         let mut rest = [Controller::default(); 2];
         for (n, side) in [(0usize, -1.0f32), (1, 1.0)] {
             let hw = |i: usize| w(&self.wobble[W_HAND + 3 * n + i]);
-            // Opposite arms; the right forward with the left foot.
-            let swing = amp * (step + if side > 0.0 { 0.0 } else { PI }).sin();
-            let fwd = if swing > 0.0 { swing * 1.1 } else { swing * 0.9 };
-            let fwd_pos = fwd.max(0.0);
+            // Opposite arms: the left furthest forward just after the right
+            // heel strikes (0.56), the right half a stride on.
+            let peak = mix(0.56, 0.38) - if side > 0.0 { 0.5 } else { 0.0 };
+            let swing = amp * once(peak); // ahead of the mean
+            let phase = swing / (amp + 1e-4); // -1..1
+            let mean = walking * mix(0.038, 0.045) * k;
+            // Rising as it comes forward; running, at both ends too (U).
+            let rise = (1.0 - run) * 0.20 * swing + run * (0.46 * swing + 9.1 * swing * swing / k) + run * 0.20 * k;
             // Body frame offsets (x right, y up, z back), tracking metres.
             let mut off = [
-                hw(0) * (0.007 + 0.4 * p.arm_sway_m) * k * still - side * 0.15 * fwd_pos,
-                hw(1) * 0.007 * k * still + breath * p.breath_m * k + 0.8 * fwd * fwd / k + 0.15 * fwd_pos + run * k * (0.12 + 0.05 * fwd_pos / (amp + 1e-3)),
-                hw(2) * (0.007 + p.arm_sway_m) * k * still - fwd - run * 0.05 * k,
+                hw(0) * (0.007 + 0.4 * p.arm_sway_m) * k * still - side * run * 0.06 * k,
+                hw(1) * 0.007 * k * still + breath * p.breath_m * k + walking * rise,
+                hw(2) * (0.007 + p.arm_sway_m) * k * still - walking * (mean + swing),
             ];
-            // The wrist follows the arm's swing, at rest too.
-            let mut tilt = ((fwd - hw(2) * p.arm_sway_m * k * still) / (0.6 * k)).atan() + run * 0.6;
+            // Fingers tip forward (pitch, degrees) and the palm turns back
+            // (twist) as the arm comes forward; running holds the hand out.
+            let pitch = walking * (mix(23.0, 83.0) + mix(20.0, 24.5) * phase);
+            let twist = walking * (mix(26.0, 11.0) + (1.0 - run) * 10.6 * phase);
+            // The wrist follows the arm's own sway at rest too.
+            let mut tilt = (-hw(2) * p.arm_sway_m * k * still / (0.6 * k)).atan() + pitch.to_radians();
             let mut curl = p.curl.map(|c| c + run * (0.75 - c) + w(&self.wobble[W_CURL]) * 0.05 * still);
             if side > 0.0 && self.talk > 0.0 {
                 // The talking hand: up in front, beating down.
@@ -337,7 +365,7 @@ impl Animator {
             }
             let turn = quat_mul(
                 quat_axis([1.0, 0.0, 0.0], tilt),
-                quat_axis([0.0, 1.0, 0.0], side * (w(&self.wobble[W_TURN + n]) * 3.0 * still - 8.0 * fwd_pos / (amp + 1e-3) * walking).to_radians()),
+                quat_axis([0.0, 1.0, 0.0], side * (w(&self.wobble[W_TURN + n]) * 3.0 * still + twist).to_radians()),
             );
             hands[n] = hand(&p, hand_pose(&p, head, body_yaw, side, off, turn), curl);
             rest[n] = hand(&p, hand_pose(&p, head, body_yaw, side, [0.0; 3], [0.0, 0.0, 0.0, 1.0]), p.curl);
@@ -350,9 +378,10 @@ impl Animator {
 }
 
 /// The front-to-back half swing of the wrist (m, 1.6 m eye height) at
-/// `v` m/s: gait studies put the whole swing at 17 cm at 1.2 m/s.
+/// `v` m/s, from motion capture: 15 cm at 1.2 m/s, 23 at 1.65; running
+/// (3.35) bends the elbows and swings 13.
 fn swing_amplitude(v: f32) -> f32 {
-    const TABLE: [(f32, f32); 7] = [(0.0, 0.0), (0.5, 0.04), (1.0, 0.09), (1.3, 0.12), (1.6, 0.15), (2.0, 0.18), (4.0, 0.18)];
+    const TABLE: [(f32, f32); 8] = [(0.0, 0.0), (0.7, 0.10), (1.0, 0.14), (1.3, 0.16), (1.7, 0.21), (2.2, 0.20), (3.0, 0.14), (4.0, 0.13)];
     if v < 0.3 {
         return 0.0;
     }
@@ -481,7 +510,8 @@ mod tests {
             }
         }
         let k = EYE_HEIGHT / 1.6;
-        assert!(fwd_r > 0.10 * k && fwd_r < 0.2 * k, "{fwd_r}");
+        // Motion capture: the wrist reaches about 19-27 cm ahead of the head walking.
+        assert!(fwd_r > 0.15 * k && fwd_r < 0.27 * k, "{fwd_r}");
         assert!(fwd_l > 0.10 * k, "{fwd_l}");
         assert!(opposite > 100, "{opposite}");
     }

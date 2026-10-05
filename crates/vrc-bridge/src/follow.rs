@@ -11,6 +11,13 @@
 //! distance, braking smoothly as it shrinks: a round of the eyes takes
 //! 0.3-0.8 s, and at full stick the avatar runs 4 m/s.
 //!
+//! In the way (each view's points, along the way to the target): a low
+//! obstacle (a step up, a bench: up to JUMP_MAX_M) is jumped with a run-up;
+//! anything else is walked round, along the path a planner finds on a
+//! height map of the view (`vrc_nav::next_waypoint`, the walks' planner).
+//! Pushing without moving (stuck) jumps once, then backs off and turns
+//! aside.
+//!
 //! Lost, the bot stands and the eyes look around one view at a time,
 //! starting where the target was last seen and widening both ways; the
 //! first view that finds them ends the search and the legs go that way.
@@ -23,6 +30,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use vrc_players::names::match_score;
+use vrc_scene::HeightMap;
 use vrc_stereo::{SgmParams, Stereo};
 use vrc_vr::osc::Osc;
 use vrc_vr::remote::FLOOR_Y;
@@ -74,6 +82,25 @@ const TURN_RATE: f32 = 200.0;
 /// Fixes predict the target's motion at most this far ahead.
 const PREDICT_S: f32 = 1.0;
 const ODOMETRY_KEPT: Duration = Duration::from_secs(4);
+/// Obstacles: counted from this high above the floor (lower ones are
+/// stepped over), jumped up to JUMP_MAX_M (VRChat's default jump clears
+/// about half a metre), with the jump this far before them and a run-up
+/// at least this fast.
+const OBSTACLE_FROM_M: f32 = 0.25;
+const JUMP_MAX_M: f32 = 0.45;
+const JUMP_AT_M: f32 = 0.5;
+const RUN_UP_SPEED: f32 = 1.6;
+const JUMP_EVERY: Duration = Duration::from_millis(1500);
+/// A detour is followed this long after the view that planned it.
+const DETOUR_FOR: Duration = Duration::from_millis(1200);
+/// Stuck: pushing (stick past STUCK_AXIS) yet slower than STUCK_SPEED for STUCK_FOR.
+const STUCK_AXIS: f32 = 0.25;
+const STUCK_SPEED: f32 = 0.15;
+const STUCK_FOR: Duration = Duration::from_millis(600);
+const ESCAPE_FOR: Duration = Duration::from_millis(500);
+/// Views judge only ways within this of where they look (degrees).
+const VIEW_HALF_DEG: f32 = 40.0;
+const STEREO_THREADS: usize = 6;
 
 #[derive(Default)]
 pub struct Follower {
@@ -93,6 +120,9 @@ struct State {
     hold: bool,
     moving: f32,
     running: bool,
+    /// What the way ahead calls for: "", "detour", "jump", "blocked", "stuck".
+    avoiding: &'static str,
+    jumps: u32,
 }
 
 /// Where the target stood, in the odometry's frame (world metres, axes of
@@ -114,8 +144,57 @@ struct Track {
     /// Where the head (and so the walk) points, degrees.
     facing: f32,
     target: Option<Fix>,
-    /// Something ahead: (when, how far ahead along `facing` then, odometry then).
-    obstacle: Option<(Instant, f32, [f32; 2])>,
+    /// Something in the way to the target, as the last view saw it.
+    obstacle: Option<Obstacle>,
+    /// A way round it: (until when, heading).
+    detour: Option<(Instant, f32)>,
+}
+
+/// Something in the way (world metres).
+#[derive(Clone, Copy, Debug)]
+struct Obstacle {
+    /// The heading it lies along, and the odometry then.
+    yaw: f32,
+    then: [f32; 2],
+    /// How far along the heading, and how high its top above the floor.
+    distance: f32,
+    top: f32,
+}
+
+impl Obstacle {
+    /// How far ahead it is now, walking along `facing` from `pos`; `None`
+    /// when walking another way.
+    fn ahead(&self, pos: [f32; 2], facing: f32) -> Option<f32> {
+        if angle_diff(facing, self.yaw).abs() > 25.0 {
+            return None;
+        }
+        let (s, c) = self.yaw.to_radians().sin_cos();
+        Some(self.distance - ((pos[0] - self.then[0]) * s - (pos[1] - self.then[1]) * c))
+    }
+
+    fn jumpable(&self) -> bool {
+        self.top <= JUMP_MAX_M
+    }
+}
+
+/// The nearest thing along `yaw` from `eye` in a corridor half a metre wide
+/// (world metres), and the top of it (the highest point within 0.4 m past
+/// its front): `None` when the way is clear. Points nearer than 0.35 m are
+/// the bot's own arm (a gesture).
+fn corridor(points: &[[f32; 3]], eye: [f32; 3], yaw: f32, metres: f32, floor: f32) -> Option<(f32, f32)> {
+    let (s, c) = yaw.to_radians().sin_cos();
+    let along = |p: &[f32; 3]| {
+        let (dx, dz) = (p[0] - eye[0], p[2] - eye[2]);
+        ((dx * s - dz * c) * metres, (dx * c + dz * s) * metres, (p[1] - floor) * metres)
+    };
+    let eye_m = (eye[1] - floor) * metres;
+    let inside = |a: &(f32, f32, f32)| a.0 > 0.35 && a.1.abs() < 0.25 && a.2 > OBSTACLE_FROM_M && a.2 < eye_m;
+    let near = points.iter().map(along).filter(inside).map(|a| a.0).fold(f32::INFINITY, f32::min);
+    if !near.is_finite() {
+        return None;
+    }
+    let top = points.iter().map(along).filter(inside).filter(|a| a.0 < near + 0.4).map(|a| a.2).fold(0.0, f32::max);
+    Some((near, top))
 }
 
 impl Track {
@@ -178,6 +257,8 @@ impl Follower {
             "distance": (if s.stand > 0.0 { s.stand } else { STAND_M } as f64 * 10.0).round() / 10.0,
             "hold": s.hold,
             "move": s.moving,
+            "avoiding": s.avoiding,
+            "jumps": s.jumps,
         })
     }
 
@@ -354,7 +435,7 @@ impl Follower {
         // The frame is at most a frame old: as good as now for the odometry.
         let at = Instant::now();
         let stereo = Stereo::from_frame(&frame, 2).ok_or_else(|| anyhow::anyhow!("not an 8-bit frame"))?;
-        let disp = stereo.disparity(&SgmParams::default());
+        let disp = stereo_pool().install(|| stereo.disparity(&SgmParams::default()));
         let eye = eye_of(&frame);
         let (yaw, _) = frame.views[0].pose.yaw_pitch();
         // The floor, in stereo units (the tracking space's).
@@ -373,35 +454,59 @@ impl Follower {
                 }
             }
         }
-        // Anything close straight ahead (a corridor half a metre wide, from
-        // knee height to the eyes)?
-        let mut nearest = f32::INFINITY;
-        let (fs, fc) = yaw.to_radians().sin_cos();
-        for (p, _) in stereo.points(&disp, 2) {
-            let (dx, dz) = (p[0] - eye[0], p[2] - eye[2]);
-            let ahead = dx * fs - dz * fc;
-            let side = dx * fc + dz * fs;
-            // Nearer than 0.35 m is the bot's own arm (a gesture).
-            if ahead * metres > 0.35 && side.abs() * metres < 0.25 && p[1] > floor + 0.4 / metres && p[1] < eye[1] {
-                nearest = nearest.min(ahead * metres);
-            }
-        }
+        let points: Vec<[f32; 3]> = stereo.points(&disp, 2).into_iter().map(|(p, _)| p).collect();
         let hit = seen.iter().filter(|s| match_score(&s.name, target) >= 0.6).max_by(|a, b| a.score.total_cmp(&b.score));
         let mut t = track.lock().unwrap();
         let then = t.pos_at(at);
-        t.obstacle = Some((at, nearest, then));
-        let mut s = self.inner.lock().unwrap();
-        s.obstacle = nearest;
-        let Some(hit) = hit else { return Ok(false) };
-        let rel = [(hit.feet[0] - eye[0]) * metres, (hit.feet[2] - eye[2]) * metres];
-        t.add_fix(at, [then[0] + rel[0], then[1] + rel[1]]);
-        // Their own body is not in the way.
-        if nearest > rel[0].hypot(rel[1]) - 0.5 {
-            t.obstacle = None;
+        let found = if let Some(hit) = hit {
+            let rel = [(hit.feet[0] - eye[0]) * metres, (hit.feet[2] - eye[2]) * metres];
+            t.add_fix(at, [then[0] + rel[0], then[1] + rel[1]]);
+            let mut s = self.inner.lock().unwrap();
+            s.last_seen = Some(at);
+            s.distance = rel[0].hypot(rel[1]);
+            true
+        } else {
+            false
+        };
+        // The way to them, as far as this view shows it.
+        let Some(goal) = t.target.filter(|f| f.at.elapsed() < LOST_AFTER).and_then(|_| t.target_now()) else {
+            return Ok(found);
+        };
+        let direct = bearing(then, goal);
+        let gap = (goal[0] - then[0]).hypot(goal[1] - then[1]);
+        if angle_diff(direct, yaw).abs() > VIEW_HALF_DEG {
+            return Ok(found); // not in view: the detour (or the turn) goes on
         }
-        s.last_seen = Some(at);
-        s.distance = rel[0].hypot(rel[1]);
-        Ok(true)
+        // Their own body (within half a metre of their feet) is not in the way.
+        let blocked = corridor(&points, eye, direct, metres, floor).filter(|&(d, _)| d < gap - 0.5 && d < 3.0);
+        let mut s = self.inner.lock().unwrap();
+        s.obstacle = blocked.map_or(f32::INFINITY, |b| b.0);
+        let Some((distance, top)) = blocked else {
+            t.obstacle = None;
+            t.detour = None;
+            s.avoiding = "";
+            return Ok(found);
+        };
+        let obstacle = Obstacle { yaw: direct, then, distance, top };
+        t.obstacle = Some(obstacle);
+        // A way round, on a height map of this view.
+        let to = [eye[0] + (goal[0] - then[0]) / metres, eye[2] + (goal[1] - then[1]) / metres];
+        let mut map = HeightMap::new(vrc_nav::world_params().in_units(metres), [eye[0], eye[2]], floor);
+        map.add(&points, eye);
+        let round = vrc_nav::next_waypoint(&map, eye, to, vrc_nav::CLEARANCE_M / metres, 2.0 / metres)
+            .map(|(yaw, _)| yaw)
+            .filter(|&w| angle_diff(w, direct).abs() > 5.0);
+        // Low and a long way round: over it.
+        let over = obstacle.jumpable() && round.is_none_or(|w| angle_diff(w, direct).abs() > 45.0);
+        t.detour = if over { None } else { round.map(|w| (at + DETOUR_FOR, w)) };
+        s.avoiding = if over {
+            "jump"
+        } else if t.detour.is_some() {
+            "detour"
+        } else {
+            "blocked"
+        };
+        Ok(found)
     }
 
     /// The legs: odometry, turning to the target, the thumbstick.
@@ -410,6 +515,11 @@ impl Follower {
         let mut last = Instant::now();
         let mut axis = 0.0f32;
         let mut aimed = f32::NAN;
+        let mut last_jump: Option<Instant> = None;
+        let mut slow_since: Option<Instant> = None;
+        let mut pushed_since: Option<Instant> = None;
+        let mut escape: Option<Instant> = None;
+        let mut aside = 1.0f32;
         while !stop.load(Ordering::SeqCst) {
             std::thread::sleep(TICK);
             if osc.is_none() {
@@ -443,26 +553,35 @@ impl Follower {
                 t.history.pop_front();
             }
             let fresh = t.target.is_some_and(|f| f.at.elapsed() < LOST_AFTER);
+            let mut jump = false;
             let want = match t.target_now() {
+                _ if escape.is_some_and(|e| now < e) => BACK_AXIS,
                 Some(goal) if fresh && !hold => {
                     let (gx, gz) = (goal[0] - pos[0], goal[1] - pos[1]);
                     let gap = gx.hypot(gz);
-                    if gap > 0.3 {
-                        // Turn towards them, smoothly.
-                        let to = bearing(pos, goal);
+                    // Round something, or straight to them.
+                    let detour = t.detour.filter(|d| now < d.0).map(|d| d.1);
+                    if gap > 0.3 || detour.is_some() {
+                        let to = detour.unwrap_or_else(|| bearing(pos, goal));
                         let step = angle_diff(to, t.facing).clamp(-TURN_RATE * dt, TURN_RATE * dt);
                         t.facing = wrap(t.facing + step);
                     }
                     let speed = vz.max(0.0);
                     let left = gap - stand - speed * LAG_S;
                     // Something in the way, nearer than they are?
-                    let blocked = t.obstacle.is_some_and(|(_, d, then)| {
-                        let walked = (pos[0] - then[0]) * ahead[0] + (pos[1] - then[1]) * ahead[1];
-                        d - walked < OBSTACLE_M && d - walked < gap - 0.3
-                    });
+                    let facing = t.facing;
+                    let ob = t.obstacle.and_then(|o| o.ahead(pos, facing).map(|d| (o, d))).filter(|&(_, d)| d < gap - 0.3);
+                    let over = ob.filter(|(o, d)| o.jumpable() && *d < 2.0 && last_jump.is_none_or(|j| now - j > JUMP_EVERY));
+                    let blocked = ob.is_some_and(|(_, d)| d < OBSTACLE_M) && over.is_none();
+                    if let Some((_, d)) = over {
+                        jump = d < JUMP_AT_M + speed * 0.1;
+                    }
                     let start = if axis > 0.0 { 0.05 } else { WALK_MARGIN };
                     if gap - stand > start && !blocked {
-                        let v = (2.0 * BRAKE * left.max(0.0)).sqrt().min(MAX_SPEED);
+                        let mut v = (2.0 * BRAKE * left.max(0.0)).sqrt().min(MAX_SPEED);
+                        if over.is_some() {
+                            v = v.max(RUN_UP_SPEED); // a run-up
+                        }
                         if v >= MIN_SPEED { AXIS_DEAD + v / SPEED_PER_AXIS } else { 0.0 }
                     } else if gap < stand - BACK_MARGIN || (axis < 0.0 && gap < stand - BACK_UNTIL) {
                         BACK_AXIS
@@ -472,10 +591,43 @@ impl Follower {
                 }
                 _ => 0.0,
             };
+            // Stuck: pushing, not moving. Jump once; then back off and turn aside.
+            if axis > STUCK_AXIS {
+                let pushed = *pushed_since.get_or_insert(now);
+                if now - pushed > Duration::from_millis(500) && vz < STUCK_SPEED {
+                    if now - *slow_since.get_or_insert(now) > STUCK_FOR {
+                        slow_since = None;
+                        if last_jump.is_none_or(|j| now - j > Duration::from_secs(3)) {
+                            jump = true;
+                        } else {
+                            escape = Some(now + ESCAPE_FOR);
+                            aside = -aside;
+                            let yaw = wrap(t.facing + aside * 60.0);
+                            t.detour = Some((now + ESCAPE_FOR + DETOUR_FOR, yaw));
+                            self.inner.lock().unwrap().avoiding = "stuck";
+                        }
+                    }
+                } else {
+                    slow_since = None;
+                }
+            } else {
+                pushed_since = None;
+                slow_since = None;
+            }
             let facing = t.facing;
             drop(t);
             if (want - axis).abs() > 0.02 || (want == 0.0 && axis != 0.0) {
                 self.set_axis(bridge, &mut axis, want.clamp(-1.0, 1.0));
+            }
+            if jump {
+                last_jump = Some(now);
+                let _ = bridge.osc.send_i32("/input/Jump", 1);
+                let b = bridge.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(100));
+                    let _ = b.osc.send_i32("/input/Jump", 0);
+                });
+                self.inner.lock().unwrap().jumps += 1;
             }
             if fresh && (aimed.is_nan() || angle_diff(facing, aimed).abs() >= 1.0) {
                 // The eyes may hold the headset a moment: next tick then.
@@ -496,6 +648,13 @@ impl Follower {
             self.inner.lock().unwrap().moving = (value * 100.0).round() / 100.0;
         }
     }
+}
+
+/// Following looks again and again: its stereo gets a few cores, not all
+/// (all of them made a follow cost about six cores' time, beside the game).
+fn stereo_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| rayon::ThreadPoolBuilder::new().num_threads(STEREO_THREADS).build().expect("a thread pool"))
 }
 
 /// The middle of the eyes of `frame` (tracking space, stereo units).
@@ -541,6 +700,30 @@ mod tests {
         // Jitter of a few centimetres is standing still.
         t.add_fix(t0 + Duration::from_millis(900), [0.02, -3.5]);
         assert!(t.target.unwrap().vel[0].abs() < 0.3);
+    }
+
+    #[test]
+    fn corridors_find_and_measure_obstacles() {
+        let eye = [0.0, 1.6, 0.0];
+        // A box 0.4 m high from 1.0 m ahead (-z), and a wall off to the side.
+        let mut points = Vec::new();
+        for i in 0..10 {
+            for j in 0..8 {
+                points.push([-0.2 + 0.04 * i as f32, 0.05 * j as f32, -1.0 - 0.03 * (i % 3) as f32]);
+                points.push([1.5, 0.2 * j as f32, -0.2 + 0.04 * i as f32]);
+            }
+        }
+        let (d, top) = corridor(&points, eye, 0.0, 1.0, 0.0).unwrap();
+        assert!((d - 1.0).abs() < 0.1 && (top - 0.35).abs() < 0.05, "{d} {top}");
+        // Turned 90 degrees right: the wall, 1.5 m off, is in the way; its top is the eyes' cut.
+        let (d, _) = corridor(&points, eye, 90.0, 1.0, 0.0).unwrap();
+        assert!((d - 1.5).abs() < 0.05);
+        assert!(corridor(&points, eye, -90.0, 1.0, 0.0).is_none());
+        // Walking up to the box along its heading brings it nearer; another way, it is not ahead.
+        let o = Obstacle { yaw: 0.0, then: [0.0, 0.0], distance: 1.0, top };
+        assert!((o.ahead([0.0, -0.4], 0.0).unwrap() - 0.6).abs() < 1e-4);
+        assert!(o.ahead([0.0, 0.0], 60.0).is_none());
+        assert!(o.jumpable());
     }
 
     #[test]

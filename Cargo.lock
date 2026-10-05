@@ -1796,6 +1796,7 @@ dependencies = [
  "futures-util",
  "jpeg-encoder",
  "png",
+ "rayon",
  "reqwest",
  "rpassword",
  "serde",
