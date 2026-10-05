@@ -98,14 +98,18 @@ const TURN_RATE: f32 = 200.0;
 const PREDICT_S: f32 = 1.0;
 const ODOMETRY_KEPT: Duration = Duration::from_secs(4);
 /// Obstacles: standing more than STEP_M over the ground before them (lower
-/// ones are walked up), with at least OBSTACLE_POINTS points (NEAR_POINTS
-/// nearer than 0.9 m; stray points of stereo come in ones and twos, a box
-/// 0.4 m high 3 m off gives some 400); reaching
+/// ones are walked up), with BIN_POINTS points in a 10 cm bin and
+/// OBSTACLE_POINTS in it and the next two, spanning MIN_SPAN_M of height
+/// (NEAR_POINTS nearer than 0.9 m): stray points of stereo come alone, a
+/// wall met at a slant spreads thin over several bins (25 points a bin
+/// missed such walls); reaching
 /// within EYE_MARGIN_M of the eyes, walked round, else jumped first, this
 /// far before them, after a run-up at least RUN_UP_SPEED fast.
 const STEP_M: f32 = 0.3;
-const OBSTACLE_POINTS: usize = 25;
-const NEAR_POINTS: usize = 40;
+const BIN_POINTS: usize = 3;
+const OBSTACLE_POINTS: usize = 12;
+const NEAR_POINTS: usize = 12;
+const MIN_SPAN_M: f32 = 0.05;
 const EYE_MARGIN_M: f32 = 0.25;
 const JUMP_AT_M: f32 = 0.5;
 /// A jump that left the same obstacle (within this) in the way failed:
@@ -294,7 +298,12 @@ fn corridor(points: &[[f32; 3]], eye: [f32; 3], yaw: f32, metres: f32, floor: f3
             continue;
         }
         let above: Vec<(f32, f32)> = bin.iter().copied().filter(|&(_, up)| up > ground + STEP_M).collect();
-        if above.len() >= OBSTACLE_POINTS {
+        // A wall met at a slant spreads over several bins, a few points
+        // each; stray points come alone: count this bin and the next two,
+        // and want some height to them.
+        let window: Vec<f32> = bins[i..(i + 3).min(BINS)].iter().flatten().filter(|a| a.1 > ground + STEP_M).map(|a| a.1).collect();
+        let span = window.iter().copied().fold(f32::NEG_INFINITY, f32::max) - window.iter().copied().fold(f32::INFINITY, f32::min);
+        if above.len() >= BIN_POINTS && window.len() >= OBSTACLE_POINTS && span >= MIN_SPAN_M {
             let distance = above.iter().map(|a| a.0).fold(f32::INFINITY, f32::min);
             // Its top: the highest point within half a metre past the front.
             let upto = (i + 6).min(BINS);
