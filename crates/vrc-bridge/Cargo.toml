@@ -1,17 +1,28 @@
 [package]
 name = "vrc-bridge"
 version = "0.1.0"
-description = "The bridge's HTTP API for the AstrBot plugin: the VR capabilities (survey, walk to) of the bot's virtual headset"
+description = "The bot's VRChat client over HTTP/WebSocket for the AstrBot plugin: audio, room state, inputs, the Web API side, following, and the VR capabilities of the virtual headset"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+axum.workspace = true
 clap.workspace = true
+futures-util.workspace = true
 jpeg-encoder.workspace = true
 png.workspace = true
+reqwest.workspace = true
+rpassword.workspace = true
+serde.workspace = true
 serde_json.workspace = true
-tiny_http = "0.12"
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 vrc-nav.workspace = true
+vrc-players.workspace = true
 vrc-scene.workspace = true
+vrc-stereo.workspace = true
+vrc-vr.workspace = true

@@ -1,6 +1,7 @@
-"""VRChat for AstrBot: the bot's own VRChat desktop client as a platform.
+"""VRChat for AstrBot: the bot's own VRChat client as a platform.
 
-The game runs on a Linux host next to ``bridge/vrc_bridge.py``; this plugin
+The game runs on a Linux host (VR mode on a virtual headset) next to the Rust
+bridge (``crates/vrc-bridge``); this plugin
 registers the ``vrchat`` platform adapter (``vrchat_adapter.py``: realtime
 voice in the room, quick actions for the voice model, text to the chatbox)
 and the tools the room's chat uses to move the avatar, follow friends and go
@@ -13,7 +14,6 @@ from __future__ import annotations
 
 import base64
 import json
-import time
 
 import mcp.types
 
@@ -83,56 +83,28 @@ class VRChatPlugin(Star):
 
         return await self._act(event, who)
 
-    @llm_tool("vrchat_view")
-    async def vrchat_view(self, event: AstrMessageEvent, show: str = "around", name: str = "",
-                          camera: str = "first"):
-        """看 VRChat 里 bot 的画面。around（默认）：原地转一圈，前、右 / 后、左四向全景（2x2 拼图），可走位置统一编号，可用 vrchat_goto 前往；ahead：只看正前方（快）；map：边走边建的俯视地图（记过的地标、可站立平台 P1..）；last_seen：最后一次看到某位白名单好友时的画面，附时间和世界。
+    @llm_tool("vrchat_last_seen")
+    async def vrchat_last_seen(self, event: AstrMessageEvent, name: str = ""):
+        """最后一次看到某位白名单好友时的画面，附多久以前、在哪个世界。
 
         Args:
-            show(string): around、ahead、map 或 last_seen。
-            name(string): last_seen 时的好友显示名；留空则取最近看到的那位。
-            camera(string): around / ahead 时：first（默认，第一人称）或 third（临时切到第三人称从身后看，画面中间下方那个人就是自己，用来确认站在哪、看更大范围；看完自动切回第一人称，移动总是第一人称）。
+            name(string): 好友显示名；留空则取最近看到的那位。
         """
-        # Only in the room's own chat: the text thread the room's voice
-        # thread hands its tasks to (the persona lists this tool for every
-        # chat).
         adapter = find_adapter(self.context)
         if adapter is not None and event.unified_msg_origin != adapter.room_umo:
             return _json({"error": "只能在 VRChat 语音线程配套的文字会话中使用"})
-        if show == "map":
-
-            async def mapped(adapter):
-                jpeg, words = await adapter.map_view()
-                return f"俯视地图（你在中间、朝上）。{words}", jpeg
-
-            return await self._picture(event, mapped)
-        if show == "ahead":
-
-            async def ahead(adapter):
-                jpeg = await adapter.view(camera)
-                return f"正前方（{time.strftime('%H:%M:%S')}）。{adapter.nav_text}", jpeg
-
-            return await self._picture(event, ahead)
-        if show != "last_seen":
-
-            async def around(adapter):
-                jpeg = await adapter.look_around(camera)
-                return f"四周（前、右 / 后、左）。{adapter.nav_text}", jpeg
-
-            return await self._picture(event, around)
 
         async def last_seen(adapter):
             found = await adapter.last_seen(name)
             if found is None:
                 return "还没有看到过白名单好友。"
             sighting, jpeg = found
-            text = (f"最后一次看到 {sighting['name']}：{sighting['age_s']:.0f} 秒前，"
-                    f"在 {sighting['world'] or '未知世界'}")
-            return text, jpeg
+            return (f"最后一次看到 {sighting['name']}：{sighting['age_s']:.0f} 秒前，"
+                    f"在 {sighting['world'] or '未知世界'}"), jpeg
 
         return await self._picture(event, last_seen)
 
-    # -- VR mode: looking around and walking (the VR bridge) -----------------
+    # -- looking around and walking ----------------------------------------
 
     async def _vr(self, event: AstrMessageEvent, action) -> mcp.types.CallToolResult | str:
         """Runs a VR action for the room's own chat: ``action(adapter)``
@@ -142,8 +114,6 @@ class VRChatPlugin(Star):
             return _json({"error": "VRChat 平台未运行"})
         if event.unified_msg_origin != adapter.room_umo:
             return _json({"error": "只能在 VRChat 语音线程配套的文字会话中使用"})
-        if not adapter.vr_url:
-            return _json({"error": "VR bridge 未配置（桌面模式请用 vrchat_view / vrchat_goto）"})
         try:
             text, pano, top = await action(adapter)
         except Exception as exc:  # noqa: BLE001 - reported to the model
@@ -156,7 +126,7 @@ class VRChatPlugin(Star):
 
     @llm_tool("vrchat_look_around")
     async def vrchat_look_around(self, event: AstrMessageEvent, players: bool = True):
-        """VR 模式：原地转头环视一圈（约 2 秒），返回两张带相同编号的图：全景图（中间是正前方，两边是身后）和俯视地图（你在中间、朝上；绿色地面、红色障碍、暗色未知），以及编号地点列表（玩家按名牌认出，白名单好友标出；可走的地面、已见区域的边缘、可跳上去的高台），各带距离和方位（相对正前方，正数在右）。用 vrchat_walk_to 走到某个编号。
+        """原地转头环视一圈（约 2 秒），返回两张带相同编号的图：全景图（中间是正前方，两边是身后）和俯视地图（你在中间、朝上；绿色地面、红色障碍、暗色未知），以及编号地点列表（玩家按名牌认出，白名单好友标出；可走的地面、已见区域的边缘、可跳上去的高台），各带距离和方位（相对正前方，正数在右）。用 vrchat_walk_to 走到某个编号。
 
         Args:
             players(boolean): 是否读名牌找玩家（默认 true；false 稍快）。
@@ -171,7 +141,7 @@ class VRChatPlugin(Star):
     @llm_tool("vrchat_walk_to")
     async def vrchat_walk_to(self, event: AstrMessageEvent, place: int = -1, bearing: float = 0.0,
                              distance: float = 0.0):
-        """VR 模式：走到上一次 vrchat_look_around 的某个编号地点（绕开障碍、分段走、每段后重新环视），或按方位走一段距离；走完返回新的全景图、地图和编号地点。
+        """走到上一次 vrchat_look_around 的某个编号地点（绕开障碍、分段走、每段后重新环视），或按方位走一段距离；走完返回新的全景图、地图和编号地点。
 
         Args:
             place(number): 上一次环视里的地点编号；不按编号走时留空（-1）。
@@ -270,38 +240,18 @@ class VRChatPlugin(Star):
         """VRChat 当前状态：游戏是否在运行、所在世界和房间实例、房间里的其他玩家（显示名）。"""
         return await self._act(event, lambda a: a.request("GET", "/v1/status"))
 
-    @llm_tool("vrchat_move")
-    async def vrchat_move(
-        self, event: AstrMessageEvent, direction: str, seconds: float = 1.0, run: bool = False
-    ) -> str:
-        """在 VRChat 里移动自己的身体（相对当前朝向），走完自动停下。
+    @llm_tool("vrchat_step")
+    async def vrchat_step(self, event: AstrMessageEvent, turn: float = 0.0, direction: str = "forward",
+                          meters: float = 0.0, jump: bool = False) -> str:
+        """小而精确的动作（不是赶路，赶路用 vrchat_walk_to）：先按角度转身（正为右），再朝某个方向走几米（按角色自身速度计量，被挡住就停），或者跳。
 
         Args:
-            direction(string): forward、back、left、right 之一。
-            seconds(number): 走多久，秒，最多 10；走几步约 1 秒。
-            run(boolean): 是否奔跑。
+            turn(number): 先转多少度，正为右、负为左（180 为掉头）。
+            direction(string): 往哪走（相对转身后的朝向）：forward、back、left、right。
+            meters(number): 走多少米，0 到 5（0 不走）。
+            jump(boolean): 起步时跳（不走时原地跳）。
         """
-        return await self._act(event, lambda a: a.move(direction, seconds, run))
-
-    @llm_tool("vrchat_turn")
-    async def vrchat_turn(self, event: AstrMessageEvent, direction: str, seconds: float = 0.5) -> str:
-        """在 VRChat 里原地左右转身。
-
-        Args:
-            direction(string): left 或 right。
-            seconds(number): 转多久，秒，最多 5。
-        """
-        return await self._act(event, lambda a: a.turn(direction, seconds))
-
-    @llm_tool("vrchat_look")
-    async def vrchat_look(self, event: AstrMessageEvent, direction: str, amount: int = 200) -> str:
-        """在 VRChat 里抬头或低头。
-
-        Args:
-            direction(string): up 或 down。
-            amount(number): 幅度，100 为一点，400 为很多，最多 600。
-        """
-        return await self._act(event, lambda a: a.look(direction, amount))
+        return await self._act(event, lambda a: a.step(turn, direction, meters, jump))
 
     @llm_tool("vrchat_jump")
     async def vrchat_jump(self, event: AstrMessageEvent) -> str:
@@ -321,7 +271,7 @@ class VRChatPlugin(Star):
 
     @llm_tool("vrchat_stop")
     async def vrchat_stop(self, event: AstrMessageEvent) -> str:
-        """立即停止 VRChat 里正在进行的移动和转身。"""
+        """立即停止 VRChat 里正在进行的移动、转身和跟随。"""
         return await self._act(event, lambda a: a.request("POST", "/v1/stop"))
 
     @llm_tool("vrchat_chatbox")
@@ -369,99 +319,6 @@ class VRChatPlugin(Star):
             change(string): closer（靠近一点）、farther（离远一点）、stay（原地别动）、resume（继续跟）之一。
         """
         return await self._act(event, lambda a: a.follow_adjust(change))
-
-    @llm_tool("vrchat_drive")
-    async def vrchat_drive(self, event: AstrMessageEvent, steps: list,
-                           view: str = "ahead") -> mcp.types.CallToolResult | str:
-        """接管并驾驶 VRChat 角色做小动作（跳、侧移、按角度转身或抬头，行走最多 1 秒，全速 1 秒约 4 米；赶路或走一段距离用 vrchat_goto，如后退 2 米：bearing 180 distance 2），期间暂停自动跟随；完成后告诉你实际走了多远，默认返回正前方画面。接管前在跟随的，停止操作 10 秒后自动恢复跟随（或用 vrchat_autopilot 立即恢复）。
-
-        Args:
-            steps(array): 步骤列表，依次执行（合计最多 10 秒、24 步）。每步是同时按住的输入，持续 ms 毫秒：move（forward/back/left/right/forward-left/forward-right/back-left/back-right）、speed（0.2-1，1 约每秒 4 米，0.5 约 2 米）、run、jump（该步开始时跳）、turn（度，正为右）、look（度，正为上）、ms（0-3000）。例：[{"move":"forward","ms":600},{"move":"forward","jump":true,"ms":400},{"turn":-90}]
-            view(string): 完成后返回的画面：ahead（默认，正前方）、around（四向全景）、none（不返回）。
-        """
-
-        async def drive(adapter):
-            result, jpeg = await adapter.drive(steps, view)
-            done = (f"完成：{result.get('steps')} 步，{result.get('ms', 0) / 1000:.1f} 秒。"
-                    if result.get("ok") else "中途被停止。")
-            moved = result.get("moved")
-            if moved:
-                done += (f"实际位移：向前 {moved['ahead_m']} 米、向右 {moved['right_m']} 米"
-                         "（相对出发时的朝向，负数为后、左）。")
-            return (done + f"当前画面：{adapter.nav_text}", jpeg) if jpeg else done
-
-        return await self._picture(event, drive)
-
-    @llm_tool("vrchat_goto")
-    async def vrchat_goto(self, event: AstrMessageEvent, mark: int = -1, detour: str = "auto",
-                          view: str = "ahead", climb: bool = False, bearing: float | None = None,
-                          distance: float | None = None, cell: str = "",
-                          landmark: str = "", platform: str = "") -> mcp.types.CallToolResult | str:
-        """走到上一张画面里标号的可走位置（自动转向、行走，被挡住会自动绕行）；0 表示掉头。完成后默认返回正前方画面和新的可走位置。
-
-        Args:
-            mark(number): 上一张画面里的位置编号；0 掉头。
-            detour(string): 绕行：auto（默认，自动选边）、left（从左边绕）、right（从右边绕）、none（不绕，挡住就停）。
-            view(string): 完成后返回的画面：ahead（默认，正前方）、around（四向全景）、none（不返回）。
-            climb(boolean): true 表示要站到那里的东西上面（桌子、坐墩、台阶）：径直走到跟前后向前跳上去，结果里的 jump.height_change_m 是落地后升高了多少米（约 0 即没上去）。
-            bearing(number): 不用编号时，按正前方画面顶部刻度尺的角度前往（度，正为右，180 为身后），适合对准某个物体（如要跳上去的东西）或走一段距离。
-            distance(number): 与 bearing 一起用：要走多少米（默认走到被挡住或没路为止）。
-            cell(string): 不用编号时，正前方画面网格里目标所在的格子（底部字母 A-H、左侧数字 1-5，如 D4）：径直走到那东西跟前（配合 climb 跳上去）。
-            landmark(string): 用 vrchat_note 记过的东西的名字：按地图规划路线前往（看不见也行）。
-            platform(string): 地图上的可站立平台编号（P1..），配合 climb 跳上去。
-        """
-
-        async def goto(adapter):
-            result, jpeg = await adapter.goto(int(mark), detour, view, bool(climb), bearing,
-                                              distance, cell or None, landmark or None,
-                                              platform or None)
-            text = f"结果：{json.dumps(result, ensure_ascii=False)}。"
-            return (text + adapter.nav_text, jpeg) if jpeg else text
-
-        return await self._picture(event, goto)
-
-    @llm_tool("vrchat_camera_y")
-    async def vrchat_camera_y(self, event: AstrMessageEvent, action: str = "view",
-                              horizon: float | None = None,
-                              degrees: float | None = None) -> mcp.types.CallToolResult | str:
-        """VRChat 视角的上下（Y 轴）。view：拍一张从抬头到低头的长图，带刻度（黄线 now 0 是当前朝向，上下每 10 度一条）；level：按长图里远处地平线所在的刻度转过去，并记为水平基准；set：按度数抬头（正）或低头（负）看东西。画面一直朝天或朝地时，先 view 再 level。
-
-        Args:
-            action(string): view、level 或 set。
-            horizon(number): level 必填：长图里远处地平线所在刻度的度数（如 -30）。
-            degrees(number): set 必填：抬头（正）或低头（负）多少度。
-        """
-        act = action if action in ("view", "level", "set") else "view"
-        value = horizon if act == "level" else degrees
-        if act != "view" and value is None:
-            need = "horizon" if act == "level" else "degrees"
-            return _json({"error": f"{act} 需要 {need}：对照 view 长图的刻度"})
-
-        async def shown(adapter):
-            jpeg = await adapter.camera_y(act, None if act == "view" else float(value))
-            if act == "view":
-                return ("从抬头到低头的长图，黄线 now 0 是当前朝向，每 10 度一条刻度。水平时远处地平线在 now 线上；"
-                        "要水平就用 level，horizon 填地平线所在刻度。"), jpeg
-            if act == "level":
-                return "已转到地平线并记为水平基准；地平线应在黄线上，不在就再 view。", jpeg
-            return "已调整，当前画面带刻度；下次看画面或走动会自动回到水平。", jpeg
-
-        return await self._picture(event, shown)
-
-    @llm_tool("vrchat_note")
-    async def vrchat_note(self, event: AstrMessageEvent, name: str, cell: str) -> str:
-        """把正前方画面里某个格子中的东西按名字记到地图上，之后可用 vrchat_goto landmark 找回（看不见也行）。
-
-        Args:
-            name(string): 简短名字，如 黄色坐墩。
-            cell(string): 它在正前方画面网格里的格子，如 D4。
-        """
-        return await self._act(event, lambda a: a.note(name, cell))
-
-    @llm_tool("vrchat_autopilot")
-    async def vrchat_autopilot(self, event: AstrMessageEvent) -> str:
-        """结束手动驾驶：如果之前在跟随某人，恢复自动跟随。"""
-        return await self._act(event, lambda a: a.autopilot())
 
     @llm_tool("vrchat_follow_rooms")
     async def vrchat_follow_rooms(self, event: AstrMessageEvent, enabled: bool) -> str:

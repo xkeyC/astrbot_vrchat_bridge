@@ -41,6 +41,13 @@ impl Osc {
         Osc::with_ports(&other.send_to, other.query_port)
     }
 
+    /// Sends a message with any arguments (`/chatbox/input` takes a string
+    /// and two booleans).
+    pub fn send(&self, address: &str, args: &[Arg]) -> Result<()> {
+        self.udp.send_to(&encode(address, args), &self.send_to)?;
+        Ok(())
+    }
+
     /// Sends a float (`/input/Vertical`, `/avatar/eyeheight`, ...).
     pub fn send_f32(&self, address: &str, value: f32) -> Result<()> {
         self.udp.send_to(&message(address, b",f", &value.to_be_bytes()), &self.send_to)?;
@@ -68,6 +75,50 @@ impl Osc {
     pub fn eye_height(&self) -> Result<f64> {
         self.query("/avatar/eyeheight")
     }
+}
+
+/// An OSC argument.
+#[derive(Clone, Debug)]
+pub enum Arg {
+    Int(i32),
+    Float(f32),
+    Bool(bool),
+    Str(String),
+}
+
+/// An OSC message.
+pub fn encode(address: &str, args: &[Arg]) -> Vec<u8> {
+    let pad = |b: &[u8]| {
+        let mut v = b.to_vec();
+        v.push(0);
+        while v.len() % 4 != 0 {
+            v.push(0);
+        }
+        v
+    };
+    let mut tags = String::from(",");
+    let mut payload = Vec::new();
+    for a in args {
+        match a {
+            Arg::Int(i) => {
+                tags.push('i');
+                payload.extend_from_slice(&i.to_be_bytes());
+            }
+            Arg::Float(f) => {
+                tags.push('f');
+                payload.extend_from_slice(&f.to_be_bytes());
+            }
+            Arg::Bool(b) => tags.push(if *b { 'T' } else { 'F' }),
+            Arg::Str(s) => {
+                tags.push('s');
+                payload.extend(pad(s.as_bytes()));
+            }
+        }
+    }
+    let mut out = pad(address.as_bytes());
+    out.extend(pad(tags.as_bytes()));
+    out.extend(payload);
+    out
 }
 
 /// An OSC message with one argument.
