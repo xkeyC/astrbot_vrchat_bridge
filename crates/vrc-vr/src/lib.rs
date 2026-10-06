@@ -11,6 +11,7 @@
 //!
 //! - [`anim`] gives the hands (and a little of the head) life: idle sway,
 //!   arm swing when walking, gestures when talking.
+//! - [`trackers`] sends VRChat's OSC trackers (hip, feet, ...): full body.
 //!
 //! See `docs/full-vr/` for how the pieces fit and why.
 
@@ -21,6 +22,7 @@ pub mod pose;
 pub mod remote;
 pub mod scan;
 pub mod tap;
+pub mod trackers;
 pub mod walk;
 
 pub use pose::{Fov, Pose};

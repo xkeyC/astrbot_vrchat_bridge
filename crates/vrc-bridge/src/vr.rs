@@ -34,6 +34,8 @@ pub struct VrCore {
     /// VRChat's calibration expects it, else the avatar stands on tiptoe
     /// (too high) or crouches.
     pub head_height: f32,
+    /// The head leaned off where it stands (`lean_head`).
+    pub lean: [f32; 3],
 }
 
 impl VrCore {
@@ -49,6 +51,7 @@ impl VrCore {
             yaw: 0.0,
             pitch: 0.0,
             head_height: vrc_vr::anim::AnimParams::default().head_height,
+            lean: [0.0; 3],
         }
     }
 
@@ -60,6 +63,7 @@ impl VrCore {
             self.yaw = yaw;
             self.pitch = pitch;
             rig.hmd.state.head.position[1] = self.head_height;
+            self.lean = [0.0; 3];
             let head = rig.hmd.state.head.position;
             rig.hmd.state.hands_at_rest(head, yaw);
             rig.hmd.send()?;
@@ -115,6 +119,134 @@ impl VrCore {
         let head = rig.hmd.state.head.position;
         rig.hmd.state.hands_at_rest(head, yaw);
         self.aim(yaw, pitch)
+    }
+
+    /// Sets a hand by hand (`/v1/vr/hand`): its grip `offset` from the eyes
+    /// (metres: right, up, ahead of where the body faces), turned `turn`
+    /// (degrees: yaw, pitch, roll from the body's facing; the grip's -Z is
+    /// where it points), the trigger pulled `trigger` (0..1) and `buttons`
+    /// held. Returns the grip pose sent.
+    pub fn set_hand(&mut self, hand: &str, offset: [f32; 3], turn: [f32; 3], trigger: f32, buttons: &[String]) -> Result<Pose> {
+        for name in buttons {
+            anyhow::ensure!(["a", "b", "system", "thumbstick"].contains(&name.as_str()), "buttons are a, b, system, thumbstick");
+        }
+        let rig = self.rig(&[])?;
+        let state = &mut rig.hmd.state;
+        let (head, body) = (state.head.position, state.body_yaw);
+        let facing = Pose::looking(body, 0.0, [0.0; 3]);
+        let (right, ahead) = (facing.rotate([1.0, 0.0, 0.0]), facing.rotate([0.0, 0.0, -1.0]));
+        let position = [
+            head[0] + right[0] * offset[0] + ahead[0] * offset[2],
+            head[1] + offset[1],
+            head[2] + right[2] * offset[0] + ahead[2] * offset[2],
+        ];
+        let look = Pose::looking(body + turn[0], turn[1], position);
+        let roll = vrc_vr::pose::quat_axis([0.0, 0.0, 1.0], -turn[2].to_radians());
+        let pose = Pose { orientation: vrc_vr::pose::quat_mul(look.orientation, roll), position };
+        let c = match hand {
+            "left" => &mut state.left,
+            "right" => &mut state.right,
+            _ => bail!("hand is left or right"),
+        };
+        c.active = true;
+        c.pose = pose;
+        c.trigger = trigger.clamp(0.0, 1.0);
+        c.trigger_touch = trigger > 0.0;
+        c.trigger_click = trigger >= 0.95;
+        let held = |name: &str| buttons.iter().any(|b| b == name);
+        (c.a_click, c.a_touch) = (held("a"), held("a"));
+        (c.b_click, c.b_touch) = (held("b"), held("b"));
+        (c.system_click, c.system_touch) = (held("system"), held("system"));
+        (c.thumbstick_click, c.thumbstick_touch) = (held("thumbstick"), held("thumbstick"));
+        rig.hmd.send()?;
+        Ok(pose)
+    }
+
+    /// Leans the head `lean` (metres: right, up, ahead of where the body
+    /// faces) off where it stands (`/v1/vr/head`: looking past what the
+    /// avatar wears to its own feet); `[0, 0, 0]` stands straight again.
+    /// Returns the head, and how far it is off (tracking space).
+    pub fn lean_head(&mut self, lean: [f32; 3]) -> Result<([f32; 3], [f32; 3])> {
+        let old = self.lean;
+        let rig = self.rig(&[])?;
+        let state = &mut rig.hmd.state;
+        let facing = Pose::looking(state.body_yaw, 0.0, [0.0; 3]);
+        let (right, ahead) = (facing.rotate([1.0, 0.0, 0.0]), facing.rotate([0.0, 0.0, -1.0]));
+        let offset = |l: [f32; 3]| [right[0] * l[0] + ahead[0] * l[2], l[1], right[2] * l[0] + ahead[2] * l[2]];
+        let (was, now) = (offset(old), offset(lean));
+        for i in 0..3 {
+            state.head.position[i] += now[i] - was[i];
+        }
+        let head = state.head.position;
+        rig.hmd.send()?;
+        self.lean = lean;
+        Ok((head, now))
+    }
+
+    /// Bends forward at the hips by `deg` (0: straight), hands clasped
+    /// behind the back (out of the view): the head goes ahead and down as
+    /// a body's does, about the hip joints (Drillis & Contini: 0.530 of
+    /// the stature, the eyes at 0.936), so it neither floats nor stretches.
+    /// Returns the head, and how far it is off where it stands.
+    pub fn bend_over(&mut self, deg: f32) -> Result<([f32; 3], [f32; 3])> {
+        let stature = (self.head_height - vrc_vr::remote::FLOOR_Y) / 0.936;
+        let (s, c) = deg.to_radians().sin_cos();
+        // (up, ahead) from the hip joints, turned forward about them.
+        let bend = |up: f32, ahead: f32| (up * c - ahead * s, ahead * c + up * s);
+        let eyes = ((0.936 - 0.530) * stature, 0.02 * stature);
+        let (up, ahead) = bend(eyes.0, eyes.1);
+        let out = self.lean_head([0.0, up - eyes.0, ahead - eyes.1])?;
+        if deg == 0.0 {
+            return Ok(out);
+        }
+        // The hands at the small of the back, a little apart.
+        let (hand_up, hand_ahead) = bend(0.06 * stature, -0.11 * stature);
+        let rig = self.rig(&[])?;
+        let state = &mut rig.hmd.state;
+        let body = state.body_yaw;
+        let facing = Pose::looking(body, 0.0, [0.0; 3]);
+        let (right, fwd) = (facing.rotate([1.0, 0.0, 0.0]), facing.rotate([0.0, 0.0, -1.0]));
+        // The hip joints under the standing head.
+        let head = [state.head.position[0] - out.1[0], state.head.position[1] - out.1[1], state.head.position[2] - out.1[2]];
+        let hip = [head[0] - fwd[0] * eyes.1, head[1] - eyes.0, head[2] - fwd[2] * eyes.1];
+        for (hand, side) in [(&mut state.left, -1.0f32), (&mut state.right, 1.0)] {
+            let r = side * 0.05 * stature;
+            hand.active = true;
+            hand.pose = Pose::looking(
+                body + side * 90.0,
+                -60.0,
+                [hip[0] + right[0] * r + fwd[0] * hand_ahead, hip[1] + hand_up, hip[2] + right[2] * r + fwd[2] * hand_ahead],
+            );
+        }
+        rig.hmd.send()?;
+        Ok(out)
+    }
+
+    /// Sets a hand's grip (tracking space) and its trigger (0..1).
+    pub fn set_hand_pose(&mut self, hand: &str, pose: Pose, trigger: f32) -> Result<()> {
+        let rig = self.rig(&[])?;
+        let c = match hand {
+            "left" => &mut rig.hmd.state.left,
+            "right" => &mut rig.hmd.state.right,
+            _ => bail!("hand is left or right"),
+        };
+        c.active = true;
+        c.pose = pose;
+        c.trigger = trigger.clamp(0.0, 1.0);
+        c.trigger_touch = trigger > 0.0;
+        c.trigger_click = trigger >= 0.95;
+        rig.hmd.send()
+    }
+
+    /// Lets go of both hands' triggers and buttons, keeping where they are.
+    pub fn release_hands(&mut self) -> Result<()> {
+        let rig = self.rig(&[])?;
+        for c in [&mut rig.hmd.state.left, &mut rig.hmd.state.right] {
+            (c.trigger, c.trigger_touch, c.trigger_click) = (0.0, false, false);
+            (c.a_click, c.a_touch, c.b_click, c.b_touch) = (false, false, false, false);
+            (c.system_click, c.system_touch, c.thumbstick_click, c.thumbstick_touch) = (false, false, false, false);
+        }
+        rig.hmd.send()
     }
 
     // -- surveys and walks --------------------------------------------------------

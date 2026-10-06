@@ -31,6 +31,16 @@ pub struct Stereo {
     pub left_pose: Pose,
 }
 
+/// The width the eyes are matched at, whatever size they are rendered:
+/// the disparity range (so the nearest distance seen) and the cost stay
+/// the same when the headset's resolution changes.
+pub const MATCH_WIDTH: u32 = 640;
+
+/// The scale that brings a `width`-wide eye to about [`MATCH_WIDTH`].
+pub fn match_scale(width: u32) -> usize {
+    ((width + MATCH_WIDTH / 2) / MATCH_WIDTH).max(1) as usize
+}
+
 impl Stereo {
     /// The pair of a tapped frame (8-bit RGBA/BGRA formats).
     pub fn from_frame(frame: &EyeFrame, scale: usize) -> Option<Stereo> {

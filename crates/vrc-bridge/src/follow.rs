@@ -705,7 +705,7 @@ impl Follower {
         };
         // The frame is at most a frame old: as good as now for the odometry.
         let at = Instant::now();
-        let stereo = Stereo::from_frame(&frame, 2).ok_or_else(|| anyhow::anyhow!("not an 8-bit frame"))?;
+        let stereo = Stereo::from_frame(&frame, vrc_stereo::match_scale(frame.width)).ok_or_else(|| anyhow::anyhow!("not an 8-bit frame"))?;
         let disp = stereo_pool().install(|| stereo.disparity(&SgmParams::default()));
         let eye = eye_of(&frame);
         let (yaw, _) = frame.views[0].pose.yaw_pitch();
@@ -1108,7 +1108,7 @@ fn stereo_pool() -> &'static rayon::ThreadPool {
 /// per 10 cm from 0.3 m out, the points' count and lowest and highest
 /// height over the floor (world metres), and what `corridor` makes of it.
 pub fn corridor_report(frame: &EyeFrame, yaw: Option<f32>, metres: f32) -> anyhow::Result<Value> {
-    let stereo = Stereo::from_frame(frame, 2).ok_or_else(|| anyhow::anyhow!("not an 8-bit frame"))?;
+    let stereo = Stereo::from_frame(frame, vrc_stereo::match_scale(frame.width)).ok_or_else(|| anyhow::anyhow!("not an 8-bit frame"))?;
     let disp = stereo_pool().install(|| stereo.disparity(&SgmParams::default()));
     let points: Vec<[f32; 3]> = stereo.points(&disp, 2).into_iter().map(|(p, _)| p).collect();
     let eye = eye_of(frame);

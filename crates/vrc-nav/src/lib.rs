@@ -66,13 +66,14 @@ pub struct SurveyOptions {
     pub down: bool,
     /// Read name tags (needs the rig's OCR).
     pub players: bool,
-    /// Match the stereo at 1/scale of the eye size.
+    /// Match the stereo at 1/scale of the eye size (0: about
+    /// `vrc_stereo::MATCH_WIDTH` wide, whatever the eye size).
     pub stereo_scale: usize,
 }
 
 impl Default for SurveyOptions {
     fn default() -> Self {
-        SurveyOptions { count: 5, pitch: -10.0, down: true, players: true, stereo_scale: 2 }
+        SurveyOptions { count: 5, pitch: -10.0, down: true, players: true, stereo_scale: 0 }
     }
 }
 
@@ -123,7 +124,8 @@ pub fn survey(rig: &mut Rig, opts: &SurveyOptions, blocked: &[[f32; 2]]) -> Resu
     let mut points = Vec::new();
     let mut pairs = Vec::new();
     for s in &shots {
-        let stereo = Stereo::from_frame(&s.frame, opts.stereo_scale).context("not an 8-bit frame")?;
+        let scale = if opts.stereo_scale == 0 { vrc_stereo::match_scale(s.frame.width) } else { opts.stereo_scale };
+        let stereo = Stereo::from_frame(&s.frame, scale).context("not an 8-bit frame")?;
         let disp = stereo.disparity(&SgmParams::default());
         points.extend(stereo.points(&disp, 1).into_iter().map(|(p, _)| p));
         pairs.push((stereo, disp));

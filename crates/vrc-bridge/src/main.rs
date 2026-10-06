@@ -21,6 +21,7 @@
 mod anim;
 mod api;
 mod bridge;
+mod calibrate;
 mod follow;
 mod game;
 mod sightings;
@@ -183,6 +184,11 @@ async fn main() -> Result<()> {
         .route("/v1/vr/height", get(vr_height).post(vr_set_height))
         .route("/v1/vr/reset", post(vr_reset))
         .route("/v1/vr/corridor", get(vr_corridor))
+        .route("/v1/vr/trackers", get(vr_trackers).post(vr_set_trackers))
+        .route("/v1/vr/hand", post(vr_hand))
+        .route("/v1/vr/input", post(vr_input))
+        .route("/v1/vr/head", post(vr_head))
+        .route("/v1/vr/calibrate", get(vr_calibrate_status).post(vr_calibrate))
         .route("/v1/vr/survey/pano.jpg", get(vr_pano))
         .route("/v1/vr/survey/map.png", get(vr_map))
         .route_layer(middleware::from_fn_with_state(bridge.clone(), auth))
@@ -598,11 +604,12 @@ async fn vr_reset(State(b): State<App>) -> Reply {
     for axis in ["/input/Vertical", "/input/Horizontal"] {
         let _ = b.osc.send_f32(axis, 0.0);
     }
-    let yaw = on_headset(&b, |vr, _| {
+    let yaw = on_headset(&b, |vr, b| {
         let yaw = vr.yaw;
         vr.forget_places();
         vr.reset();
         vr.face(yaw, 0.0)?;
+        *b.anim.head_lean.lk() = [0.0; 3];
         Ok(yaw)
     })
     .await;
@@ -636,4 +643,177 @@ async fn vr_pano(State(b): State<App>) -> std::result::Result<Response, Fail> {
 async fn vr_map(State(b): State<App>) -> std::result::Result<Response, Fail> {
     let png = on_headset(&b, |vr, _| vr::map_png(vr.survey.as_ref().context("no survey yet")?)).await?;
     Ok(([("Content-Type", "image/png")], png).into_response())
+}
+
+// -- full body (trying it out) ----------------------------------------------------------
+
+/// The OSC trackers as set, and what they would send now (Unity's terms).
+fn trackers_json(b: &App) -> Result<Value> {
+    use vrc_vr::trackers;
+    let settings = b.anim.trackers.lk().clone();
+    settings.parts()?;
+    let state = b.vr.try_lk().and_then(|vr| vr.link()).and_then(|l| l.owner()).map(|o| o.state);
+    let round = |v: [f32; 3]| v.map(|x| (x as f64 * 1000.0).round() / 1000.0);
+    let mut v = serde_json::to_value(&settings)?;
+    match state.map(|s| b.anim.tracker_frame(&settings, &s)) {
+        Some(Ok(frame)) => {
+            v["applied_scale"] = json!(frame.scale);
+            v["sending"] = frame
+                .trackers
+                .iter()
+                .map(|(part, pose)| {
+                    let (p, r) = trackers::to_unity(pose);
+                    json!({"part": format!("{part:?}"), "slot": part.slot(), "position": round(p), "rotation": round(r)})
+                })
+                .collect();
+            let (p, r) = trackers::to_unity(&frame.head);
+            v["head"] = json!({"position": round(p), "rotation": round(r)});
+        }
+        Some(Err(e)) => v["error"] = json!(format!("{e:#}")),
+        None => v["error"] = json!("no headset yet"),
+    }
+    Ok(v)
+}
+
+async fn vr_trackers(State(b): State<App>) -> Reply {
+    Ok(Json(trackers_json(&b)?))
+}
+
+/// `{"on": true, "parts": ["hip", "feet"], "head": "once"}` (any of them):
+/// sets the OSC trackers; the head's rotation is sent again.
+async fn vr_set_trackers(State(b): State<App>, Body(body): Body) -> Reply {
+    let mut v = serde_json::to_value(b.anim.trackers.lk().clone())?;
+    for (k, val) in body.as_object().into_iter().flatten() {
+        if v.get(k).is_none() {
+            return Err(anyhow::anyhow!("no setting {k} (on, parts, head, shift, scale, auto_calibrate)").into());
+        }
+        v[k] = val.clone();
+    }
+    let settings: anim::TrackerSettings = serde_json::from_value(v)?;
+    b.anim.set_trackers(settings)?;
+    Ok(Json(trackers_json(&b)?))
+}
+
+/// Sets a hand by hand: `{"hand": "right", "offset": [right, up, ahead],
+/// "turn": [yaw, pitch, roll], "trigger": 0..1, "buttons": ["b"],
+/// "press_ms": 150}` (a press: let go after); `{"release": true}` gives
+/// the hands back to the animation, at rest.
+async fn vr_hand(State(b): State<App>, Body(body): Body) -> Reply {
+    use std::sync::atomic::Ordering;
+    if body["release"].as_bool() == Some(true) {
+        b.anim.manual_hands.store(false, Ordering::Relaxed);
+        on_headset(&b, |vr, _| {
+            let yaw = vr.yaw;
+            vr.release_hands()?;
+            vr.face(yaw, 0.0)
+        })
+        .await?;
+        return Ok(Json(json!({"ok": true, "hands": "animation"})));
+    }
+    let hand = body["hand"].as_str().unwrap_or("right").to_string();
+    let triple = |key: &str| -> Result<[f32; 3]> {
+        match body.get(key) {
+            None => Ok([0.0; 3]),
+            Some(v) => {
+                let a: Vec<f32> = serde_json::from_value(v.clone())?;
+                anyhow::ensure!(a.len() == 3 && a.iter().all(|x| x.is_finite()), "{key} is three numbers");
+                Ok([a[0], a[1], a[2]])
+            }
+        }
+    };
+    let offset = triple("offset")?;
+    if offset.iter().any(|x| x.abs() > 1.5) {
+        return Err(anyhow::anyhow!("offset within 1.5 m").into());
+    }
+    let turn = triple("turn")?;
+    let trigger = num(&body, "trigger", 0.0) as f32;
+    let buttons: Vec<String> = serde_json::from_value(body.get("buttons").cloned().unwrap_or(json!([])))?;
+    let press = Duration::from_millis(num(&body, "press_ms", 0.0).clamp(0.0, 5000.0) as u64);
+    b.anim.manual_hands.store(true, Ordering::Relaxed);
+    let pose = on_headset(&b, move |vr, _| {
+        let pose = vr.set_hand(&hand, offset, turn, trigger, &buttons)?;
+        if !press.is_zero() {
+            std::thread::sleep(press);
+            vr.release_hands()?;
+        }
+        Ok(pose)
+    })
+    .await?;
+    Ok(Json(json!({"ok": true, "grip": {"position": pose.position, "orientation": pose.orientation}})))
+}
+
+/// Presses one of VRChat's OSC inputs (`/input/<name>`, a button: 1, then
+/// 0 after `press_ms`), e.g. `QuickMenuToggleLeft`.
+async fn vr_input(State(b): State<App>, Body(body): Body) -> Reply {
+    let name = body["name"].as_str().unwrap_or("").to_string();
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(anyhow::anyhow!("name: an /input/ button").into());
+    }
+    let address = format!("/input/{name}");
+    let press = Duration::from_millis(num(&body, "press_ms", 150.0).clamp(20.0, 5000.0) as u64);
+    b.osc.send_i32(&address, 1)?;
+    tokio::time::sleep(press).await;
+    b.osc.send_i32(&address, 0)?;
+    Ok(Json(json!({"ok": true, "input": address})))
+}
+
+/// The head off where it stands: `{"bend": degrees}` bends forward at
+/// the hips, hands behind the back (0: straight again, the hands back to
+/// the animation), e.g. to look past what the avatar wears at its own feet
+/// (then `/v1/screenshot?pitch=-80`); or `{"lean": [right, up, ahead]}`
+/// moves the head alone (metres).
+async fn vr_head(State(b): State<App>, Body(body): Body) -> Reply {
+    use std::sync::atomic::Ordering;
+    let (head, off) = if let Some(deg) = body["bend"].as_f64() {
+        if !(0.0..=75.0).contains(&deg) {
+            return Err(anyhow::anyhow!("bend is 0-75 degrees").into());
+        }
+        let deg = deg as f32;
+        if deg > 0.0 {
+            b.anim.manual_hands.store(true, Ordering::Relaxed);
+        }
+        let out = on_headset(&b, move |vr, _| {
+            let out = vr.bend_over(deg)?;
+            if deg == 0.0 {
+                let yaw = vr.yaw;
+                vr.face(yaw, 0.0)?;
+            }
+            Ok(out)
+        })
+        .await?;
+        if deg == 0.0 {
+            b.anim.manual_hands.store(false, Ordering::Relaxed);
+        }
+        out
+    } else {
+        let lean: Vec<f32> = serde_json::from_value(body.get("lean").cloned().unwrap_or(json!([0, 0, 0])))?;
+        if lean.len() != 3 || lean.iter().any(|x| !x.is_finite() || x.abs() > 0.8) {
+            return Err(anyhow::anyhow!("lean is three numbers within 0.8 m").into());
+        }
+        on_headset(&b, move |vr, _| vr.lean_head([lean[0], lean[1], lean[2]])).await?
+    };
+    // The trackers stay where the body stands.
+    *b.anim.head_lean.lk() = off;
+    Ok(Json(json!({"ok": true, "head": head})))
+}
+
+/// Whether VRChat tracks the full body now (its TrackingType: 6 with hip
+/// and feet trackers calibrated, 3 head and hands).
+async fn vr_calibrate_status(State(b): State<App>) -> Reply {
+    let tt = tokio::task::spawn_blocking({
+        let b = b.clone();
+        move || calibrate::tracking_type(&b)
+    })
+    .await?;
+    Ok(Json(json!({"tracking_type": tt, "full_body": tt == Some(calibrate::FULL_BODY), "trackers_on": b.anim.trackers.lk().on})))
+}
+
+/// Calibrates full body by itself (`calibrate`): turns the trackers on if
+/// they are not, then the Quick Menu, 校准, both triggers. A body already
+/// tracked in full is left alone unless `{"force": true}`.
+async fn vr_calibrate(State(b): State<App>, Body(body): Body) -> Reply {
+    let force = body["force"].as_bool().unwrap_or(false);
+    b.require_game()?;
+    let report = tokio::task::spawn_blocking(move || calibrate::now(&b, force)).await??;
+    Ok(Json(report))
 }

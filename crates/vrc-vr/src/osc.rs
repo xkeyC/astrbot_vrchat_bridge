@@ -48,6 +48,12 @@ impl Osc {
         Ok(())
     }
 
+    /// Sends a message already encoded ([`encode`]).
+    pub fn send_raw(&self, packet: &[u8]) -> Result<()> {
+        self.udp.send_to(packet, &self.send_to)?;
+        Ok(())
+    }
+
     /// Sends a float (`/input/Vertical`, `/avatar/eyeheight`, ...).
     pub fn send_f32(&self, address: &str, value: f32) -> Result<()> {
         self.udp.send_to(&message(address, b",f", &value.to_be_bytes()), &self.send_to)?;
