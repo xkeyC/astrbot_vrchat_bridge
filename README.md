@@ -147,3 +147,51 @@ VRChat 的服务条款对自动化或机器人账号有限制，请自行评估�
 ## 许可证
 
 [GNU Affero General Public License v3.0](LICENSE)。`third_party/` 里的补丁分别遵循 Monado（BSL-1.0）和 xrizer（GPL-3.0）的许可证。
+
+## 致谢与参考
+
+本项目建立在下面这些项目、数据和研究之上，感谢它们的作者。调研过、但最终没有采用的方案，记在 [docs/full-vr/](docs/full-vr/README.md) 的几份调研文档里。
+
+> 标有 **fork** 的项目，本项目实际用的是修改过的 fork，而不是上游原版；上游版本不带这些修改，直接替换不能用。Monado 和 xrizer 没有 fork，而是在上游提交上打补丁（`third_party/`，构建脚本会自动打上）。
+
+### 运行环境与上游
+
+- [VRChat](https://hello.vrchat.com/)：[OSC](https://docs.vrchat.com/docs/osc-overview)、[OSC 追踪器](https://docs.vrchat.com/docs/osc-trackers)、[化身参数](https://docs.vrchat.com/docs/osc-avatar-parameters)、[化身缩放](https://docs.vrchat.com/docs/osc-avatar-scaling) 和 OSCQuery 接口
+- [Monado](https://gitlab.freedesktop.org/monado/monado)：OpenXR 运行时（remote 驱动、null 合成器）；补丁见 `third_party/`（抓帧、按需拷贝、正方形视场、运行中调整帧率）
+- [xrizer](https://github.com/Supreeeme/xrizer)：OpenVR 到 OpenXR 的转换层；补丁见 `third_party/`（交换链加 `TRANSFER_SRC` 用法）
+- [OpenXR](https://www.khronos.org/openxr/)、Steam 和 Proton、PipeWire
+
+### AstrBot 生态与推理服务
+
+- [AstrBot](https://github.com/AstrBotDevs/AstrBot)：本项目作为它的平台插件运行
+  - **fork**：[xkeyC/AstrBot](https://github.com/xkeyC/AstrBot) 的 `codex_agent_runtime` 分支（Codex 运行器、实时语音核心 `astrbot.core.voice`、语音工具）
+- [OpenAI Codex](https://github.com/openai/codex)：AstrBot 里做决策的 agent 运行时
+  - **fork**：[xkeyC/codex_for_astrbot](https://github.com/xkeyC/codex_for_astrbot) 的 `astrbot` 分支（AstrBot 的 Python 绑定、本地语音后端、Chat Completions 线路等；随上游版本合并更新）
+- [local-multimodal-infra](https://github.com/mercallureAI/local-multimodal-infra)：OCR、物品检测和本地语音的推理服务，其中用到：
+  - [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) 的 PP-OCRv5（名牌识别）
+  - [Ultralytics](https://github.com/ultralytics/ultralytics) 的 YOLO11（物品检测）
+  - [ONNX Runtime](https://github.com/microsoft/onnxruntime)
+- [VRCX](https://github.com/vrcx-team/VRCX)：VRChat Web API 的用法参考（登录、好友、邀请）
+
+### 动作数据
+
+- [CMU Graphics Lab Motion Capture Database](http://mocap.cs.cmu.edu)，BVH 版本取自 [una-dinosauria/cmu-mocap](https://github.com/una-dinosauria/cmu-mocap)：走跑动作、步态统计
+- [Bandai Namco Research Motion Dataset](https://github.com/BandaiNamcoResearchInc/Bandai-Namco-Research-Motiondataset)（CC BY-NC 4.0）：带风格的日常动作
+- [Quaternius](https://quaternius.com) 的 Universal Animation Library（CC0）：游戏化身常用动作
+- Drillis R., Contini R. *Body Segment Parameters*（1966）：重定向用的人体比例
+
+### 算法与思路参考
+
+- Hirschmüller H. *Stereo Processing by Semiglobal Matching and Mutual Information*（TPAMI 2008）：双目匹配（SGM）
+- Zabih R., Woodfill J. *Non-parametric Local Transforms for Computing Visual Correspondence*（ECCV 1994）：census 代价
+- [KISS-ICP](https://github.com/PRBonn/kiss-icp)：只估平移的配准、以里程作先验的思路
+- [elevation_mapping_cupy](https://github.com/leggedrobotics/elevation_mapping_cupy)：按距离加权融合、用视线清除走开的物体
+- [OctoMap](https://octomap.github.io)：体素的命中和穿过计数
+- Triebel R., Pfaff P., Burgard W. *Multi-Level Surface Maps for Outdoor Terrain Mapping and Loop Closing*（IROS 2006）：一个格子里存多层表面
+- Lumelsky V., Stepanov A. 的 Bug 算法（Algorithmica 1987）：跟随时沿墙绕行
+- [VLMnav](https://jirl-upenn.github.io/VLMnav/)、[Set-of-Mark](https://github.com/microsoft/SoM)：在画面上给候选点编号，让大模型选
+
+### 软件库
+
+- Rust：[tokio](https://tokio.rs)、[axum](https://github.com/tokio-rs/axum)、[reqwest](https://github.com/seanmonstar/reqwest)、[tokio-tungstenite](https://github.com/snapview/tokio-tungstenite)、[rayon](https://github.com/rayon-rs/rayon)、[cudarc](https://github.com/coreylowman/cudarc)、[serde](https://serde.rs)、[clap](https://github.com/clap-rs/clap)、[tracing](https://github.com/tokio-rs/tracing)、[anyhow](https://github.com/dtolnay/anyhow)、[jpeg-encoder](https://github.com/vstroebel/jpeg-encoder)、[png](https://github.com/image-rs/image-png)、[memmap2](https://github.com/RazrFalcon/memmap2-rs)、[rpassword](https://github.com/conradkleinespel/rpassword)
+- Python（`tools/` 里的离线脚本）：[NumPy](https://numpy.org)、[SciPy](https://scipy.org)、[Matplotlib](https://matplotlib.org)
