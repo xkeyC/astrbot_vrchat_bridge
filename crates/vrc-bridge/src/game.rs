@@ -24,6 +24,10 @@ pub struct GameState {
     pub players: BTreeMap<String, String>,
     pub oscquery_port: u16,
     pub vram_mib: u64,
+    /// The game's log being read, and the worlds joined in it so far: a
+    /// visit (the map's session) is the two together.
+    pub log: String,
+    pub joins: u32,
 }
 
 impl GameState {
@@ -42,6 +46,17 @@ impl GameState {
             "players": others,
             "vram_mib": self.vram_mib,
         })
+    }
+
+    /// The world (`wrld_...`) the bot is in; empty between worlds.
+    pub fn world_id(&self) -> &str {
+        self.instance.split(':').next().unwrap_or("")
+    }
+
+    /// This visit to the world: the same however often the log is read
+    /// again (a bridge restarted).
+    pub fn session(&self) -> String {
+        format!("{}#{}", self.log, self.joins)
     }
 
     /// Display names of the other players.
@@ -65,6 +80,7 @@ impl GameState {
         } else if let Some(at) = line.find("[Behaviour] Joining wrld_") {
             let rest = &line[at + 20..];
             self.instance = rest.split_whitespace().next().unwrap_or("").to_string();
+            self.joins += 1;
         } else if line.contains("[Behaviour] OnLeftRoom") {
             self.world_name.clear();
             self.instance.clear();
@@ -131,6 +147,8 @@ impl LogTail {
             state.instance.clear();
             state.players.clear();
             state.oscquery_port = 0;
+            state.log = self.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            state.joins = 0;
             changed = true;
         }
         let Some(path) = &self.path else { return Ok(changed) };

@@ -147,11 +147,12 @@ class VRChatPlugin(Star):
     @llm_tool("vrchat_walk_to")
     async def vrchat_walk_to(self, event: AstrMessageEvent, place: int = -1, side: str = "",
                              degrees: float = 0.0, distance: float = 0.0, pace: str = "walk",
-                             around: bool = False):
-        """走到上一次 vrchat_view 的某个编号地点（绕开障碍、分段走），或按方位走一段距离；走完返回正前方的新画面和编号地点（around 为 true 时返回环视全景图和地图）。出发前先用 vrchat_view 环顾四周。
+                             around: bool = False, to: str = ""):
+        """走到上一次 vrchat_view 的某个编号地点（绕开障碍、分段走）；或按名字走到地图上记住的地点或见过的物体（to：再远、看不见也行，按地图规划路线，绕开以前撞过的玻璃）；或按方位走一段距离。走完返回正前方的新画面和编号地点（around 为 true 时返回环视全景图和地图）。出发前先用 vrchat_view 环顾四周，它的结果里"On your map"列出地图上记得的地点和物体。
 
         Args:
             place(number): 上一次环视里的地点编号；不按编号走时留空（-1）。
+            to(string): 不按编号时：地图上的地点或物体名（环视结果"On your map"里的名字，如自己命名的地点、couch、couch 2）。
             side(string): 不按编号时往哪走：ahead（前）、left（左）、right（右）、behind（后）。
             degrees(number): 配合 side 为 left / right：从正前方往那边偏多少度（默认 90）。
             distance(number): 配合 side：走多少米（默认 2）。
@@ -160,7 +161,7 @@ class VRChatPlugin(Star):
         """
 
         async def walk(adapter):
-            body = vr_goto_body({"place": place if place >= 1 else None, "side": side, "degrees": degrees,
+            body = vr_goto_body({"place": place if place >= 1 else None, "to": to, "side": side, "degrees": degrees,
                                  "distance": distance, "pace": pace, "around": around})
             data, pano, top = await adapter.vr_goto(body, who="text")
             return goto_words(data) + " " + survey_words(data["after"]), pano, top
@@ -325,6 +326,15 @@ class VRChatPlugin(Star):
         except ValueError as e:
             return _json({"error": str(e)})
         return await self._act(event, lambda a: a.request("POST", "/v1/motion", body))
+
+    @llm_tool("vrchat_remember_place")
+    async def vrchat_remember_place(self, event: AstrMessageEvent, name: str) -> str:
+        """把 bot 现在站的位置和朝向用一个名字记在这个世界的地图上（比如"舞台"）；之后 vrchat_walk_to 用 to=这个名字就能从这个世界的任何地方走回来，并转回当时的朝向，换天再来也记得。要先正常站着（坐着、躺着时先用 vrchat_posture 站起来再记）。同名再记一次会改到这里。
+
+        Args:
+            name(string): 地点名（按对方的说法）。
+        """
+        return await self._act(event, lambda a: a.request("POST", "/v1/map/place", {"name": name}))
 
     @llm_tool("vrchat_stop")
     async def vrchat_stop(self, event: AstrMessageEvent) -> str:

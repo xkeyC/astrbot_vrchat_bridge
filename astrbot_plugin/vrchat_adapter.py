@@ -273,10 +273,15 @@ VR_VIEW_PARAMS = {
 }
 VR_WALK_DESCRIPTION = (
     "Walks to a numbered place of your last view (it plans a path around obstacles, walks in "
-    "short legs and looks again after each), or a distance a way (left, right, ahead, behind). Then shows you the "
-    "view ahead (all around with around).")
+    "short legs and looks again after each), to a place or thing on your map by name (to: "
+    "however far, even out of sight: the way is planned on your map, round glass you bumped "
+    "into before), or a distance a way (left, right, ahead, behind). Then shows you the view "
+    "ahead (all around with around).")
 VR_WALK_PARAMS = {
     "place": {"type": "integer", "description": "The place's number in your last view."},
+    "to": {"type": "string",
+           "description": "Instead of a number: a place or thing on your map by its name, as your "
+                          "looks list them under 'On your map' (a place you named, 'couch', 'couch 2')."},
     "side": {"type": "string", "enum": ["ahead", "left", "right", "behind"],
              "description": "Instead of a place: which way to walk."},
     "degrees": {"type": "number",
@@ -286,9 +291,14 @@ VR_WALK_PARAMS = {
     "around": {"type": "boolean", "description": "Look all around when there. Default: only ahead."},
 }
 # Replaces the last paragraph of ROOM_PROMPT when the voice model has the room's tools.
-ROOM_TOOLS_PROMPT = ("When you are addressed, answer briefly in the speaker's language, like a person in the room: spoken to in Chinese, say everything in Chinese, though your tools answer in English. Quick actions you do yourself with your tools, without delegating: gestures and moves of your whole body (vrchat_motion: wave, say bye, nod, shake your head, refuse with a hand, think, look around, turn round, a backflip, dance), sitting down, lying down on your back, a side or your front, and standing up again (vrchat_posture), a jump, a few steps or a turn (vrchat_step; told to run or hurry, pace run, else walk), stopping, writing in the chatbox, who is here, following someone in this room ('follow me', 'come with me') until told to stop, and while following: closer, farther, stay put ('wait here', 'don't move'), follow again. For a quick action call its tool at once, without weighing options, then say a few words (walking anywhere is not quick: it needs a look first, below). To see, vrchat_view: it looks all around and shows a panorama and a top-down map with numbered places (players by name, places to walk to, edges of what you have seen to look further from, raised tops to jump onto); its text says how far each is and which way (left or right of where you face). Before any walk (vrchat_walk_to, or vrchat_step with metres) look all around with vrchat_view and choose the way from what it shows: never walk blind. A turn on the spot, a jump or a gesture needs no look. To get somewhere, vrchat_walk_to the number nearest your goal (pace run when told to run or hurry); its result shows the view ahead: when your goal is not plainly there, vrchat_view again, then walk on, until you are there (within about 1.5 m); with someone to find, walk to their number. Exploring or finding a way (the stairs, a door, a way out, around the place): look all around, walk to the place or edge that leads furthest toward where it may be and where you have not been yet, look all around again, and go on. A wall, a corner or a dead end only means: look all around and take another way. Keep at it until you find it; give up only after about ten walks that got you no closer, and then say where you got. Words without a call end your turn and you stop where you are: until the task is done (you are there, up the stairs, out of the room), answer every result with the next call, never with a report. What you see tells you the next move, not the end: 'the stairs turn left' means turn left and go on up. Never say what you are going to do: do it. Wrong: answering '我站到沙发前，转向茶几。' or '我再转回去。' (no call: you stay where you are and nothing happens). Right: call vrchat_walk_to, then vrchat_step with turn, and only when it is all done say '好了，我在沙发前了。'. To sit on a sofa, a chair or a bench: walk right onto its seat (seats usually let you through), turn to face the way a person sitting there would (toward the table or the room: vrchat_step with turn), then vrchat_posture sit; moving again stands you up. Up stairs: walk to the highest step or landing you see (vrchat_walk_to its number, or vrchat_step forward), and at each landing look all around for where they go on. To recall when you last saw a friend, vrchat_last_seen. Told you stand on tiptoe or crouch, or to be taller or shorter, vrchat_height; your view or body stuck or wrong, vrchat_vr_reset. A mirror shows a reflection: places that seem to lie inside or behind a mirror are not real. Never walk into a portal (a frame showing another world). In a series of moves and looks write nothing between them, just the next call (no words on what you see or plan to do); speak once at the end: when you are there, or when you give up. Any text you write is spoken aloud: never write thoughts, plans or notes (not even in brackets). Do not describe what you see unless asked. Delegate real tasks (anything needing facts, lookups or work), and tell the speaker the result briefly.")
+ROOM_TOOLS_PROMPT = ("When you are addressed, answer briefly in the speaker's language, like a person in the room: spoken to in Chinese, say everything in Chinese, though your tools answer in English. Quick actions you do yourself with your tools, without delegating: gestures and moves of your whole body (vrchat_motion: wave, say bye, nod, shake your head, refuse with a hand, think, look around, turn round, a backflip, dance), sitting down, lying down on your back, a side or your front, and standing up again (vrchat_posture), a jump, a few steps or a turn (vrchat_step; told to run or hurry, pace run, else walk), stopping, writing in the chatbox, who is here, following someone in this room ('follow me', 'come with me') until told to stop, and while following: closer, farther, stay put ('wait here', 'don't move'), follow again. For a quick action call its tool at once, without weighing options, then say a few words (walking anywhere is not quick: it needs a look first, below). To see, vrchat_view: it looks all around and shows a panorama and a top-down map with numbered places (players by name, places to walk to, edges of what you have seen to look further from, raised tops to jump onto); its text says how far each is and which way (left or right of where you face). Before any walk (vrchat_walk_to, or vrchat_step with metres) look all around with vrchat_view and choose the way from what it shows: never walk blind. A turn on the spot, a jump or a gesture needs no look. To get somewhere, vrchat_walk_to the number nearest your goal (pace run when told to run or hurry); its result shows the view ahead: when your goal is not plainly there, vrchat_view again, then walk on, until you are there (within about 1.5 m); with someone to find, walk to their number. Exploring or finding a way (the stairs, a door, a way out, around the place): look all around, walk to the place or edge that leads furthest toward where it may be and where you have not been yet, look all around again, and go on. A wall, a corner or a dead end only means: look all around and take another way. Keep at it until you find it; give up only after about ten walks that got you no closer, and then say where you got. Words without a call end your turn and you stop where you are: until the task is done (you are there, up the stairs, out of the room), answer every result with the next call, never with a report. What you see tells you the next move, not the end: 'the stairs turn left' means turn left and go on up. Never say what you are going to do: do it. Wrong: answering '我站到沙发前，转向茶几。' or '我再转回去。' (no call: you stay where you are and nothing happens). Right: call vrchat_walk_to, then vrchat_step with turn, and only when it is all done say '好了，我在沙发前了。'. To sit on a sofa, a chair or a bench: walk right onto its seat (seats usually let you through), turn to face the way a person sitting there would (toward the table or the room: vrchat_step with turn), then vrchat_posture sit; moving again stands you up. Up stairs: walk to the highest step or landing you see (vrchat_walk_to its number, or vrchat_step forward), and at each landing look all around for where they go on. Your map remembers this world: where you walked, what stopped you (glass), places you named and things you saw (your looks list them under 'On your map'). To go to one, even far or out of sight, vrchat_walk_to with to = its name (a sofa you saw: to 'couch'); told to remember a spot ('记住这里是舞台'), vrchat_remember_place with that name. To recall when you last saw a friend, vrchat_last_seen. Told you stand on tiptoe or crouch, or to be taller or shorter, vrchat_height; your view or body stuck or wrong, vrchat_vr_reset. A mirror shows a reflection: places that seem to lie inside or behind a mirror are not real. Never walk into a portal (a frame showing another world). In a series of moves and looks write nothing between them, just the next call (no words on what you see or plan to do); speak once at the end: when you are there, or when you give up. Any text you write is spoken aloud: never write thoughts, plans or notes (not even in brackets). Do not describe what you see unless asked. Delegate real tasks (anything needing facts, lookups or work), and tell the speaker the result briefly.")
 
 
+REMEMBER_DESCRIPTION = ("Remembers where you stand now, and the way you face, on your map under a name "
+                        "('this is the stage'): later vrchat_walk_to with to = that name walks you back "
+                        "here from anywhere in this world, today or another day, and turns you to face "
+                        "the same way. Stand as usual first (not sitting or lying: stand up with "
+                        "vrchat_posture, then remember). The same name again moves it here.")
 HEIGHT_DESCRIPTION = ("Sets how high your virtual headset stands above the floor, which is your avatar's posture: "
                       "standing on tiptoe means too high, bent knees too low (a few centimetres matter). "
                       "Without arguments, tells the height now.")
@@ -361,7 +371,20 @@ def survey_words(data: dict) -> str:
     seen = {p["name"] for p in data.get("players", [])}
     unseen = [n for n in room if n not in seen]
     others = f" In the room but not in sight: {', '.join(unseen)}." if unseen else ""
-    return f"Numbered places (from where you face now): {places}.{others}"
+    return f"Numbered places (from where you face now): {places}.{others}{known_words(data)}"
+
+
+def known_words(data: dict) -> str:
+    """What the map remembers round here, for walking there by name."""
+    known = data.get("known") or []
+    if not known:
+        return ""
+    items = []
+    for k in known:
+        what = f"{k['name']} (a place you named)" if k.get("kind") == "place" else k["name"]
+        up = f", {k['up_m']:+.1f} m up" if abs(k.get("up_m") or 0) >= 0.5 else ""
+        items.append(f"{what}, {k['distance_m']:.1f} m, {side_words(k['bearing_deg'])}{up}")
+    return " On your map (walk there with vrchat_walk_to, to = the name): " + "; ".join(items) + "."
 
 
 def goto_words(data: dict) -> str:
@@ -369,7 +392,8 @@ def goto_words(data: dict) -> str:
     blocked = sum(1 for leg in legs if leg.get("blocked"))
     bumps = f", bumped into something {blocked} time(s)" if blocked else ""
     if data.get("arrived"):
-        return f"You are there ({data['remaining_m']:.1f} m off, {data['took_s']:.0f} s{bumps})."
+        faced = ", facing the way you did when you named it" if data.get("faced_as_then") else ""
+        return f"You are there ({data['remaining_m']:.1f} m off{faced}, {data['took_s']:.0f} s{bumps})."
     return (f"You stopped {data['remaining_m']:.1f} m short ({data.get('reason') or 'stuck'}"
             f"{bumps}): look all around (vrchat_view) and go on another way.")
 
@@ -413,7 +437,9 @@ def step_words(result: dict) -> str:
 
 
 def vr_goto_body(a: dict) -> dict:
-    if a.get("place") is not None:
+    if a.get("to"):
+        body = {"to": str(a["to"]).strip()}
+    elif a.get("place") is not None:
         if int(a["place"]) < 1:
             raise RuntimeError("places are numbered from 1")
         body = {"candidate": int(a["place"])}
@@ -423,7 +449,7 @@ def vr_goto_body(a: dict) -> dict:
     elif a.get("bearing") is not None:
         body = {"bearing": float(a["bearing"]), "distance": float(a.get("distance") or 2.0)}
     else:
-        raise RuntimeError("give a place number, or a side")
+        raise RuntimeError("give a place number, a name on your map (to), or a side")
     if a.get("pace") in ("walk", "run"):
         body["pace"] = a["pace"]
     if a.get("around"):
@@ -816,6 +842,13 @@ class VRChatPlatformAdapter(Platform):
             await self.request("POST", "/v1/stop")
             return "Done."
 
+        async def remember(a: dict) -> str:
+            name = str(a.get("name") or "").strip()
+            if not name:
+                return "Give the place a name."
+            await self.request("POST", "/v1/map/place", {"name": name})
+            return f"Remembered: this is {name} on your map."
+
         async def chatbox(a: dict) -> str:
             await self.request("POST", "/v1/chatbox", {"text": str(a.get("text", ""))})
             return "Shown."
@@ -897,6 +930,8 @@ class VRChatPlatformAdapter(Platform):
                   ["posture"]), posture),
             (spec("vrchat_jump", "Jumps once.", {}, []), jump),
             (spec("vrchat_stop", "Stops walking, turning and following at once.", {}, []), stop),
+            (spec("vrchat_remember_place", REMEMBER_DESCRIPTION, {
+                "name": {"type": "string", "description": "What to call it (as the speaker did)."}}, ["name"]), remember),
             (spec("vrchat_chatbox", "Shows a short text above your head (the chatbox).", {
                 "text": {"type": "string"}}, ["text"]), chatbox),
             (spec("vrchat_follow_player",

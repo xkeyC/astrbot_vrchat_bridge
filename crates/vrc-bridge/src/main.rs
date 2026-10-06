@@ -23,6 +23,7 @@ mod api;
 mod bridge;
 mod calibrate;
 mod follow;
+mod mapping;
 mod motion;
 mod game;
 mod sightings;
@@ -158,6 +159,7 @@ async fn main() -> Result<()> {
     tokio::spawn(bridge.clone().chatbox_sender(chat_rx));
     tokio::spawn(bridge.social.clone().run(bridge.clone()));
     tokio::spawn(bridge.sightings.clone().run(bridge.clone()));
+    bridge.mapping.start(bridge.clone());
     {
         let (anim, b) = (bridge.anim.clone(), bridge.clone());
         std::thread::spawn(move || anim.run(b));
@@ -195,6 +197,13 @@ async fn main() -> Result<()> {
         .route("/v1/motion/reload", post(motion_reload))
         .route("/v1/vr/survey/pano.jpg", get(vr_pano))
         .route("/v1/vr/survey/map.png", get(vr_map))
+        .route("/v1/vr/beacon", get(vr_beacon))
+        .route("/v1/vr/detect", post(vr_detect))
+        .route("/v1/map", get(map_status))
+        .route("/v1/map.png", get(map_png))
+        .route("/v1/map/save", post(map_save))
+        .route("/v1/map/forget", post(map_forget))
+        .route("/v1/map/place", post(map_place))
         .route_layer(middleware::from_fn_with_state(bridge.clone(), auth))
         .with_state(bridge.clone());
     let listener = tokio::net::TcpListener::bind(&addr).await.with_context(|| format!("listen on {addr}"))?;
@@ -585,6 +594,72 @@ async fn vr_goto(State(b): State<App>, Body(body): Body) -> Reply {
     let result = on_headset(&b, move |vr, _| vr.goto(&whitelist, &body, since)).await;
     b.idle_later();
     Ok(Json(result?))
+}
+
+// -- the lasting map -----------------------------------------------------------------
+
+/// Things in the latest frame of the eyes; `{"save": true}` keeps the
+/// frame and the answer (`detect/` next to the token) to judge the detector by.
+async fn vr_detect(State(b): State<App>, Body(body): Body) -> Reply {
+    let save = body["save"].as_bool().unwrap_or(false).then(|| {
+        game::expand(&b.args.token_file).parent().map(|p| p.join("detect")).unwrap_or_else(|| "detect".into())
+    });
+    Ok(Json(on_headset(&b, move |vr, _| vr.detect(save)).await?))
+}
+
+/// The position beacon in the latest frame of the eyes.
+async fn vr_beacon(State(b): State<App>) -> Reply {
+    Ok(Json(on_headset(&b, |vr, _| vr.beacon()).await?))
+}
+
+async fn map_status(State(b): State<App>) -> Json<Value> {
+    Json(b.mapping.status())
+}
+
+/// `radius` (metres, default 8), `px` (pixels a 10 cm column, default 3),
+/// `up` (1: the way the bot faces up), `to` (`x,z` on the map: a way there drawn).
+async fn map_png(State(b): State<App>, Query(q): Query<std::collections::HashMap<String, String>>) -> std::result::Result<Response, Fail> {
+    let radius = q.get("radius").and_then(|v| v.parse::<f32>().ok()).unwrap_or(8.0).clamp(2.0, 40.0);
+    let px = q.get("px").and_then(|v| v.parse::<usize>().ok()).unwrap_or(3).clamp(1, 8);
+    let up = q.get("up").is_some_and(|v| v == "1" || v == "true");
+    let to = q.get("to").and_then(|v| {
+        let (x, z) = v.split_once(',')?;
+        Some([x.trim().parse::<f32>().ok()?, z.trim().parse::<f32>().ok()?])
+    });
+    let m = b.mapping.clone();
+    let png = tokio::task::spawn_blocking(move || m.png(radius, px, up, to)).await.map_err(|e| Fail(e.into()))??;
+    Ok(([(axum::http::header::CONTENT_TYPE, "image/png")], png).into_response())
+}
+
+async fn map_save(State(b): State<App>) -> Json<Value> {
+    let m = b.mapping.clone();
+    let _ = tokio::task::spawn_blocking(move || m.save()).await;
+    Json(b.mapping.status())
+}
+
+/// Starts this world's map anew (the old file kept aside).
+async fn map_forget(State(b): State<App>) -> Reply {
+    let m = b.mapping.clone();
+    tokio::task::spawn_blocking(move || m.forget()).await.map_err(|e| Fail(e.into()))??;
+    Ok(Json(b.mapping.status()))
+}
+
+/// Names where the bot stands: `{"name": "..."}`.
+async fn map_place(State(b): State<App>, Body(body): Body) -> Reply {
+    let name = body["name"].as_str().map(str::trim).filter(|n| !n.is_empty()).context("name is required")?;
+    // Standing as usual: sitting, lying or in a motion the head is not over
+    // the feet, and the place would be off (and so would the way it faces).
+    if let Some(posture) = motion::holding(&b) {
+        bail_fail(&format!("you are {posture} now: stand up first (vrchat_posture stand), then remember the place"))?;
+    }
+    if b.anim.motion.lk().is_some() {
+        bail_fail("a motion is playing: wait for it to end (or stop it), standing as usual, then remember the place")?;
+    }
+    if b.vr.try_lk().is_some_and(|vr| vr.lean != [0.0; 3]) {
+        bail_fail("your head is leaned or bent: stand straight first, then remember the place")?;
+    }
+    let at = b.mapping.name_place(name)?;
+    Ok(Json(json!({"ok": true, "name": name, "at": at})))
 }
 
 async fn vr_height(State(b): State<App>) -> Json<Value> {

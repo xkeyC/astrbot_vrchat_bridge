@@ -11,6 +11,7 @@
 | [fbt-research.md](fbt-research.md) | 全身动作接管调研：OSC 追踪器、全身追踪校准 |
 | [motion.md](motion.md) | 动作系统：片段库、步态、姿势、跟随里的身体和头 |
 | [agent-vr-use.md](agent-vr-use.md) | 代理怎样操作 VRChat 的 VR 菜单（像素到手柄射线、自动校准） |
+| [avatar-position-beacon.md](avatar-position-beacon.md) | 化身位置角标：着色器把世界坐标画进 bot 自己眼睛的角落，bridge 读出来 |
 
 ## 链路
 

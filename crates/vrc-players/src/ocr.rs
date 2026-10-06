@@ -19,9 +19,9 @@ pub struct OcrLine {
 
 #[derive(Clone)]
 pub struct OcrClient {
-    host: String,
-    port: u16,
-    path: String,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) path: String,
     pub model: String,
     pub token: Option<String>,
 }
@@ -47,36 +47,40 @@ impl OcrClient {
 
     /// The lines of an encoded image.
     pub fn lines(&self, image: &[u8], content_type: &str) -> Result<Vec<OcrLine>> {
-        let up = || format!("OCR at {}:{} is not up", self.host, self.port);
-        // A host gone quiet fails in seconds, not the system's minutes (a
-        // caller may hold the headset meanwhile).
-        let mut s = (self.host.as_str(), self.port)
-            .to_socket_addrs()
-            .with_context(up)?
-            .find_map(|addr| TcpStream::connect_timeout(&addr, Duration::from_secs(3)).ok())
-            .with_context(up)?;
-        s.set_read_timeout(Some(Duration::from_secs(10)))?;
-        s.set_write_timeout(Some(Duration::from_secs(10)))?;
-        let auth = self.token.as_ref().map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
-        write!(
-            s,
-            "POST {}?model={} HTTP/1.0\r\nHost: {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{auth}\r\n",
-            self.path,
-            self.model,
-            self.host,
-            image.len()
-        )?;
-        s.write_all(image)?;
-        let mut reply = Vec::new();
-        s.read_to_end(&mut reply)?;
-        let reply = String::from_utf8_lossy(&reply);
-        let (head, body) = reply.split_once("\r\n\r\n").context("not an HTTP reply")?;
-        let status = head.split_whitespace().nth(1).unwrap_or("");
-        if status != "200" {
-            bail!("OCR answered {status}: {}", body.chars().take(200).collect::<String>());
-        }
-        parse(body)
+        parse(&post(&self.host, self.port, &self.path, &self.model, self.token.as_deref(), image, content_type, "OCR")?)
     }
+}
+
+/// POSTs an image to `path?model=<model>` of the service; the reply's body
+/// (`what` names the service in errors).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn post(host: &str, port: u16, path: &str, model: &str, token: Option<&str>, image: &[u8], content_type: &str, what: &str) -> Result<String> {
+    let up = || format!("{what} at {host}:{port} is not up");
+    // A host gone quiet fails in seconds, not the system's minutes (a
+    // caller may hold the headset meanwhile).
+    let mut s = (host, port)
+        .to_socket_addrs()
+        .with_context(up)?
+        .find_map(|addr| TcpStream::connect_timeout(&addr, Duration::from_secs(3)).ok())
+        .with_context(up)?;
+    s.set_read_timeout(Some(Duration::from_secs(10)))?;
+    s.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let auth = token.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
+    write!(
+        s,
+        "POST {path}?model={model} HTTP/1.0\r\nHost: {host}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{auth}\r\n",
+        image.len()
+    )?;
+    s.write_all(image)?;
+    let mut reply = Vec::new();
+    s.read_to_end(&mut reply)?;
+    let reply = String::from_utf8_lossy(&reply);
+    let (head, body) = reply.split_once("\r\n\r\n").context("not an HTTP reply")?;
+    let status = head.split_whitespace().nth(1).unwrap_or("");
+    if status != "200" {
+        bail!("{what} answered {status}: {}", body.chars().take(200).collect::<String>());
+    }
+    Ok(body.to_string())
 }
 
 fn parse(body: &str) -> Result<Vec<OcrLine>> {
@@ -103,6 +107,32 @@ fn parse(body: &str) -> Result<Vec<OcrLine>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn posts_and_reads_back_over_http() {
+        use std::net::TcpListener;
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = server.local_addr().unwrap().port();
+        let seen = std::thread::spawn(move || {
+            let (mut c, _) = server.accept().unwrap();
+            let mut got = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !got.ends_with(b"IMG") {
+                let n = c.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+            }
+            c.write_all(b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{\"lines\": []}").unwrap();
+            String::from_utf8_lossy(&got).into_owned()
+        });
+        let c = OcrClient::new(&format!("http://127.0.0.1:{port}/v1/ocr/lines"), "m").unwrap();
+        assert!(c.lines(b"IMG", "image/jpeg").unwrap().is_empty());
+        let request = seen.join().unwrap();
+        assert!(request.starts_with("POST /v1/ocr/lines?model=m HTTP/1.0\r\nHost: 127.0.0.1\r\n"), "{request:?}");
+        assert!(request.ends_with("Content-Length: 3\r\n\r\nIMG"), "{request:?}");
+    }
 
     #[test]
     fn parses_the_answer() {

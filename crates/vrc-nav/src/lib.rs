@@ -8,7 +8,11 @@
 //!   (places and players) to pick from.
 //! - [`goto`]: walk to a point of a survey: short legs along a planned
 //!   path, each measured by the avatar's own speed, a fresh survey and plan
-//!   after each, a blocked leg remembered as an obstacle.
+//!   after each, a blocked leg remembered as an obstacle. With the lasting
+//!   map (`vrc-map`), the way is planned on it (what earlier walks saw and
+//!   learned: up stairs, round what stopped a walk, along ways walked
+//!   before), the surveys go onto it, and a blocked leg marks it; without
+//!   it (or before the visit is placed on it), on the survey's own map.
 //!
 //! Coordinates are the tracking space's (the head turns, the playspace
 //! never does, so its axes stay fixed to the world; walking moves the world
@@ -22,7 +26,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use vrc_players::{OcrClient, Sighting};
+use vrc_players::{DetectClient, ObjectSighting, OcrClient, Sighting};
 use vrc_scene::candidates::{paths, stopped, walkable};
 use vrc_scene::{candidates, Candidate, CandidateParams, HeightMap, MapParams, Person};
 use vrc_stereo::{fit_floor, Disparity, Floor, SgmParams, Stereo};
@@ -32,6 +36,10 @@ use vrc_vr::scan::{self, Shot};
 use vrc_vr::tap::EyeTap;
 use vrc_vr::walk::{self, WalkParams};
 
+pub use vrc_map;
+use vrc_map::plan::{PlanParams, Planner};
+use vrc_map::{MarkKind, Observation};
+
 /// What the capabilities drive: the virtual headset, its eyes, VRChat's
 /// OSC, and (optionally) OCR for name tags.
 pub struct Rig {
@@ -39,6 +47,8 @@ pub struct Rig {
     pub tap: EyeTap,
     pub osc: Option<Osc>,
     pub ocr: Option<OcrClient>,
+    /// Things in the views (the same service as the OCR).
+    pub detect: Option<DetectClient>,
     /// Display names in priority order.
     pub whitelist: Vec<String>,
     /// VRChat's log directory (the room's players).
@@ -68,6 +78,8 @@ pub struct SurveyOptions {
     pub down: bool,
     /// Read name tags (needs the rig's OCR).
     pub players: bool,
+    /// Find things in the views (sofas, chairs...: the lasting map's objects).
+    pub objects: bool,
     /// Match the stereo at 1/scale of the eye size (0: about
     /// `vrc_stereo::MATCH_WIDTH` wide, whatever the eye size).
     pub stereo_scale: usize,
@@ -75,7 +87,7 @@ pub struct SurveyOptions {
 
 impl Default for SurveyOptions {
     fn default() -> Self {
-        SurveyOptions { count: 5, ahead: false, pitch: -10.0, down: true, players: true, stereo_scale: 0 }
+        SurveyOptions { count: 5, ahead: false, pitch: -10.0, down: true, players: true, objects: true, stereo_scale: 0 }
     }
 }
 
@@ -89,6 +101,8 @@ pub struct Survey {
     pub floor: Floor,
     pub map: HeightMap,
     pub players: Vec<Sighting>,
+    /// Things found in the views (tracking space).
+    pub objects: Vec<ObjectSighting>,
     pub candidates: Vec<Candidate>,
     /// World metres per stereo unit (1.0 when VRChat did not say).
     pub metres: f32,
@@ -101,6 +115,7 @@ pub struct Timings {
     pub scan: Duration,
     pub stereo: Duration,
     pub ocr: Duration,
+    pub detect: Duration,
     pub map: Duration,
 }
 
@@ -155,6 +170,25 @@ pub fn survey(rig: &mut Rig, opts: &SurveyOptions, blocked: &[[f32; 2]]) -> Resu
     }
     timings.ocr = t.elapsed();
 
+    let t = Instant::now();
+    let mut objects = Vec::new();
+    if opts.objects {
+        if let Some(detect) = &rig.detect {
+            // Not the look down at the feet: the bot's own body.
+            for (s, (stereo, disp)) in shots.iter().zip(&pairs).filter(|(s, _)| s.pitch > -45.0) {
+                let rgb = s.frame.eye_rgb8(0)?;
+                match detect.detect_rgb(&rgb, s.frame.width, s.frame.height) {
+                    Ok(found) => objects.extend(vrc_players::objects::place(&s.frame, stereo, disp, &found)),
+                    Err(e) => {
+                        eprintln!("detection failed: {e:#}");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    timings.detect = t.elapsed();
+
     // World metres per stereo unit; a floor found nonsense (at or over
     // the eyes) or an eye height not read leaves it 1.
     let metres = match rig.osc.as_ref().map(|o| o.eye_height()) {
@@ -176,7 +210,7 @@ pub fn survey(rig: &mut Rig, opts: &SurveyOptions, blocked: &[[f32; 2]]) -> Resu
     let cparams = CandidateParams { clearance: CLEARANCE_M / metres, min_distance: 0.8 / metres, min_gap: 0.8 / metres, ..Default::default() };
     let candidates = candidates(&map, eye, yaw, &people, &cparams);
     timings.map = t.elapsed();
-    Ok(Survey { shots, pairs, eye, yaw, floor, map, players, candidates, metres, room, timings })
+    Ok(Survey { shots, pairs, eye, yaw, floor, map, players, objects, candidates, metres, room, timings })
 }
 
 impl Survey {
@@ -209,19 +243,139 @@ impl Survey {
 pub struct GotoOptions {
     /// Close enough, world metres.
     pub arrive: f32,
-    /// Longest leg between surveys, world metres.
+    /// Longest leg between surveys, world metres (on the lasting map:
+    /// `map_leg`, as what lies ahead is known better).
     pub leg: f32,
+    pub map_leg: f32,
     pub max_legs: usize,
     pub walk: WalkParams,
     /// [`walk::stops`] when the walk was asked for (a stop since ends it);
     /// `None`: when `goto` starts.
     pub since: Option<u64>,
+    /// The lasting map to walk by and add to.
+    pub map: Option<vrc_map::Shared>,
+    /// How high the target stands over the bot's floor (world metres): up
+    /// the stairs, not under them.
+    pub target_up: Option<f32>,
 }
 
 impl Default for GotoOptions {
     fn default() -> Self {
-        GotoOptions { arrive: 0.6, leg: 1.6, max_legs: 12, walk: WalkParams::default(), since: None }
+        GotoOptions {
+            arrive: 0.6,
+            leg: 1.6,
+            map_leg: 3.0,
+            max_legs: 12,
+            walk: WalkParams::default(),
+            since: None,
+            map: None,
+            target_up: None,
+        }
     }
+}
+
+/// A survey's looks as the lasting map takes them.
+pub fn observations(s: &Survey) -> Vec<Observation> {
+    let at = Instant::now();
+    let people: Vec<[f32; 3]> = s.players.iter().map(|p| p.feet).collect();
+    s.pairs
+        .iter()
+        .map(|(stereo, disp)| {
+            let points: Vec<[f32; 3]> = stereo.points(disp, 2).into_iter().map(|(p, _)| p).collect();
+            Observation::from_tracking(&points, s.eye, s.floor.height, s.metres, &people, at)
+        })
+        .collect()
+}
+
+/// The position beacon of `frame` (the avatar's shader, in the eyes'
+/// corner) onto the lasting map: the feet `eyes_m` (world metres) under the
+/// eyes. Whether it was there.
+pub fn beacon_fix(map: &vrc_map::Shared, frame: &vrc_vr::tap::EyeFrame, eyes_m: f32, at: Instant) -> bool {
+    let Some(left) = vrc_vr::beacon::read(frame, 0) else { return false };
+    let mut p = left.position_bot();
+    if let Some(right) = vrc_vr::beacon::read(frame, 1) {
+        let q = right.position_bot();
+        // Two eyes far apart are not one head: one of them misread.
+        if (p[0] - q[0]).hypot(p[2] - q[2]) > 0.3 {
+            return false;
+        }
+        p = [(p[0] + q[0]) / 2.0, (p[1] + q[1]) / 2.0, (p[2] + q[2]) / 2.0];
+    }
+    let head = frame.views[0].pose.yaw_pitch().0;
+    map.lock().unwrap_or_else(std::sync::PoisonError::into_inner).fix(at, [p[0], p[1] - eyes_m, p[2]], left.yaw, head);
+    true
+}
+
+/// [`beacon_fix`] with the eyes' height over the feet from the frame itself:
+/// `standing_m` (world metres) when the headset stands at `standing_y`
+/// (tracking space), the eyes as high as the frame has them now (sitting,
+/// lying: lower; with the standing height, the feet came out 0.6 m low).
+pub fn beacon_fix_as_is(map: &vrc_map::Shared, frame: &vrc_vr::tap::EyeFrame, standing_m: f32, standing_y: f32, at: Instant) -> bool {
+    let floor = vrc_vr::remote::FLOOR_Y;
+    let eye_y = (frame.views[0].pose.position[1] + frame.views[1].pose.position[1]) / 2.0;
+    let eyes_m = standing_m * (eye_y - floor) / (standing_y - floor).max(0.1);
+    beacon_fix(map, frame, eyes_m, at)
+}
+
+/// Puts a survey on the lasting map (where the bot is first, from the
+/// beacon in its views, if the avatar has one).
+pub fn observe(map: &vrc_map::Shared, s: &Survey) {
+    let eyes_m = (s.eye[1] - s.floor.height) * s.metres;
+    let now = Instant::now();
+    s.shots.iter().any(|shot| beacon_fix(map, &shot.frame, eyes_m, now));
+    for o in observations(s) {
+        map.lock().unwrap_or_else(std::sync::PoisonError::into_inner).observe(&o);
+    }
+    let rels: Vec<_> = s
+        .objects
+        .iter()
+        .map(|o| (o, [(o.at[0] - s.eye[0]) * s.metres, (o.at[1] - s.floor.height) * s.metres, (o.at[2] - s.eye[2]) * s.metres]))
+        .collect();
+    objects_onto(map, &rels, s.metres, now);
+}
+
+/// Things seen go onto the lasting map: each with where it is from the feet
+/// (world metres) as the look was taken `at`; farther than
+/// [`vrc_map::MAX_RANGE`] stereo places them too loosely (a television 8 m
+/// off scattered over 1.5 m).
+pub fn objects_onto(map: &vrc_map::Shared, seen: &[(&ObjectSighting, [f32; 3])], metres: f32, at: Instant) {
+    let mut n = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !n.writable() {
+        return;
+    }
+    for (o, rel) in seen {
+        if rel[0].hypot(rel[2]) > vrc_map::MAX_RANGE {
+            continue;
+        }
+        let p = n.place(*rel, at);
+        n.map.saw_object(&o.label, p, [o.size[0] * metres, o.size[1] * metres], o.score, vrc_map::unix_now());
+    }
+}
+
+/// How the bot walks on the lasting map: its body from its eyes' height
+/// (world metres; Drillis & Contini: the eyes at 0.936 of the stature). The
+/// start's unseen disc is kept to half a metre: pressed to a pane of glass,
+/// a metre of it reached through the glass, and the way went that way.
+pub fn plan_params(eyes_m: f32) -> PlanParams {
+    PlanParams { body: (eyes_m / 0.936).max(0.5), radius: CLEARANCE_M, step: 0.3, drop: 0.8, start_radius: 0.5, ..Default::default() }
+}
+
+/// The lasting map's next leg toward `goal` (map frame): (heading in the
+/// session, metres), or arrived (`Err` with what is left); `None` without
+/// a way on it.
+fn map_leg(map: &vrc_map::Shared, goal: [f32; 3], up: bool, s: &Survey, opts: &GotoOptions) -> Option<Result<(f32, f32), f32>> {
+    let n = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let pose = n.pose;
+    let left = (goal[0] - pose[0]).hypot(goal[2] - pose[2]);
+    if left <= opts.arrive && (!up || (goal[1] - pose[1]).abs() < 0.5) {
+        return Some(Err(left));
+    }
+    // The body: its stature from the eyes (Drillis & Contini: 0.936).
+    let p = plan_params((s.eye[1] - s.floor.height) * s.metres);
+    let mut planner = Planner::new(&n.map, p, pose);
+    let path = planner.plan([goal[0], goal[2]], up.then_some(goal[1]))?;
+    let (heading, d, _) = planner.leg(&path, opts.map_leg)?;
+    Some(Ok((n.session_heading(heading), d)))
 }
 
 /// How a walk to a point went.
@@ -245,6 +399,8 @@ pub struct LegReport {
     pub blocked: bool,
     /// Straight distance left before the leg (world metres).
     pub before: f32,
+    /// Planned on the lasting map (else on the survey's).
+    pub on_map: bool,
 }
 
 /// Walks to `target` (x, z in the tracking space as of `first`, the survey
@@ -258,24 +414,54 @@ pub fn goto(rig: &mut Rig, first: Survey, target: [f32; 2], opts: &GotoOptions) 
     let mut blocked: Vec<[f32; 2]> = Vec::new();
     let mut legs = Vec::new();
     let mut s = first;
-    let survey_opts = SurveyOptions { players: false, ..Default::default() };
+    let survey_opts = SurveyOptions { players: false, objects: false, ..Default::default() };
+    // The target on the lasting map (once the visit is placed on it).
+    let on_map = opts.map.as_ref().and_then(|map| {
+        observe(map, &s);
+        let n = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !n.ready() {
+            return None;
+        }
+        let m = s.metres;
+        let rel = [(target[0] - s.eye[0]) * m, opts.target_up.unwrap_or(0.0), (target[1] - s.eye[2]) * m];
+        Some(n.place(rel, Instant::now()))
+    });
     for _ in 0..opts.max_legs {
         let eye = s.eye;
         let m = s.metres;
-        let left = (target[0] - eye[0]).hypot(target[1] - eye[2]) * m;
-        if left <= opts.arrive {
+        let mut left = (target[0] - eye[0]).hypot(target[1] - eye[2]) * m;
+        let planned_on_map = match (&opts.map, on_map) {
+            (Some(map), Some(goal)) => match map_leg(map, goal, opts.target_up.is_some(), &s, opts) {
+                Some(Err(rest)) => {
+                    return Ok(GotoReport { arrived: true, remaining: rest, legs, took: started.elapsed(), reason: None });
+                }
+                Some(Ok(leg)) => Some(leg),
+                None => None,
+            },
+            _ => None,
+        };
+        if let (Some(map), Some(goal)) = (&opts.map, on_map) {
+            let n = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            left = (goal[0] - n.pose[0]).hypot(goal[2] - n.pose[2]);
+        }
+        if planned_on_map.is_none() && left <= opts.arrive {
             return Ok(GotoReport { arrived: true, remaining: left, legs, took: started.elapsed(), reason: None });
         }
-        let Some((yaw, wp_dist)) = next_waypoint(&s.map, eye, target, CLEARANCE_M / m, opts.leg / m) else {
-            return Ok(GotoReport {
-                arrived: false,
-                remaining: left,
-                legs,
-                took: started.elapsed(),
-                reason: Some("no way there from here".into()),
-            });
+        let (yaw, planned) = match planned_on_map {
+            Some((yaw, d)) => (yaw, d.min(opts.map_leg)),
+            None => {
+                let Some((yaw, wp_dist)) = next_waypoint(&s.map, eye, target, CLEARANCE_M / m, opts.leg / m) else {
+                    return Ok(GotoReport {
+                        arrived: false,
+                        remaining: left,
+                        legs,
+                        took: started.elapsed(),
+                        reason: Some("no way there from here".into()),
+                    });
+                };
+                (yaw, (wp_dist * m).min(opts.leg))
+            }
         };
-        let planned = (wp_dist * m).min(opts.leg);
         if walk::stopped_since(begun) {
             return Ok(GotoReport { arrived: false, remaining: left, legs, took: started.elapsed(), reason: Some("stopped".into()) });
         }
@@ -289,6 +475,11 @@ pub fn goto(rig: &mut Rig, first: Survey, target: [f32; 2], opts: &GotoOptions) 
             *b = [b[0] - dx, b[1] - dz];
         }
         if leg.blocked {
+            // On the lasting map too: that way, there, is shut (not a leg
+            // all but walked: slowing at its end reads as stopped).
+            if let Some(map) = opts.map.as_ref().filter(|_| leg.walked < planned - 0.2) {
+                map.lock().unwrap_or_else(std::sync::PoisonError::into_inner).stopped(yaw, 0.4, MarkKind::Blocked, vrc_map::unix_now());
+            }
             // Something we could not see is just ahead: a wall across the
             // way (a mirror, glass), not a post to walk round.
             for k in -4..=4 {
@@ -296,12 +487,15 @@ pub fn goto(rig: &mut Rig, first: Survey, target: [f32; 2], opts: &GotoOptions) 
                 blocked.push([eye[0] + sy * ahead + cy * across, eye[2] - cy * ahead + sy * across]);
             }
         }
-        legs.push(LegReport { yaw, planned, walked: leg.walked, blocked: leg.blocked, before: left });
+        legs.push(LegReport { yaw, planned, walked: leg.walked, blocked: leg.blocked, before: left, on_map: planned_on_map.is_some() });
         if leg.stopped {
             let remaining = (left - leg.walked).max(0.0);
             return Ok(GotoReport { arrived: false, remaining, legs, took: started.elapsed(), reason: Some("stopped".into()) });
         }
         s = survey(rig, &survey_opts, &blocked)?;
+        if let Some(map) = &opts.map {
+            observe(map, &s);
+        }
     }
     let left = (target[0] - s.eye[0]).hypot(target[1] - s.eye[2]) * s.metres;
     Ok(GotoReport {
@@ -403,6 +597,7 @@ impl Rig {
             Some(url) if !url.is_empty() => Some(OcrClient::new(url, ocr_model)?),
             _ => None,
         };
+        let detect = ocr.as_ref().map(|o| DetectClient::from_ocr(o, vrc_players::objects::DETECT_MODEL));
         if remote.is_empty() {
             bail!("no remote driver address");
         }
@@ -411,6 +606,7 @@ impl Rig {
             tap: EyeTap::open(tap),
             osc,
             ocr,
+            detect,
             whitelist,
             log_dir: PathBuf::from(home).join(vrc_vr::osc::LOG_DIR),
         })

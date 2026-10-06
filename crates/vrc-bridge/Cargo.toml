@@ -22,6 +22,7 @@ tokio.workspace = true
 tokio-tungstenite.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+vrc-map.workspace = true
 vrc-nav.workspace = true
 vrc-players.workspace = true
 vrc-scene.workspace = true

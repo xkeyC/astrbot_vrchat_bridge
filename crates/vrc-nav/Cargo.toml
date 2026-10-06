@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 serde_json.workspace = true
+vrc-map.workspace = true
 vrc-players.workspace = true
 vrc-scene.workspace = true
 vrc-stereo.workspace = true

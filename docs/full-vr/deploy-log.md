@@ -51,6 +51,13 @@
 | 19:01–19:18 | bridge：跟随时身体正对、头看人、找人每 3 圈抬头、楼梯；`vrchat_view` / `around`。插件：先备份插件目录，换成新版，重启 AstrBot | AstrBot 正常运行，插件已加载，bridge 音频流已连上；日志里只有原有的无关报错（`get_dim`） |
 | 待办 | Mon3tr 人格的文字工具白名单里，`vrchat_look_around` 要换回 `vrchat_view` | 未做（需要用户在 WebUI 改或授权） |
 
+## 2026-10-06（持久地图）
+
+| 时间 | 操作 | 结果 |
+|---|---|---|
+| 21:27–21:53 | bridge 换成 `feat/persistent-map` 分支的构建（还没合进 main），多次重新部署；地图存在 bot 配置目录的 `maps/` | 在 SuRroom 实测环视、前进、按地图走回命名点；跟随没有开着（之前用户用语音停掉了） |
+| 21:34、21:47 | 用户上传了带位置角标的化身，两次重启游戏（`/v1/game/start` 带 `restart`，回到原来的私人房间） | 角标两只眼都读得出；第二次重启后 bot 回到出生点 |
+
 ### 当前服务器状态
 
 - VRChat 以 VR 模式运行，`monado-service` 是临时单元（systemd-run）：合成器 30 fps（可通过 `/dev/shm/vrc-fps` 临时调整），每帧都抓（8 槽环形缓冲区），视场 100°。

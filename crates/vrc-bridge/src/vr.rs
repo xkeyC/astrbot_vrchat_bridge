@@ -17,6 +17,18 @@ use vrc_vr::Pose;
 use crate::Args;
 
 pub const STEP_MAX_M: f32 = 5.0;
+/// At a place on the lasting map, the last bit is stepped (forward, back,
+/// aside, still facing the same way) up to SETTLE_TRIES times, the beacon
+/// read before each, until within SETTLE_CLOSE_M (a walk's arrival is
+/// 0.6 m; the user: fine-tune it by stepping); not from farther than
+/// SETTLE_FAR_M. Slowly: SETTLE_AXIS of the stick.
+const SETTLE_TRIES: usize = 3;
+const SETTLE_CLOSE_M: f32 = 0.12;
+const SETTLE_FAR_M: f32 = 1.2;
+const SETTLE_AXIS: f32 = 0.25;
+/// Looks list what the lasting map knows this near, at most this many.
+const KNOWN_WITHIN_M: f32 = 30.0;
+const KNOWN_MAX: usize = 12;
 
 /// The forward stick for a pace: `walk` (about 0.9 m/s) or `run` (about
 /// 1.35 m/s): near the gait cycles' own speeds, so the steps keep their
@@ -48,6 +60,8 @@ pub struct VrCore {
     pub head_height: f32,
     /// The head leaned off where it stands (`lean_head`).
     pub lean: [f32; 3],
+    /// The lasting map: surveys go onto it, walks plan on it.
+    pub map: Option<vrc_nav::vrc_map::Shared>,
 }
 
 impl VrCore {
@@ -64,6 +78,7 @@ impl VrCore {
             pitch: 0.0,
             head_height: vrc_vr::anim::AnimParams::default().head_height,
             lean: [0.0; 3],
+            map: None,
         }
     }
 
@@ -306,9 +321,13 @@ impl VrCore {
     pub fn survey(&mut self, whitelist: &[String], players: bool, around: bool) -> Result<Value> {
         let opts = SurveyOptions { players, ahead: !around, ..Default::default() };
         let s = vrc_nav::survey(self.rig(whitelist)?, &opts, &[])?;
+        if let Some(map) = &self.map {
+            vrc_nav::observe(map, &s);
+        }
         self.serial += 1;
         self.yaw = s.yaw;
-        let v = survey_json(self.serial, &s);
+        let mut v = survey_json(self.serial, &s);
+        v["known"] = self.known(s.yaw);
         self.survey = Some(s);
         Ok(v)
     }
@@ -326,9 +345,29 @@ impl VrCore {
         }
         // A fresh survey to plan from (people move, and so may the bot).
         let s = vrc_nav::survey(self.rig(whitelist)?, &SurveyOptions { players: false, ..Default::default() }, &[])?;
-        let target = if let Some(id) = input["candidate"].as_u64() {
+        // How high the place is over the floor (up the stairs, not under).
+        let mut target_up = None;
+        // A place on the lasting map: stepped onto exactly, and faced as then.
+        let mut settle_to: Option<([f32; 3], Option<f32>)> = None;
+        let target = if let Some(name) = input["to"].as_str().or(input["place"].as_str()) {
+            // A place named or a thing seen on the lasting map: where it is
+            // from here (however far: the walk plans on the map).
+            let map = self.map.as_ref().context("no lasting map")?;
+            let n = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            anyhow::ensure!(n.ready(), "your map works only where your avatar's position beacon is read (none now)");
+            let (_, at, heading) = n.find(name).with_context(|| {
+                let names: Vec<String> = n.landmarks().into_iter().take(12).map(|l| l.0).collect();
+                format!("nothing called {name} on your map; it knows: {}", if names.is_empty() { "nothing yet".into() } else { names.join(", ") })
+            })?;
+            let d = [at[0] - n.pose[0], at[1] - n.pose[1], at[2] - n.pose[2]];
+            let rel = vrc_nav::vrc_map::turn(d, -n.yaw);
+            target_up = Some(rel[1]);
+            settle_to = Some((at, heading));
+            [s.eye[0] + rel[0] / s.metres, s.eye[2] + rel[2] / s.metres]
+        } else if let Some(id) = input["candidate"].as_u64() {
             let seen = self.survey.as_ref().context("no view to pick a place from: look first")?;
             let c = seen.candidates.iter().find(|c| c.id as u64 == id).context("no such place in the last view")?;
+            target_up = Some((c.position[1] - seen.floor.height) * seen.metres);
             [c.position[0], c.position[2]]
         } else {
             let bearing = input["bearing"].as_f64().context("a candidate, or a bearing and a distance")? as f32;
@@ -341,14 +380,22 @@ impl VrCore {
         // Moving: the places' numbers stop holding (here and on failure). A
         // stop since it was asked for ends it before the first leg.
         self.forget_places();
-        let mut opts = GotoOptions { since: Some(since), ..Default::default() };
+        let mut opts = GotoOptions { since: Some(since), map: self.map.clone(), target_up, ..Default::default() };
         if let Some(a) = pace_axis(input["pace"].as_str())? {
             opts.walk.axis = a;
         }
         let report = vrc_nav::goto(self.rig(whitelist)?, s, target, &opts)?;
+        let settled = match (&self.map.clone(), settle_to) {
+            (Some(map), Some((goal, heading))) if report.reason.as_deref() != Some("stopped") => Some(self.settle(map, goal, heading, since)?),
+            _ => None,
+        };
         let around = input["around"].as_bool().unwrap_or(false);
         let after = vrc_nav::survey(self.rig(whitelist)?, &SurveyOptions { ahead: !around, ..Default::default() }, &[])?;
+        if let Some(map) = &self.map {
+            vrc_nav::observe(map, &after);
+        }
         self.serial += 1;
+        let known = self.known(after.yaw);
         self.yaw = after.yaw;
         let mut v = json!({
             "arrived": report.arrived,
@@ -360,9 +407,17 @@ impl VrCore {
                 "planned_m": r2(l.planned),
                 "walked_m": r2(l.walked),
                 "blocked": l.blocked,
+                "on_map": l.on_map,
             })).collect::<Vec<_>>(),
         });
+        if let Some((left, faced)) = settled {
+            // Where it ended, as the beacon has it.
+            v["remaining_m"] = json!(r2(left));
+            v["arrived"] = json!(left <= opts.arrive);
+            v["faced_as_then"] = json!(faced);
+        }
         v["after"] = survey_json(self.serial, &after);
+        v["after"]["known"] = known;
         self.survey = Some(after);
         Ok(v)
     }
@@ -432,6 +487,149 @@ impl VrCore {
         frame
     }
 
+    /// What the detector finds in the latest frame, placed (on the lasting
+    /// map too: map frame, when there is one). With `save`, the frame (left
+    /// eye, JPEG) and the answer go into that directory as
+    /// `<unix ms>.jpg` / `.json`: material to judge the detector by.
+    pub fn detect(&mut self, save: Option<std::path::PathBuf>) -> Result<Value> {
+        let frame = self.frame()?;
+        let rig = self.rig(&[])?;
+        let detect = rig.detect.clone().context("no detection service (it comes with the OCR's)")?;
+        let metres = match rig.osc.as_ref().map(|o| o.eye_height()) {
+            Some(Ok(h)) if h > 0.0 => h as f32 / (self.head_height - vrc_vr::remote::FLOOR_Y),
+            _ => 1.0,
+        };
+        let stereo = vrc_stereo::Stereo::from_frame(&frame, vrc_stereo::match_scale(frame.width)).context("not an 8-bit frame")?;
+        let disp = stereo.disparity(&vrc_stereo::SgmParams::default());
+        let rgb = frame.eye_rgb8(0)?;
+        let t = std::time::Instant::now();
+        let found = detect.detect_rgb(&rgb, frame.width, frame.height)?;
+        let took = t.elapsed();
+        let placed = vrc_players::objects::place(&frame, &stereo, &disp, &found);
+        let eye = [
+            (frame.views[0].pose.position[0] + frame.views[1].pose.position[0]) / 2.0,
+            (frame.views[0].pose.position[1] + frame.views[1].pose.position[1]) / 2.0,
+            (frame.views[0].pose.position[2] + frame.views[1].pose.position[2]) / 2.0,
+        ];
+        let now = std::time::Instant::now();
+        let on_map = |o: &vrc_players::ObjectSighting| {
+            let map = self.map.as_ref()?;
+            let n = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let rel = [(o.at[0] - eye[0]) * metres, (o.at[1] - vrc_vr::remote::FLOOR_Y) * metres, (o.at[2] - eye[2]) * metres];
+            Some(n.place(rel, now).map(|v| (v as f64 * 100.0).round() / 100.0))
+        };
+        let v = json!({
+            "took_ms": took.as_millis() as u64,
+            "model": detect.model,
+            "found": found.iter().map(|d| json!({"label": d.label, "confidence": (d.confidence as f64 * 100.0).round() / 100.0, "bbox": d.bbox.map(|v| v.round())})).collect::<Vec<_>>(),
+            "placed": placed.iter().map(|o| json!({
+                "label": o.label,
+                "distance_m": r2(((o.at[0] - eye[0]).hypot(o.at[2] - eye[2])) * metres),
+                "size_m": o.size.map(|v| r2(v * metres)),
+                "map": on_map(o),
+            })).collect::<Vec<_>>(),
+        });
+        if let Some(dir) = save {
+            std::fs::create_dir_all(&dir)?;
+            let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+            std::fs::write(dir.join(format!("{stamp}.jpg")), eye_jpeg(&frame, 0)?)?;
+            std::fs::write(dir.join(format!("{stamp}.json")), serde_json::to_vec_pretty(&v)?)?;
+        }
+        Ok(v)
+    }
+
+    /// What the position beacon says in the latest frame (both eyes), with
+    /// the head's pose then (tracking space) to compare.
+    pub fn beacon(&mut self) -> Result<Value> {
+        let frame = self.frame()?;
+        let eyes: Vec<Value> = (0..2)
+            .map(|i| match vrc_vr::beacon::read(&frame, i) {
+                Some(b) => json!({
+                    "position": b.position, "yaw": (b.yaw as f64 * 100.0).round() / 100.0,
+                    "pitch": (b.pitch as f64 * 100.0).round() / 100.0, "seq": b.seq,
+                }),
+                None => Value::Null,
+            })
+            .collect();
+        let head = frame.views[0].pose;
+        let (yaw, pitch) = head.yaw_pitch();
+        Ok(json!({
+            "eyes": eyes,
+            "eye_size": [frame.width, frame.height],
+            "head": {"yaw": yaw.round(), "pitch": pitch.round(), "left_eye": frame.views[0].pose.position, "right_eye": frame.views[1].pose.position},
+        }))
+    }
+
+    /// Steps onto `goal` (map frame) from close by: forward, back or aside,
+    /// still facing the same way, a few times, the beacon read before each;
+    /// then faces `heading` (map), if given. What is left (metres), and
+    /// whether it turned to the heading.
+    fn settle(&mut self, map: &vrc_nav::vrc_map::Shared, goal: [f32; 3], heading: Option<f32>, since: u64) -> Result<(f32, bool)> {
+        let standing_m = match self.rig(&[])?.osc.as_ref().map(|o| o.eye_height()) {
+            Some(Ok(h)) if h > 0.0 => h as f32,
+            _ => return Ok((f32::NAN, false)),
+        };
+        let mut left = f32::NAN;
+        for k in 0..=SETTLE_TRIES {
+            // Where the bot is now: the beacon in the latest frame.
+            let frame = self.frame()?;
+            vrc_nav::beacon_fix_as_is(map, &frame, standing_m, self.head_height, std::time::Instant::now());
+            let (d, way) = {
+                let n = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !n.ready() {
+                    break;
+                }
+                let (dx, dz) = (goal[0] - n.pose[0], goal[2] - n.pose[2]);
+                (dx.hypot(dz), n.session_heading(dx.atan2(-dz).to_degrees()))
+            };
+            left = d;
+            if k == SETTLE_TRIES || d <= SETTLE_CLOSE_M || d > SETTLE_FAR_M || walk::stopped_since(since) {
+                break;
+            }
+            let facing = self.yaw;
+            let rig = self.rig(&[])?;
+            let osc = Osc::with_ports_from(rig.osc.as_ref().context("walking needs VRChat's OSC")?)?;
+            let params = WalkParams { axis: SETTLE_AXIS, ..Default::default() };
+            walk::leg_facing(&mut rig.hmd, &osc, facing, scan::angle_diff(way, facing), d, &params, since)?;
+        }
+        let faced = match heading {
+            Some(h) if !walk::stopped_since(since) => {
+                let h = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner).session_heading(h);
+                self.face(h, 0.0)?;
+                true
+            }
+            _ => false,
+        };
+        Ok((left, faced))
+    }
+
+    /// What the lasting map knows round here (places named, things seen),
+    /// nearest first, from where the bot faces (`yaw`, session).
+    pub fn known(&self, yaw: f32) -> Value {
+        let Some(map) = &self.map else { return json!([]) };
+        let n = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !n.ready() {
+            return json!([]);
+        }
+        let p = n.pose;
+        n.landmarks()
+            .into_iter()
+            .filter(|l| (l.2[0] - p[0]).hypot(l.2[2] - p[2]) <= KNOWN_WITHIN_M)
+            .take(KNOWN_MAX)
+            .map(|(name, kind, at)| {
+                let (dx, dz) = (at[0] - p[0], at[2] - p[2]);
+                let heading = n.session_heading(dx.atan2(-dz).to_degrees());
+                json!({
+                    "name": name,
+                    "kind": kind,
+                    "distance_m": r2(dx.hypot(dz)),
+                    "bearing_deg": scan::angle_diff(heading, yaw).round(),
+                    "up_m": r2(at[1] - p[1]),
+                })
+            })
+            .collect()
+    }
+
     /// The latest frame of the eyes.
     pub fn frame(&mut self) -> Result<EyeFrame> {
         let rig = self.rig(&[])?;
@@ -494,10 +692,19 @@ pub fn survey_json(serial: u64, s: &Survey) -> Value {
             "ocr": p.text,
         })).collect::<Vec<_>>(),
         "room": s.room,
+        // Things found (each view's: one thing seen in two is listed twice).
+        "objects": s.objects.iter().map(|o| {
+            let (dx, dz) = (o.at[0] - s.eye[0], o.at[2] - s.eye[2]);
+            json!({
+                "label": o.label,
+                "distance_m": r2(dx.hypot(dz) * s.metres),
+                "bearing_deg": vrc_vr::scan::angle_diff(dx.atan2(-dz).to_degrees(), s.yaw).round(),
+            })
+        }).collect::<Vec<_>>(),
         "metres_per_unit": s.metres,
         "timings_ms": {
             "scan": ms(s.timings.scan), "stereo": ms(s.timings.stereo),
-            "ocr": ms(s.timings.ocr), "map": ms(s.timings.map),
+            "ocr": ms(s.timings.ocr), "detect": ms(s.timings.detect), "map": ms(s.timings.map),
         },
     })
 }

@@ -1,0 +1,9 @@
+[package]
+name = "vrc-map"
+version = "0.1.0"
+description = "The bot's lasting map of a world: what stereo saw, fused as it walks (several floors, stairs), and what walking taught (ways walked, ways that looked open but were not), with the odometry it is placed by"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

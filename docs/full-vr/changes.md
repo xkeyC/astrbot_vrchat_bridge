@@ -40,6 +40,11 @@
 | `tools/motion/` | 动作片段的离线生成：`fetch.py`（下载源）、`library.py`（片段表）、`retarget.py`、`postures.py`、`keyframes.py`、`poses/` |
 | `tools/agent-vr/` | 操作 VR 菜单、校准和冷重启测试的脚本 |
 | `astrbot_plugin/` | `vrchat_emote` 换成 `vrchat_motion`、`vrchat_posture`；走路工具加 `pace`（walk / run）；`vrchat_look_around` 改回 `vrchat_view`（默认环顾四周，`around: false` 只看前方；提示词要求每次移动前先看一圈），`vrchat_walk_to` 走完默认只返回前方画面，`vrchat_step` 转身或走了之后也返回前方画面；转身和方向改成文字参数，返回的方位写成左右；提示词补上探索、上楼梯、坐座位和“不说只做”的规则 |
+| `crates/vrc-map` | 持久地图（D31）：体素柱和多层表面、经验层（走过、被挡、跳失败的标记）、物体和命名地点、只估平移的配准、多层 A*、按世界存盘、再次进房时的定位、位置角标的世界坐标系 |
+| `crates/vrc-vr` 的 `beacon` | 读化身位置角标（avatar-position-beacon.md） |
+| `crates/vrc-players` 的 `objects` | infra 的 YOLO 检测（`/v1/detect/objects`）和用双目定位；OCR 和检测共用 HTTP 请求代码（`ocr::post`） |
+| `crates/vrc-nav` | `goto` 在持久地图上规划（`GotoOptions::map`、`target_up`），环视写进地图，被挡的一段在地图上记标记 |
+| `crates/vrc-bridge` 的 `mapping` | 里程线程（OSCQuery 速度）、建图线程、按世界存取（配置目录下 `maps/`）；`/v1/map`、`/v1/map.png`、`/v1/map/save`、`/v1/map/forget`、`/v1/map/place`、`/v1/vr/beacon`、`/v1/vr/detect`；`/v1/vr/goto` 可传 `place`（地图上的命名地点） |
 | `docs/full-vr/` | 本文档集 |
 
 ## 其他项目

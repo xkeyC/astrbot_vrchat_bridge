@@ -15,6 +15,7 @@ use vrc_vr::osc::{Arg, Osc};
 use crate::anim::Anim;
 use crate::follow::Follower;
 use crate::game::{self, GameState, LogTail};
+use crate::mapping::Mapping;
 use crate::sightings::Sightings;
 use crate::social::Social;
 use crate::vr::VrCore;
@@ -65,6 +66,8 @@ pub struct Bridge {
     pub vr: Arc<Mutex<VrCore>>,
     pub follower: Arc<Follower>,
     pub sightings: Arc<Sightings>,
+    /// The lasting map of the world the bot is in.
+    pub mapping: Arc<Mapping>,
     pub anim: Arc<Anim>,
     /// The async runtime: tasks started from plain threads (the animation's,
     /// a calibration's) go to it.
@@ -97,8 +100,10 @@ impl Bridge {
         let social = Arc::new(Social::new(config_dir.join("social.json"), config_dir.join("cookies.json")));
         let anim = Arc::new(Anim::new(config_dir.join("anim.json")));
         let motions = Arc::new(crate::motion::Library::new(config_dir.join("motions")));
+        let mapping = Mapping::new(config_dir.join("maps"));
         let mut core = VrCore::new(&args);
         core.head_height = anim.params().head_height;
+        core.map = Some(mapping.nav.clone());
         let vr = Arc::new(Mutex::new(core));
         let bridge = Arc::new(Bridge {
             token,
@@ -114,6 +119,7 @@ impl Bridge {
             vr,
             follower: Arc::new(Follower::default()),
             sightings: Arc::new(Sightings::default()),
+            mapping,
             anim,
             rt: tokio::runtime::Handle::current(),
             motions,

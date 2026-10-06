@@ -16,6 +16,7 @@
 //! See `docs/full-vr/` for how the pieces fit and why.
 
 pub mod anim;
+pub mod beacon;
 pub mod fps;
 pub mod motion;
 pub mod osc;

@@ -121,6 +121,17 @@ const STEP_OFF_M: f32 = 0.06;
 const STEP_S: f32 = 0.2;
 const STEP_LIFT_M: f32 = 0.05;
 const STEP_MAX_DEG: f32 = 60.0;
+/// Far behind the body (more than FAR_DEG to turn yet), the steps are
+/// quicker and bigger.
+const FAR_DEG: f32 = 90.0;
+const STEP_FAR_S: f32 = 0.15;
+const STEP_FAR_MAX_DEG: f32 = 75.0;
+/// The hips lead the feet by at most this much (degrees): the body turns
+/// at once (a turn round on the spot, a new way round by the map), the feet
+/// take a step at a time; hips that turned with the body left the feet on
+/// the wrong sides of them, the legs crossed and twisted (user: "有时候 ai
+/// 会以奇怪的姿势扭曲脚"). The rest of a quick turn is the upper body's.
+const HIPS_AHEAD_FEET_DEG: f32 = 45.0;
 /// A foot on the ground pivots (turns where it stands) to stay within this
 /// of where the hips face (degrees): the body turns with the head, the feet
 /// twist and step after it. Turning its toes in toward the other foot, less
@@ -144,8 +155,8 @@ struct Feet {
     /// Where each foot stands (left, right), once known.
     planted: [Option<vrc_vr::Pose>; 2],
     /// The foot stepping now: which, from, to, the turn it makes round the
-    /// centre (degrees), how far through (0..1).
-    step: Option<(usize, vrc_vr::Pose, vrc_vr::Pose, f32, f32)>,
+    /// centre (degrees), how far through (0..1), how long it takes.
+    step: Option<(usize, vrc_vr::Pose, vrc_vr::Pose, f32, f32, f32)>,
     /// Where the hips face (degrees), close behind the body.
     hips: Option<f32>,
 }
@@ -179,8 +190,8 @@ impl Feet {
             }
         }
         let mut now = [self.planted[0].unwrap(), self.planted[1].unwrap()];
-        if let Some((i, from, to, turn, t)) = self.step.as_mut() {
-            *t = (*t + dt / STEP_S).min(1.0);
+        if let Some((i, from, to, turn, t, secs)) = self.step.as_mut() {
+            *t = (*t + dt / *secs).min(1.0);
             let w = ease(*t);
             // Round the centre, then the rest of the way straight.
             let swung = round(from.position, centre, *turn * w);
@@ -212,7 +223,9 @@ impl Feet {
             let i = if need(1 - lead) > 1.5 * need(lead) { 1 - lead } else { lead };
             let (turn, dist) = off(i);
             if turn.abs() > STEP_TURN_DEG || dist > STEP_OFF_M {
-                let k = (STEP_MAX_DEG / turn.abs().max(1e-3)).min(1.0);
+                let far = turn.abs() > FAR_DEG;
+                let most = if far { STEP_FAR_MAX_DEG } else { STEP_MAX_DEG };
+                let k = (most / turn.abs().max(1e-3)).min(1.0);
                 let from = now[i];
                 let swing = turn * k;
                 let mut to = if k >= 1.0 {
@@ -231,7 +244,7 @@ impl Feet {
                     to.position[0] = other[0] + (to.position[0] - other[0]) * s;
                     to.position[2] = other[2] + (to.position[2] - other[2]) * s;
                 }
-                self.step = Some((i, from, to, swing, 0.0));
+                self.step = Some((i, from, to, swing, 0.0, if far { STEP_FAR_S } else { STEP_S }));
             }
         }
         // The hips with the body (a little behind it at most); a foot on the
@@ -243,6 +256,16 @@ impl Feet {
             }
             None => Some(body_yaw),
         };
+        // Not further round than the feet allow: the way they stand, from
+        // where they are (left to right is the stance's right), not how they
+        // point (a planted foot pivots where it stands: by its pointing the
+        // hips went round past it and the feet stood in a line across them).
+        let (l, r) = (now[0].position, now[1].position);
+        let feet_yaw = (r[2] - l[2]).atan2(r[0] - l[0]).to_degrees();
+        let lead = turn_between(feet_yaw, self.hips.unwrap());
+        if lead.abs() > HIPS_AHEAD_FEET_DEG {
+            self.hips = Some(feet_yaw + lead.clamp(-HIPS_AHEAD_FEET_DEG, HIPS_AHEAD_FEET_DEG));
+        }
         let hips = self.hips.unwrap();
         let stepping = self.step.as_ref().map(|s| s.0);
         for i in 0..2 {
@@ -719,6 +742,63 @@ impl Anim {
             };
             if let Err(e) = sent {
                 tracing::debug!("animation: {e:#}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod feet_tests {
+    use super::*;
+
+    /// The feet where the body would stand them, facing `yaw` (0.2 m apart).
+    fn wanted(yaw: f32) -> [vrc_vr::Pose; 2] {
+        let f = vrc_vr::Pose::looking(yaw, 0.0, [0.0; 3]);
+        let r = f.rotate([1.0, 0.0, 0.0]);
+        [-0.1f32, 0.1].map(|side| vrc_vr::Pose::looking(yaw, 0.0, [r[0] * side, 0.0, r[2] * side]))
+    }
+
+    /// Where the left foot is from the right, across the hips (+: to the
+    /// left of it, as it should be).
+    fn apart_across(feet: &[vrc_vr::Pose; 2], hips: f32) -> f32 {
+        let r = vrc_vr::Pose::looking(hips, 0.0, [0.0; 3]).rotate([1.0, 0.0, 0.0]);
+        let d = [feet[1].position[0] - feet[0].position[0], feet[1].position[2] - feet[0].position[2]];
+        d[0] * r[0] + d[1] * r[2]
+    }
+
+    #[test]
+    fn a_turn_round_at_once_never_crosses_the_legs() {
+        for turn in [180.0f32, -170.0, 120.0, -90.0] {
+            let mut feet = Feet::default();
+            let centre = [0.0, 1.5, 0.0];
+            let dt = 0.04;
+            for _ in 0..10 {
+                feet.update(wanted(0.0), centre, 0.0, dt);
+            }
+            let mut last = None;
+            let mut done = None;
+            for k in 0..100 {
+                let (now, hips) = feet.update(wanted(turn), centre, turn, dt);
+                let across = apart_across(&now, hips);
+                assert!(across > 0.05, "turn {turn}, tick {k}: the legs cross ({across:.3} m, hips {hips:.0})");
+                for f in &now {
+                    let twist = turn_between(hips, yaw_of(f)).abs();
+                    assert!(twist <= PIVOT_DEG + HIPS_AHEAD_FEET_DEG + 1.0, "turn {turn}, tick {k}: a foot {twist:.0} deg off the hips");
+                }
+                if done.is_none() && turn_between(hips, turn).abs() < 2.0 && now.iter().all(|f| turn_between(yaw_of(f), turn).abs() < STEP_TURN_DEG + 1.0) {
+                    done = Some(k as f32 * dt);
+                }
+                last = Some((now, hips));
+            }
+            // About a second for a turn round (six steps).
+            let took = done.expect("round in the end");
+            assert!(took <= 1.6, "turn {turn}: {took:.2} s");
+            eprintln!("turn {turn}: round in {took:.2} s");
+            // Round in the end: the hips and both feet facing the new way.
+            let (now, hips) = last.unwrap();
+            assert!(turn_between(hips, turn).abs() < 2.0, "turn {turn}: hips at {hips}");
+            for f in &now {
+                assert!(turn_between(yaw_of(f), turn).abs() < STEP_TURN_DEG + 1.0, "turn {turn}: a foot at {}", yaw_of(f));
             }
         }
     }
