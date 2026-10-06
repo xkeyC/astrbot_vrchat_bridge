@@ -44,6 +44,8 @@ pub const EYE_HEIGHT: f32 = 1.93;
 /// height calibration put it for this avatar (stereo: -0.31..-0.32 with the
 /// head at 1.45-1.6 m; D23). Eyes to floor = head height - FLOOR_Y.
 pub const FLOOR_Y: f32 = -0.32;
+/// How far back of rest the hands go while the bot looks about (metres).
+pub const HANDS_BACK_M: f32 = 0.08;
 /// One eye as the driver reports it: its field of view, and its pose
 /// relative to the head.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -110,6 +112,19 @@ impl State {
         let p = AnimParams::default();
         for (hand, side) in [(&mut self.left, -1.0f32), (&mut self.right, 1.0)] {
             let pose = anim::hand_pose(&p, head, body_yaw_deg, side, [0.0; 3], [0.0, 0.0, 0.0, 1.0]);
+            *hand = anim::hand(&p, pose, p.curl);
+        }
+    }
+
+    /// Both hands at rest a little further back than at rest (looking about
+    /// for someone: out of the lower edge of the view), the body facing
+    /// `body_yaw_deg`.
+    pub fn hands_back_a_little(&mut self, head: [f32; 3], body_yaw_deg: f32) {
+        self.body_yaw = body_yaw_deg;
+        let p = AnimParams::default();
+        for (hand, side) in [(&mut self.left, -1.0f32), (&mut self.right, 1.0)] {
+            // Body frame: right, up, back (metres).
+            let pose = anim::hand_pose(&p, head, body_yaw_deg, side, [0.0, 0.0, HANDS_BACK_M], [0.0, 0.0, 0.0, 1.0]);
             *hand = anim::hand(&p, pose, p.curl);
         }
     }
@@ -196,6 +211,8 @@ pub struct Overlay {
     pub right: Controller,
     pub rest: [Controller; 2],
     pub head: HeadOffset,
+    /// The whole head instead of the owner's (a motion clip moves it).
+    pub head_pose: Option<Pose>,
 }
 
 /// A small motion of the head on top of where the owner points it: turned
@@ -227,7 +244,10 @@ impl Link {
             (Some(o), false) => {
                 s.left = o.left;
                 s.right = o.right;
-                s.head = o.head.apply(s.head);
+                s.head = match o.head_pose {
+                    Some(head) => head,
+                    None => o.head.apply(s.head),
+                };
             }
             (Some(o), true) => [s.left, s.right] = o.rest,
             (None, _) => {}

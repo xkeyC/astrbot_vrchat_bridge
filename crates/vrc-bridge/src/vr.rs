@@ -17,6 +17,18 @@ use vrc_vr::Pose;
 use crate::Args;
 
 pub const STEP_MAX_M: f32 = 5.0;
+
+/// The forward stick for a pace: `walk` (about 0.9 m/s) or `run` (about
+/// 1.35 m/s): near the gait cycles' own speeds, so the steps keep their
+/// natural rate; none: the walks' default.
+pub fn pace_axis(pace: Option<&str>) -> Result<Option<f32>> {
+    Ok(match pace {
+        None => None,
+        Some("walk") => Some(0.3),
+        Some("run") => Some(0.4),
+        Some(p) => bail!("pace is walk or run, not {p}"),
+    })
+}
 pub use vrc_vr::anim::{MAX_HEAD_HEIGHT, MIN_HEAD_HEIGHT};
 
 pub struct VrCore {
@@ -112,8 +124,47 @@ impl VrCore {
         Ok(())
     }
 
+    /// Turns the whole bot round to `yaw` (degrees) gently, in `secs`: head
+    /// and body together, eased in and out, the head tilting `tilt` degrees
+    /// aside on the way and level again at the end (a look about for
+    /// someone), and raising it `nod` degrees on the way (and down again);
+    /// the hands a little back of rest (out of the view). The feet step after the body (the
+    /// animation's).
+    pub fn turn_gently(&mut self, yaw: f32, pitch: f32, secs: f32, tilt: f32, nod: f32) -> Result<()> {
+        let (y0, p0) = (self.yaw, self.pitch);
+        let d = vrc_vr::scan::angle_diff(yaw, y0);
+        let steps = (secs.max(0.1) / 0.022).ceil() as usize;
+        for i in 1..=steps {
+            let w = i as f32 / steps as f32;
+            let e = w * w * (3.0 - 2.0 * w);
+            let (y, p) = (y0 + d * e, p0 + (pitch - p0) * e);
+            let bump = (std::f32::consts::PI * w).sin();
+            let roll = tilt * bump;
+            let p = p + nod * bump;
+            let rig = self.rig(&[])?;
+            let at = rig.hmd.state.head.position;
+            rig.hmd.state.hands_back_a_little(at, y);
+            let look = Pose::looking(y, p, at);
+            let tilted = vrc_vr::pose::quat_mul(look.orientation, vrc_vr::pose::quat_axis([0.0, 0.0, 1.0], -roll.to_radians()));
+            rig.hmd.set_head(Pose { orientation: tilted, position: at })?;
+            std::thread::sleep(Duration::from_millis(22));
+        }
+        self.yaw = (yaw + 540.0).rem_euclid(360.0) - 180.0;
+        self.pitch = pitch;
+        Ok(())
+    }
+
     /// Turns the whole bot: the head (degrees; pitch clamped to +-80) and
     /// the body under it (the hands at its sides).
+    /// The body facing `body_yaw` (the hands at its sides, the feet
+    /// stepping after it), the head looking along `yaw`, `pitch` (degrees).
+    pub fn face_and_look(&mut self, body_yaw: f32, yaw: f32, pitch: f32) -> Result<()> {
+        let rig = self.rig(&[])?;
+        let head = rig.hmd.state.head.position;
+        rig.hmd.state.hands_at_rest(head, body_yaw);
+        self.aim(yaw, pitch)
+    }
+
     pub fn face(&mut self, yaw: f32, pitch: f32) -> Result<()> {
         let rig = self.rig(&[])?;
         let head = rig.hmd.state.head.position;
@@ -251,8 +302,9 @@ impl VrCore {
 
     // -- surveys and walks --------------------------------------------------------
 
-    pub fn survey(&mut self, whitelist: &[String], players: bool) -> Result<Value> {
-        let opts = SurveyOptions { players, ..Default::default() };
+    /// Looks: all around (`around`), else only ahead (and down at the feet).
+    pub fn survey(&mut self, whitelist: &[String], players: bool, around: bool) -> Result<Value> {
+        let opts = SurveyOptions { players, ahead: !around, ..Default::default() };
         let s = vrc_nav::survey(self.rig(whitelist)?, &opts, &[])?;
         self.serial += 1;
         self.yaw = s.yaw;
@@ -262,20 +314,21 @@ impl VrCore {
     }
 
     /// Walks to a place of the last look around or a bearing; `since`: the
-    /// stops when it was asked for ([`walk::stops`]).
+    /// stops when it was asked for ([`walk::stops`]). Then looks ahead (all
+    /// around with `around`).
     pub fn goto(&mut self, whitelist: &[String], input: &Value, since: u64) -> Result<Value> {
         // A place number of a look around the caller did not see (another
         // caller looked since) would lead elsewhere.
         if input["candidate"].is_u64() {
             if let Some(seen) = input["survey"].as_u64() {
-                anyhow::ensure!(seen == self.serial, "the numbered places no longer hold (you moved, or looked around again since): look around again");
+                anyhow::ensure!(seen == self.serial, "the numbered places no longer hold (you moved, or looked again since): look again");
             }
         }
         // A fresh survey to plan from (people move, and so may the bot).
         let s = vrc_nav::survey(self.rig(whitelist)?, &SurveyOptions { players: false, ..Default::default() }, &[])?;
         let target = if let Some(id) = input["candidate"].as_u64() {
-            let seen = self.survey.as_ref().context("no survey to pick a candidate from: look around first")?;
-            let c = seen.candidates.iter().find(|c| c.id as u64 == id).context("no such place in the last look around")?;
+            let seen = self.survey.as_ref().context("no view to pick a place from: look first")?;
+            let c = seen.candidates.iter().find(|c| c.id as u64 == id).context("no such place in the last view")?;
             [c.position[0], c.position[2]]
         } else {
             let bearing = input["bearing"].as_f64().context("a candidate, or a bearing and a distance")? as f32;
@@ -288,8 +341,13 @@ impl VrCore {
         // Moving: the places' numbers stop holding (here and on failure). A
         // stop since it was asked for ends it before the first leg.
         self.forget_places();
-        let report = vrc_nav::goto(self.rig(whitelist)?, s, target, &GotoOptions { since: Some(since), ..Default::default() })?;
-        let after = vrc_nav::survey(self.rig(whitelist)?, &SurveyOptions::default(), &[])?;
+        let mut opts = GotoOptions { since: Some(since), ..Default::default() };
+        if let Some(a) = pace_axis(input["pace"].as_str())? {
+            opts.walk.axis = a;
+        }
+        let report = vrc_nav::goto(self.rig(whitelist)?, s, target, &opts)?;
+        let around = input["around"].as_bool().unwrap_or(false);
+        let after = vrc_nav::survey(self.rig(whitelist)?, &SurveyOptions { ahead: !around, ..Default::default() }, &[])?;
         self.serial += 1;
         self.yaw = after.yaw;
         let mut v = json!({
@@ -324,7 +382,7 @@ impl VrCore {
     /// to the way walked), jumping as it starts if asked. `since`: the
     /// stops when it was asked for ([`walk::stops`]).
     #[allow(clippy::too_many_arguments)]
-    pub fn step(&mut self, osc_jump: impl Fn(), turn: f32, direction: &str, meters: f32, jump: bool, since: u64) -> Result<Value> {
+    pub fn step(&mut self, osc_jump: impl Fn(), turn: f32, direction: &str, meters: f32, jump: bool, since: u64, axis: Option<f32>) -> Result<Value> {
         let offset = match direction {
             "forward" => 0.0,
             "back" => 180.0,
@@ -346,7 +404,11 @@ impl VrCore {
         let rig = self.rig(&[])?;
         let osc = rig.osc.as_ref().context("walking needs VRChat's OSC")?;
         let osc = Osc::with_ports_from(osc)?;
-        let leg = walk::leg_since(&mut rig.hmd, &osc, way, meters.min(STEP_MAX_M), &WalkParams::default(), since);
+        let mut params = WalkParams::default();
+        if let Some(a) = axis {
+            params.axis = a;
+        }
+        let leg = walk::leg_since(&mut rig.hmd, &osc, way, meters.min(STEP_MAX_M), &params, since);
         self.forget_places();
         let leg = leg?;
         self.yaw = (way + 540.0).rem_euclid(360.0) - 180.0;
@@ -440,19 +502,23 @@ pub fn survey_json(serial: u64, s: &Survey) -> Value {
     })
 }
 
-/// The latest survey's panorama as JPEG, cropped to the rows some frame saw.
+/// The latest survey's panorama as JPEG, cropped to the rows and columns
+/// some frame saw (a look ahead: that one view).
 pub fn pano_jpeg(s: &Survey) -> Result<Vec<u8>> {
     let p = s.marked_panorama(2048);
-    let seen = |r: usize| p.rgb[r * p.width * 3..(r + 1) * p.width * 3].iter().any(|&b| b != 0);
-    let first = (0..p.height).find(|&r| seen(r)).unwrap_or(0);
-    let last = (0..p.height).rev().find(|&r| seen(r)).unwrap_or(p.height - 1);
+    let px = |r: usize, c: usize| &p.rgb[(r * p.width + c) * 3..(r * p.width + c + 1) * 3];
+    let row_seen = |r: usize| (0..p.width).any(|c| px(r, c).iter().any(|&b| b != 0));
+    let col_seen = |c: usize| (0..p.height).any(|r| px(r, c).iter().any(|&b| b != 0));
+    let first = (0..p.height).find(|&r| row_seen(r)).unwrap_or(0);
+    let last = (0..p.height).rev().find(|&r| row_seen(r)).unwrap_or(p.height - 1);
+    let left = (0..p.width).find(|&c| col_seen(c)).unwrap_or(0);
+    let right = (0..p.width).rev().find(|&c| col_seen(c)).unwrap_or(p.width - 1);
+    let mut rgb = Vec::with_capacity((last + 1 - first) * (right + 1 - left) * 3);
+    for r in first..=last {
+        rgb.extend_from_slice(&p.rgb[(r * p.width + left) * 3..(r * p.width + right + 1) * 3]);
+    }
     let mut jpeg = Vec::new();
-    jpeg_encoder::Encoder::new(&mut jpeg, 85).encode(
-        &p.rgb[first * p.width * 3..(last + 1) * p.width * 3],
-        p.width as u16,
-        (last + 1 - first) as u16,
-        jpeg_encoder::ColorType::Rgb,
-    )?;
+    jpeg_encoder::Encoder::new(&mut jpeg, 85).encode(&rgb, (right + 1 - left) as u16, (last + 1 - first) as u16, jpeg_encoder::ColorType::Rgb)?;
     Ok(jpeg)
 }
 

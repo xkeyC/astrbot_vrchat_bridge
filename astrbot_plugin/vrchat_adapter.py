@@ -132,7 +132,38 @@ CONFIG_METADATA = {
     },
 }
 
-EMOTES = ("wave", "clap", "point", "cheer", "dance", "backflip", "sadness", "die")
+# Full body motions (the bridge's motions/, made by tools/motion): what the
+# model may ask for by name.
+MOTIONS = ("wave", "bye", "byebye", "nod", "shake_head", "refuse", "think", "look_around", "turn",
+           "backflip", "dance", "dance_short", "chicken_dance", "idle_talk", "fold_arms")
+POSTURES = ("stand", "sit", "lie")
+LYING_WAYS = ("back", "left", "right", "front")
+
+
+def motion_body(a: dict) -> dict:
+    """/v1/motion's body for a motion asked for by name: once, a few times
+    or a while (loops), the other hand."""
+    name = str(a.get("name"))
+    if name not in MOTIONS:
+        raise ValueError(f"name is one of {', '.join(MOTIONS)}")
+    step = {"clip": name, "mirror": bool(a.get("other_hand", False))}
+    if a.get("seconds"):
+        step["seconds"] = max(1.0, min(float(a["seconds"]), 60.0))
+    times = max(1, min(int(a.get("times") or 1), 5))
+    return {"steps": [step] * times}
+
+
+def posture_body(a: dict) -> dict:
+    posture = str(a.get("posture"))
+    if posture not in POSTURES:
+        raise ValueError(f"posture is one of {', '.join(POSTURES)}")
+    body = {"posture": posture}
+    if posture == "lie":
+        way = str(a.get("way") or "back")
+        if way not in LYING_WAYS:
+            raise ValueError(f"way is one of {', '.join(LYING_WAYS)}")
+        body["way"] = way
+    return body
 # Pictures for the models are this wide (px).
 LOOK_WIDTH = 960
 # Changes to a running follow (bridge POST /v1/follow {"adjust"}).
@@ -228,23 +259,33 @@ def room_context(state: dict) -> str:
     return f"({text})"
 
 
-VR_LOOK_DESCRIPTION = (
-    "Looks all around (about 2 s) and shows you two pictures with the same numbered places: "
-    "a panorama (its middle is where you face, its edges behind you) and a top-down map (you "
-    "in the middle facing up; green floor, red obstacles, dark unknown). Players are found by "
-    "their name tags; whitelisted friends are marked.")
+VR_VIEW_DESCRIPTION = (
+    "Shows your view ahead with numbered places (players found by their name tags, whitelisted "
+    "friends marked; places to walk to, edges of what you have seen, raised tops to jump onto), "
+    "each with distance and bearing. With around: turns all the way round (a few seconds, everyone "
+    "sees you look about) and shows a panorama (its middle is where you face, its edges behind "
+    "you) and a top-down map (you in the middle facing up; green floor, red obstacles, dark "
+    "unknown). Use around rarely: only when what you look for is not ahead and you do not know "
+    "which way it is; else the view ahead, or turn first (vrchat_step) and look ahead.")
+VR_VIEW_PARAMS = {
+    "around": {"type": "boolean", "description": "Look all around (slow; use rarely). Default: only ahead."},
+    "players": {"type": "boolean",
+                "description": "Read name tags to find players (default true; false is a little faster)."},
+}
 VR_WALK_DESCRIPTION = (
-    "Walks to a numbered place of your last look around (it plans a path around obstacles, "
-    "walks in short legs and looks again after each), or a distance at a bearing. Then shows "
-    "you the new look around.")
+    "Walks to a numbered place of your last view (it plans a path around obstacles, walks in "
+    "short legs and looks again after each), or a distance at a bearing. Then shows you the "
+    "view ahead (all around with around: use that rarely).")
 VR_WALK_PARAMS = {
-    "place": {"type": "integer", "description": "The place's number in your last look around."},
+    "place": {"type": "integer", "description": "The place's number in your last view."},
     "bearing": {"type": "number",
                 "description": "Instead of a place: degrees from where you face (+ right, 180 behind)."},
     "distance": {"type": "number", "description": "With bearing: metres to walk (default 2)."},
+    "pace": {"type": "string", "enum": ["walk", "run"], "description": "Walk (default) or run there."},
+    "around": {"type": "boolean", "description": "Look all around when there (slow; use rarely). Default: only ahead."},
 }
 # Replaces the last paragraph of ROOM_PROMPT when the voice model has the room's tools.
-ROOM_TOOLS_PROMPT = ("When you are addressed, answer briefly in the speaker's language, like a person in the room: spoken to in Chinese, say everything in Chinese, though your tools answer in English. Quick actions you do yourself with your tools, without delegating: gestures (vrchat_emote), a jump, a few steps or a turn (vrchat_step), stopping, writing in the chatbox, who is here, following someone in this room ('follow me', 'come with me') until told to stop, and while following: closer, farther, stay put ('wait here', 'don't move'), follow again. For a quick action call its tool at once, without weighing options, then say a few words. To see where you are, vrchat_look_around: a panorama and a top-down map with numbered places (players by name, places to walk to, edges of what you have seen to look further from, raised tops to jump onto); its text lists them with distance and bearing (+ right of where you face). To get somewhere, vrchat_walk_to the number nearest your goal, then look at the new pictures it shows, and again until you are there (within about 1.5 m); with someone to find, walk to their number. When what you look for is not among the places, walk to an edge toward where it may be and look again. To recall when you last saw a friend, vrchat_last_seen. Told you stand on tiptoe or crouch, or to be taller or shorter, vrchat_height; your view or body stuck or wrong, vrchat_vr_reset. A mirror shows a reflection: places that seem to lie inside or behind a mirror are not real. Never walk into a portal (a frame showing another world). In a series of moves write nothing between them, just the next call; speak once, when you are there or stuck. Any text you write is spoken aloud: never write thoughts, plans or notes (not even in brackets). Do not describe what you see unless asked. Delegate real tasks (anything needing facts, lookups or work), and tell the speaker the result briefly.")
+ROOM_TOOLS_PROMPT = ("When you are addressed, answer briefly in the speaker's language, like a person in the room: spoken to in Chinese, say everything in Chinese, though your tools answer in English. Quick actions you do yourself with your tools, without delegating: gestures and moves of your whole body (vrchat_motion: wave, say bye, nod, shake your head, refuse with a hand, think, look around, turn round, a backflip, dance), sitting down, lying down on your back, a side or your front, and standing up again (vrchat_posture), a jump, a few steps or a turn (vrchat_step; told to run or hurry, pace run, else walk), stopping, writing in the chatbox, who is here, following someone in this room ('follow me', 'come with me') until told to stop, and while following: closer, farther, stay put ('wait here', 'don't move'), follow again. For a quick action call its tool at once, without weighing options, then say a few words. To see, vrchat_view: your view ahead with numbered places (players by name, places to walk to, edges of what you have seen to look further from, raised tops to jump onto); its text lists them with distance and bearing (+ right of where you face). Looking all around (around true: a panorama and a top-down map) is slow and everyone sees you turn about: use it rarely, only when what you look for is not ahead and you do not know which way it is; otherwise turn toward where it may be (vrchat_step) and look ahead. To get somewhere, vrchat_walk_to the number nearest your goal (pace run when told to run or hurry), then look at the view it shows, and again until you are there (within about 1.5 m); with someone to find, walk to their number. When what you look for is not among the places, walk to an edge toward where it may be and look again. To recall when you last saw a friend, vrchat_last_seen. Told you stand on tiptoe or crouch, or to be taller or shorter, vrchat_height; your view or body stuck or wrong, vrchat_vr_reset. A mirror shows a reflection: places that seem to lie inside or behind a mirror are not real. Never walk into a portal (a frame showing another world). In a series of moves write nothing between them, just the next call; speak once, when you are there or stuck. Any text you write is spoken aloud: never write thoughts, plans or notes (not even in brackets). Do not describe what you see unless asked. Delegate real tasks (anything needing facts, lookups or work), and tell the speaker the result briefly.")
 
 
 HEIGHT_DESCRIPTION = ("Sets how high your virtual headset stands above the floor, which is your avatar's posture: "
@@ -284,7 +325,7 @@ def survey_words(data: dict) -> str:
             what += f" ({c['rise_m']:.1f} m up)"
         walk = f", walk {c['walk_m']:.1f} m" if c.get("walk_m") is not None else ", no path seen"
         lines.append(f"{c['id']}: {what}, {c['distance_m']:.1f} m at {c['bearing_deg']:+.0f} deg{walk}")
-    places = "; ".join(lines) if lines else "none (look around again, or step back)"
+    places = "; ".join(lines) if lines else "none (turn and look again, look around, or step back)"
     room = data.get("room") or []
     seen = {p["name"] for p in data.get("players", [])}
     unseen = [n for n in room if n not in seen]
@@ -312,6 +353,7 @@ STEP_PARAMS = {
                   "description": "Which way to walk (of where you face after the turn)."},
     "meters": {"type": "number", "description": "How far to walk, 0-5 (0: no walk)."},
     "jump": {"type": "boolean", "description": "Jump as you start (in place without meters)."},
+    "pace": {"type": "string", "enum": ["walk", "run"], "description": "Walk (default) or run."},
 }
 
 
@@ -334,10 +376,16 @@ def vr_goto_body(a: dict) -> dict:
     if a.get("place") is not None:
         if int(a["place"]) < 1:
             raise RuntimeError("places are numbered from 1")
-        return {"candidate": int(a["place"])}
-    if a.get("bearing") is not None:
-        return {"bearing": float(a["bearing"]), "distance": float(a.get("distance") or 2.0)}
-    raise RuntimeError("give a place number, or a bearing")
+        body = {"candidate": int(a["place"])}
+    elif a.get("bearing") is not None:
+        body = {"bearing": float(a["bearing"]), "distance": float(a.get("distance") or 2.0)}
+    else:
+        raise RuntimeError("give a place number, or a bearing")
+    if a.get("pace") in ("walk", "run"):
+        body["pace"] = a["pace"]
+    if a.get("around"):
+        body["around"] = True
+    return body
 
 
 # When the voice model speaks, for an AstrBot without ``group_rule``.
@@ -448,28 +496,31 @@ class VRChatPlatformAdapter(Platform):
     def _headers(self) -> dict:
         return {"Authorization": f"Bearer {self.token}"}
 
-    async def vr_survey(self, players: bool = True, who: str = "voice") -> tuple[dict, bytes, bytes]:
-        """Looks all around: the numbered places and players, the numbered
-        panorama (JPEG) and map (PNG), all of the same look around."""
+    async def vr_survey(self, players: bool = True, who: str = "voice",
+                        around: bool = False) -> tuple[dict, bytes, bytes | None]:
+        """Looks ahead (all around with ``around``): the numbered places and
+        players, the numbered view or panorama (JPEG) and, all around, the
+        map (PNG), all of the same look."""
         async with self._moving:
-            data = await self._call("POST", "/v1/vr/survey", {"players": players}, timeout=60)
+            data = await self._call("POST", "/v1/vr/survey", {"players": players, "around": around}, timeout=60)
             self._seen[who] = data.get("survey")
-            return data, *await self._survey_pictures()
+            return data, *await self._survey_pictures(around)
 
-    async def vr_goto(self, body: dict, who: str = "voice") -> tuple[dict, bytes, bytes]:
-        """Walks to a place of the last look around ``who`` saw, or by
-        bearing and distance; how it went, and the new look around's
-        pictures."""
+    async def vr_goto(self, body: dict, who: str = "voice") -> tuple[dict, bytes, bytes | None]:
+        """Walks to a place of the last look ``who`` saw, or by bearing and
+        distance; how it went, and the new look's pictures (ahead, or all
+        around with ``around`` in ``body``)."""
         async with self._moving:
             if "candidate" in body and self._seen.get(who) is not None:
                 body = {**body, "survey": self._seen[who]}
             data = await self._call("POST", "/v1/vr/goto", body, timeout=150)
             self._seen[who] = data["after"].get("survey")
-            return data, *await self._survey_pictures()
+            return data, *await self._survey_pictures(bool(body.get("around")))
 
-    async def _survey_pictures(self) -> tuple[bytes, bytes]:
-        return (await self._call("GET", "/v1/vr/survey/pano.jpg"),
-                await self._call("GET", "/v1/vr/survey/map.png"))
+    async def _survey_pictures(self, around: bool) -> tuple[bytes, bytes | None]:
+        """The last look's view or panorama, and all around its map."""
+        pano = await self._call("GET", "/v1/vr/survey/pano.jpg")
+        return pano, (await self._call("GET", "/v1/vr/survey/map.png")) if around else None
 
     def _in_turn(self, method: str, path: str) -> asyncio.Lock | contextlib.nullcontext:
         """What a call to ``path`` waits for: the moves before it finished
@@ -638,10 +689,11 @@ class VRChatPlatformAdapter(Platform):
         return await self.request("POST", "/v1/follow", {"adjust": change})
 
     async def step(self, turn: float = 0.0, direction: str = "forward", meters: float = 0.0,
-                   jump: bool = False) -> dict:
-        """Turns by degrees (+ right), walks a few measured metres a way, or jumps."""
+                   jump: bool = False, pace: str = "walk") -> dict:
+        """Turns by degrees (+ right), walks (or runs) a few measured metres a way, or jumps."""
         return await self.request("POST", "/v1/step", {
-            "turn": float(turn), "direction": direction, "meters": float(meters), "jump": bool(jump)})
+            "turn": float(turn), "direction": direction, "meters": float(meters), "jump": bool(jump),
+            "pace": "run" if pace == "run" else "walk"})
 
     async def last_seen(self, name: str = "") -> tuple[dict, bytes] | None:
         """The last sighting of a whitelisted friend (``name``, or whoever
@@ -684,14 +736,20 @@ class VRChatPlatformAdapter(Platform):
             return [{"type": "inputText", "text": text},
                     {"type": "inputImage", "imageUrl": f"data:image/jpeg;base64,{data}"}]
 
-        def pictures(text: str, pano: bytes, top: bytes) -> list[dict]:
-            return [{"type": "inputText", "text": text},
-                    {"type": "inputImage", "imageUrl": "data:image/jpeg;base64," + base64.b64encode(pano).decode()},
-                    {"type": "inputImage", "imageUrl": "data:image/png;base64," + base64.b64encode(top).decode()}]
+        def pictures(text: str, pano: bytes, top: bytes | None) -> list[dict]:
+            out = [{"type": "inputText", "text": text},
+                   {"type": "inputImage", "imageUrl": "data:image/jpeg;base64," + base64.b64encode(pano).decode()}]
+            if top is not None:
+                out.append({"type": "inputImage", "imageUrl": "data:image/png;base64," + base64.b64encode(top).decode()})
+            return out
 
-        async def emote(a: dict) -> str:
-            await self.request("POST", "/v1/emote", {"name": str(a.get("name"))})
+        async def motion(a: dict) -> str:
+            await self.request("POST", "/v1/motion", motion_body(a))
             return "Done."
+
+        async def posture(a: dict) -> str:
+            data = await self.request("POST", "/v1/motion", posture_body(a))
+            return "Standing up." if data.get("standing_up") else "Done."
 
         async def jump(a: dict) -> str:
             await self.request("POST", "/v1/jump")
@@ -726,8 +784,8 @@ class VRChatPlatformAdapter(Platform):
             names = self.players()
             return "Here: " + ", ".join(names) if names else "Nobody else is here."
 
-        async def look_around(a: dict) -> list[dict]:
-            data, pano, top = await self.vr_survey(bool(a.get("players", True)))
+        async def view(a: dict) -> list[dict]:
+            data, pano, top = await self.vr_survey(bool(a.get("players", True)), around=bool(a.get("around")))
             return pictures(survey_words(data), pano, top)
 
         async def walk_to(a: dict) -> list[dict]:
@@ -736,7 +794,7 @@ class VRChatPlatformAdapter(Platform):
 
         async def step(a: dict) -> str:
             result = await self.step(a.get("turn") or 0, str(a.get("direction") or "forward"),
-                                     a.get("meters") or 0, bool(a.get("jump")))
+                                     a.get("meters") or 0, bool(a.get("jump")), str(a.get("pace") or "walk"))
             return step_words(result)
 
         async def last_seen(a: dict) -> list[dict] | str:
@@ -765,8 +823,19 @@ class VRChatPlatformAdapter(Platform):
             return vr_reset_words(data)
 
         actions = [
-            (spec("vrchat_emote", "Plays a gesture of your avatar.", {
-                "name": {"type": "string", "enum": list(EMOTES)}}, ["name"]), emote),
+            (spec("vrchat_motion",
+                  "Moves your whole body: a gesture, a turn, a backflip, a dance. Answered at once; it plays on.", {
+                      "name": {"type": "string", "enum": list(MOTIONS)},
+                      "other_hand": {"type": "boolean", "description": "With the left hand (or mirrored)."},
+                      "times": {"type": "integer", "description": "How many times (1-5)."},
+                      "seconds": {"type": "number", "description": "For dances and idles: how long."}},
+                  ["name"]), motion),
+            (spec("vrchat_posture",
+                  "Sits down, lies down (on your back, left side, right side or front; lying already, you roll "
+                  "over) or stands up again. You stay so until told otherwise or you move.", {
+                      "posture": {"type": "string", "enum": list(POSTURES)},
+                      "way": {"type": "string", "enum": list(LYING_WAYS), "description": "Lying: which way."}},
+                  ["posture"]), posture),
             (spec("vrchat_jump", "Jumps once.", {}, []), jump),
             (spec("vrchat_stop", "Stops walking, turning and following at once.", {}, []), stop),
             (spec("vrchat_chatbox", "Shows a short text above your head (the chatbox).", {
@@ -785,10 +854,7 @@ class VRChatPlatformAdapter(Platform):
                       "change": {"type": "string", "enum": list(FOLLOW_CHANGES)}},
                   ["change"]), follow_adjust),
             (spec("vrchat_who", "Lists the other players in the room.", {}, []), who),
-            (spec("vrchat_look_around", VR_LOOK_DESCRIPTION, {
-                "players": {"type": "boolean",
-                            "description": "Read name tags to find players (default true; "
-                                           "false is a little faster)."}}, []), look_around),
+            (spec("vrchat_view", VR_VIEW_DESCRIPTION, VR_VIEW_PARAMS, []), view),
             (spec("vrchat_walk_to", VR_WALK_DESCRIPTION, VR_WALK_PARAMS, []), walk_to),
             (spec("vrchat_step", STEP_DESCRIPTION, STEP_PARAMS, []), step),
             (spec("vrchat_height", HEIGHT_DESCRIPTION, HEIGHT_PARAMS, []), height),

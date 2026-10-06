@@ -94,7 +94,7 @@ impl Default for AnimParams {
             curl: [0.40, 0.35, 0.30, 0.25, 0.25],
             breath_hz: 0.24,
             breath_m: 0.004,
-            sway: 1.5,
+            sway: 0.75,
             arm_sway_m: 0.02,
             glances: true,
             swing: 1.0,
@@ -189,7 +189,8 @@ pub struct AnimInput {
     pub speed: f32,
     /// The bot's voice now (0..1), `None` while silent.
     pub voice: Option<f32>,
-    /// Nothing else drives the head: glances are welcome.
+    /// Nothing else drives the head: glances are welcome, and the idle sway
+    /// and weight shifts play (else they settle).
     pub idle: bool,
 }
 
@@ -207,6 +208,9 @@ pub struct Animator {
     glance_pitch: Ease,
     glance_next: f32,
     glance_back: Option<f32>,
+    /// How much of the idle sway and weight shifts plays (eased to 0 while
+    /// something else moves the bot: a follow turning to look for someone).
+    calm: f32,
     speed: f32,
     gait: f32,
     talk: f32,
@@ -245,6 +249,7 @@ impl Animator {
             glance_pitch: Ease::default(),
             glance_next: 0.0,
             glance_back: None,
+            calm: 1.0,
             speed: 0.0,
             gait: 0.0,
             talk: 0.0,
@@ -369,9 +374,10 @@ impl Animator {
         }
 
         // -- the head.
+        self.calm += ((if input.idle { 1.0 } else { 0.0 }) - self.calm) * (dt / 0.5).min(1.0);
         let w = |a: &Wobble| a.at(t);
-        let still = (1.0 - walking) * p.sway * if talking { 2.0 } else { 1.0 };
-        let shift = self.shift.at(t) * p.sway * k;
+        let still = (1.0 - walking) * p.sway * self.calm * if talking { 2.0 } else { 1.0 };
+        let shift = self.shift.at(t) * p.sway * self.calm * k;
         let (bs, bc) = body_yaw.to_radians().sin_cos();
         let (right, ahead) = ([bc, 0.0, bs], [bs, 0.0, -bc]);
         // Over the standing foot: furthest right at 0.81 (right stance).
@@ -434,9 +440,9 @@ impl Animator {
             rest[n] = hand(&p, hand_pose(&p, head, body_yaw, side, [0.0; 3], [0.0, 0.0, 0.0, 1.0]), p.curl);
         }
         if !p.enabled {
-            return Overlay { left: rest[0], right: rest[1], rest, head: HeadOffset::default() };
+            return Overlay { left: rest[0], right: rest[1], rest, head: HeadOffset::default(), head_pose: None };
         }
-        Overlay { left: hands[0], right: hands[1], rest, head: head_offset }
+        Overlay { left: hands[0], right: hands[1], rest, head: head_offset, head_pose: None }
     }
 }
 

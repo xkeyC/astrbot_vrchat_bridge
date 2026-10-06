@@ -66,6 +66,11 @@ pub struct Bridge {
     pub follower: Arc<Follower>,
     pub sightings: Arc<Sightings>,
     pub anim: Arc<Anim>,
+    /// The async runtime: tasks started from plain threads (the animation's,
+    /// a calibration's) go to it.
+    pub rt: tokio::runtime::Handle,
+    /// Motion clips (`motions/` next to the token).
+    pub motions: Arc<crate::motion::Library>,
     /// The follow the model's moves paused, given back TAKEOVER_IDLE after
     /// its last (take_over, idle_later).
     takeover: Mutex<Option<Takeover>>,
@@ -91,6 +96,7 @@ impl Bridge {
         let config_dir = game::expand(&args.token_file).parent().map(|p| p.to_path_buf()).unwrap_or_default();
         let social = Arc::new(Social::new(config_dir.join("social.json"), config_dir.join("cookies.json")));
         let anim = Arc::new(Anim::new(config_dir.join("anim.json")));
+        let motions = Arc::new(crate::motion::Library::new(config_dir.join("motions")));
         let mut core = VrCore::new(&args);
         core.head_height = anim.params().head_height;
         let vr = Arc::new(Mutex::new(core));
@@ -109,6 +115,8 @@ impl Bridge {
             follower: Arc::new(Follower::default()),
             sightings: Arc::new(Sightings::default()),
             anim,
+            rt: tokio::runtime::Handle::current(),
+            motions,
             args,
             takeover: Mutex::new(None),
             takeover_moves: AtomicU64::new(0),
@@ -189,7 +197,7 @@ impl Bridge {
             return;
         }
         let me = self.clone();
-        tokio::spawn(async move {
+        self.rt.spawn(async move {
             tokio::time::sleep(TAKEOVER_IDLE).await;
             if me.takeover_moves.load(Ordering::SeqCst) == moves {
                 me.resume_following();
@@ -237,7 +245,7 @@ impl Bridge {
         self.follower.stop();
         self.send_event(json!({"type": "alert", "reason": "not_joinable_instance", "kind": kind}));
         let me = self.clone();
-        tokio::spawn(async move {
+        self.rt.spawn(async move {
             let _ = game::stop_game().await;
             me.leaving.store(false, Ordering::SeqCst);
         });

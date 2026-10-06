@@ -17,6 +17,7 @@
 
 pub mod anim;
 pub mod fps;
+pub mod motion;
 pub mod osc;
 pub mod pose;
 pub mod remote;

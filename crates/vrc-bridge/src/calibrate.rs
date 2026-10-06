@@ -92,6 +92,7 @@ static RUNNING: Mutex<()> = Mutex::new(());
 /// headset held throughout.
 pub fn now(bridge: &Arc<Bridge>, force: bool) -> Result<Value> {
     let Some(_one) = RUNNING.try_lk() else { bail!("a calibration is running") };
+    crate::motion::stop_and_wait(bridge);
     if !bridge.anim.trackers.lk().on {
         let mut settings = bridge.anim.trackers.lk().clone();
         settings.on = true;
@@ -116,8 +117,8 @@ pub fn now(bridge: &Arc<Bridge>, force: bool) -> Result<Value> {
 }
 
 /// Watches for a body VRChat no longer tracks in full though the trackers
-/// are on (the game started again) and calibrates it while the bot is idle
-/// (`auto_calibrate`); checked every few seconds by the caller.
+/// are on (the game started again) and calibrates it (`auto_calibrate`),
+/// pausing a follow meanwhile; checked every few seconds by the caller.
 pub struct Watch {
     last_try: Option<Instant>,
 }
@@ -132,7 +133,9 @@ impl Watch {
         if !settings.on || !settings.auto_calibrate || bridge.anim.trackers_on_for() < UNCALIBRATED_AFTER {
             return;
         }
-        if self.last_try.is_some_and(|t| t.elapsed() < RETRY_AFTER) || !bridge.game.lk().running || !bridge.follower.is_idle() {
+        // (A follow does not wait: calibrating pauses it, as the model's own
+        // moves do, and it goes on after.)
+        if self.last_try.is_some_and(|t| t.elapsed() < RETRY_AFTER) || !bridge.game.lk().running {
             return;
         }
         if tracking_type(bridge) != Some(HEAD_AND_HANDS) {

@@ -61,6 +61,8 @@ pub fn world_params() -> MapParams {
 pub struct SurveyOptions {
     /// Views in the ring.
     pub count: usize,
+    /// Only the one view ahead (and the look down), not the ring.
+    pub ahead: bool,
     pub pitch: f32,
     /// Also look down at the feet.
     pub down: bool,
@@ -73,7 +75,7 @@ pub struct SurveyOptions {
 
 impl Default for SurveyOptions {
     fn default() -> Self {
-        SurveyOptions { count: 5, pitch: -10.0, down: true, players: true, stereo_scale: 0 }
+        SurveyOptions { count: 5, ahead: false, pitch: -10.0, down: true, players: true, stereo_scale: 0 }
     }
 }
 
@@ -108,7 +110,7 @@ pub struct Timings {
 pub fn survey(rig: &mut Rig, opts: &SurveyOptions, blocked: &[[f32; 2]]) -> Result<Survey> {
     let head = rig.hmd.state.head;
     let (yaw, _) = head.yaw_pitch();
-    let mut views = scan::ring(opts.count, opts.pitch);
+    let mut views = if opts.ahead { vec![(yaw, opts.pitch)] } else { scan::ring(opts.count, opts.pitch) };
     if opts.down {
         views.push((yaw, -80.0));
     }

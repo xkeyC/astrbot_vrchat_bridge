@@ -72,19 +72,36 @@ const BACK_UNTIL: f32 = 0.15;
 /// Something within this (world metres) straight ahead, nearer than the
 /// target, stops the walk.
 const OBSTACLE_M: f32 = 0.6;
+/// The search, round the way they were last seen: a turn to the left
+/// (SIDE_S), a look; one sweep over to the right (SWEEP_S, the head raised
+/// a little as it passes the middle), a look; on round to behind (ROUND_S),
+/// a look; then again round that. Degrees to either side; the head tilts
+/// into each turn.
+const SEARCH_SIDE_DEG: f32 = 70.0;
+const SEARCH_SIDE_S: f32 = 0.35;
+const SEARCH_SWEEP_S: f32 = 0.6;
+const SEARCH_ROUND_S: f32 = 0.7;
+const SEARCH_TILT: f32 = 8.0;
+const SEARCH_SWEEP_NOD: f32 = 6.0;
+const SEARCH_SETTLE: Duration = Duration::from_millis(80);
+/// Each of those (once round) is a round; every third round, from the
+/// second on (2, 5, 8...), looks up this high (someone up on something),
+/// the others at PITCH. The head goes level again over SEARCH_LEVEL_S.
+const SEARCH_UP_PITCH: f32 = 20.0;
+const SEARCH_LEVEL_S: f32 = 0.3;
+/// Feet under a tag: within this of under it, at least this many points.
+const FEET_RADIUS_M: f32 = 0.25;
+const FEET_POINTS: usize = 15;
+/// Up or down from the bot by more than a step: it goes up to them (as near
+/// as this), the stairs are no stopping place.
+const OTHER_FLOOR_STAND_M: f32 = 0.8;
 /// Not seen for this long: stand and search.
 const LOST_AFTER: Duration = Duration::from_millis(1500);
 const LOST_STANDING: Duration = Duration::from_secs(4);
 /// Out of the room for this long: gone.
 const GONE_AFTER: Duration = Duration::from_secs(20);
 const PITCH: f32 = -10.0;
-/// Unread for LOST_AFTER yet last seen within LOOK_UP_WITHIN_M: a view
-/// this far up their way (degrees), at most every LOOK_UP_EVERY.
-const LOOK_UP_PITCH: f32 = 20.0;
-const LOOK_UP_WITHIN_M: f32 = 2.5;
-const LOOK_UP_EVERY: Duration = Duration::from_millis(1500);
 /// Search views: offsets (degrees) from where the target was last seen.
-const SEARCH: [f32; 6] = [0.0, 60.0, 120.0, 180.0, 240.0, 300.0];
 /// A search that found nobody: walk toward where they were this long.
 const SEEK_FOR: Duration = Duration::from_secs(4);
 /// Following a wall without seeing the target this long: stop and search.
@@ -97,7 +114,7 @@ const SEARCH_PAUSE: Duration = Duration::from_secs(2);
 const TICK: Duration = Duration::from_millis(40);
 const AXIS_DEAD: f32 = 0.1;
 const SPEED_PER_AXIS: f32 = 4.44;
-const MAX_SPEED: f32 = 3.0;
+const MAX_SPEED: f32 = 1.8;
 /// Deceleration planned for (m/s²): gentle, well inside what VRChat does.
 const BRAKE: f32 = 1.5;
 /// Input to motion, and the stop itself, as seconds of the current speed.
@@ -105,8 +122,22 @@ const LAG_S: f32 = 0.25;
 /// Slower than this is not worth a step.
 const MIN_SPEED: f32 = 0.3;
 const BACK_AXIS: f32 = -0.3;
-/// The head turns to the target at most this fast (degrees per second).
+/// The body (and the walk) turns to the target at most this fast (degrees
+/// per second).
 const TURN_RATE: f32 = 200.0;
+/// Standing, the body squares up to the target once they are more than
+/// SQUARE_FROM_DEG off, until within SQUARE_TO_DEG; nearer the middle the
+/// head alone follows them (at most HEAD_MAX_DEG off the body, HEAD_RATE
+/// degrees a second), up and down too: at the face under their name tag
+/// (TAG_OVER_FACE_M) so the tag stays in view close up, the pitch within
+/// HEAD_PITCH_MIN..HEAD_PITCH_MAX.
+const SQUARE_FROM_DEG: f32 = 20.0;
+const SQUARE_TO_DEG: f32 = 3.0;
+const HEAD_MAX_DEG: f32 = 35.0;
+const HEAD_RATE: f32 = 150.0;
+const TAG_OVER_FACE_M: f32 = 0.3;
+const HEAD_PITCH_MIN: f32 = -30.0;
+const HEAD_PITCH_MAX: f32 = 30.0;
 /// Fixes predict the target's motion at most this far ahead.
 const PREDICT_S: f32 = 1.0;
 const ODOMETRY_KEPT: Duration = Duration::from_secs(4);
@@ -120,6 +151,11 @@ const ODOMETRY_KEPT: Duration = Duration::from_secs(4);
 /// height), walked round, else jumped first (a ledge, a platform), this
 /// far before them, after a run-up at least RUN_UP_SPEED fast.
 const STEP_M: f32 = 0.3;
+/// The ground along the way is followed up (and down) by at most STAIR_M a
+/// 10 cm bin (a riser), and points as high as STAIRS_SLOPE times the way
+/// out over the eyes may be stairs' (followed, not in the way).
+const STAIR_M: f32 = 0.22;
+const STAIRS_SLOPE: f32 = 1.0;
 const BIN_POINTS: usize = 3;
 const OBSTACLE_POINTS: usize = 12;
 const NEAR_POINTS: usize = 12;
@@ -196,6 +232,8 @@ struct Fix {
     /// Where their feet are over the bot's floor (world metres): up on
     /// something, the way there is a jump up, not round the map.
     up: f32,
+    /// Their name tag over the bot's eyes (world metres).
+    tag_rise: f32,
 }
 
 /// What the eyes and the legs share.
@@ -281,9 +319,9 @@ const FROM_ANYWAY: f32 = 1.1;
 
 /// The first thing in the way along `yaw` from `eye`, in a corridor half a
 /// metre wide out to 4 m; `None` when the way is clear. The ground is
-/// followed along the corridor (slopes, steps), so a raised floor is not in
+/// followed along the corridor (slopes, stairs), so a raised floor is not in
 /// the way; something stands in the way when it rises more than a step
-/// over the ground before it. Nearer than `from` the bot's own body is in
+/// over the ground there. Nearer than `from` the bot's own body is in
 /// view too (arms swinging forward, a gesture, props it carries: a weapon on
 /// the back, a cup at its side reaching 1 m out), whatever the avatar: there
 /// only points over the eyes count, so a wall (which reaches that high) is
@@ -304,41 +342,50 @@ fn corridor(points: &[[f32; 3]], eye: [f32; 3], yaw: f32, metres: f32, floor: f3
     let first = ((from - NEAR_FROM) / BIN).round() as usize;
     let (s, c) = yaw.to_radians().sin_cos();
     let eye_m = (eye[1] - floor) * metres;
-    // Per 10 cm along the way: the heights of the points in it.
+    // Per 10 cm along the way: the points in it (ahead, height, side), up
+    // to as high as stairs rising from here could go.
     let mut bins: Vec<Vec<(f32, f32, f32)>> = vec![Vec::new(); BINS];
     for p in points {
         let (dx, dz) = (p[0] - eye[0], p[2] - eye[2]);
         let (ahead, side, up) = ((dx * s - dz * c) * metres, (dx * c + dz * s) * metres, (p[1] - floor) * metres);
-        if ahead > NEAR_FROM && side.abs() < 0.25 && up < eye_m + 0.3 {
+        if ahead > NEAR_FROM && side.abs() < 0.25 && up < eye_m + 0.3 + ahead * STAIRS_SLOPE {
             let i = ((ahead - NEAR_FROM) / BIN) as usize;
             if i < BINS {
                 bins[i].push((ahead, up, side));
             }
         }
     }
+    // The ground under each bin, as it is reached from here: followed up
+    // and down by STAIR_M a bin at most (a slope, stairs: each bin's lowest
+    // point), not up a ledge (and a drop is not followed).
+    let mut ground = vec![0.0f32; BINS];
+    let mut g = 0.0f32;
+    for (i, bin) in bins.iter().enumerate() {
+        ground[i] = g;
+        let low = bin.iter().map(|a| a.1).fold(f32::INFINITY, f32::min);
+        if (low - g).abs() <= STAIR_M {
+            g = low;
+        }
+    }
+    // Over the ground there (up to a little over the eyes: not a ceiling
+    // over stairs).
+    let (bins, ground) = (&bins, &ground);
+    let over = |i: usize| bins[i].iter().map(move |a| (a.0, a.1 - ground[i], a.2)).filter(move |a| a.1 < eye_m + 0.3);
     // Near: only what reaches up toward the eyes (a wall), not the body.
-    let near: Vec<f32> = points
-        .iter()
-        .filter_map(|p| {
-            let (dx, dz) = (p[0] - eye[0], p[2] - eye[2]);
-            let (ahead, side, up) = ((dx * s - dz * c) * metres, (dx * c + dz * s) * metres, (p[1] - floor) * metres);
-            (ahead > NEAR_FROM && ahead <= from && side.abs() < 0.25 && up > eye_m && up < eye_m + 0.3).then_some(ahead)
-        })
-        .collect();
+    let near: Vec<f32> = (0..BINS).flat_map(over).filter(|a| a.0 <= from && a.1 > eye_m).map(|a| a.0).collect();
     if near.len() >= NEAR_POINTS {
         let distance = near.iter().copied().fold(f32::INFINITY, f32::min);
         return Some(Blocker { distance, top: eye_m, tall: true });
     }
-    let mut ground = 0.0f32;
-    for (i, bin) in bins.iter().enumerate() {
-        if bin.is_empty() {
+    for i in 0..BINS {
+        if bins[i].is_empty() {
             continue;
         }
-        let above: Vec<(f32, f32, f32)> = bin.iter().copied().filter(|a| a.1 > ground + STEP_M).collect();
+        let above: Vec<(f32, f32, f32)> = over(i).filter(|a| a.1 > STEP_M).collect();
         // A wall met at a slant spreads over several bins, a few points
         // each; stray points come alone: count this bin and the next two,
         // and want some height to them.
-        let window: Vec<(f32, f32, f32)> = bins[i..(i + 3).min(BINS)].iter().flatten().copied().filter(|a| a.1 > ground + STEP_M).collect();
+        let window: Vec<(f32, f32, f32)> = (i..(i + 3).min(BINS)).flat_map(over).filter(|a| a.1 > STEP_M).collect();
         let span = window.iter().map(|a| a.1).fold(f32::NEG_INFINITY, f32::max) - window.iter().map(|a| a.1).fold(f32::INFINITY, f32::min);
         let across = || {
             let left = window.iter().filter(|a| a.2 < -SIDE).count();
@@ -349,14 +396,8 @@ fn corridor(points: &[[f32; 3]], eye: [f32; 3], yaw: f32, metres: f32, floor: f3
         if stands && (i >= first || across()) {
             let distance = above.iter().map(|a| a.0).fold(f32::INFINITY, f32::min);
             // Its top: the highest point within half a metre past the front.
-            let upto = (i + 6).min(BINS);
-            let top = bins[i..upto].iter().flatten().filter(|a| a.0 < distance + 0.5).map(|a| a.1).fold(0.0f32, f32::max);
-            return Some(Blocker { distance, top: top - ground, tall: top >= eye_m - EYE_MARGIN_M });
-        }
-        // Ground: follow it up and down by a step at most (a drop is not followed).
-        let low = bin.iter().map(|a| a.1).fold(f32::INFINITY, f32::min);
-        if (low - ground).abs() <= STEP_M {
-            ground = low;
+            let top = (i..(i + 6).min(BINS)).flat_map(over).filter(|a| a.0 < distance + 0.5).map(|a| a.1).fold(0.0f32, f32::max);
+            return Some(Blocker { distance, top, tall: top >= eye_m - EYE_MARGIN_M });
         }
     }
     None
@@ -388,7 +429,16 @@ impl Track {
         Some([f.pos[0] + f.vel[0] * ahead, f.pos[1] + f.vel[1] * ahead])
     }
 
-    fn add_fix(&mut self, at: Instant, pos: [f32; 2], up: f32) {
+    /// The head's pitch (degrees) to their face under the name tag, from
+    /// here: the tag stays in view close up and up on something.
+    fn tag_pitch(&self) -> Option<f32> {
+        let (f, goal) = (self.target?, self.target_now()?);
+        let gap = (goal[0] - self.pos[0]).hypot(goal[1] - self.pos[1]);
+        let pitch = (f.tag_rise - TAG_OVER_FACE_M).atan2(gap.max(0.3)).to_degrees();
+        Some(pitch.clamp(HEAD_PITCH_MIN, HEAD_PITCH_MAX))
+    }
+
+    fn add_fix(&mut self, at: Instant, pos: [f32; 2], up: f32, tag_rise: f32) {
         let vel = match self.target {
             Some(prev) if at > prev.at && (at - prev.at) < Duration::from_secs(2) && (at - prev.at) > Duration::from_millis(200) => {
                 let dt = (at - prev.at).as_secs_f32();
@@ -406,7 +456,7 @@ impl Track {
             }
             _ => [0.0, 0.0],
         };
-        self.target = Some(Fix { at, pos, vel, up });
+        self.target = Some(Fix { at, pos, vel, up, tag_rise });
     }
 }
 
@@ -517,9 +567,10 @@ impl Follower {
         let _done = Done { me: self.clone(), bridge: bridge.clone(), stop: stop.clone(), legs: Some(legs) };
         let mut last_here = Instant::now();
         let mut searching = false;
+        // Search rounds since they were lost (see SEARCH_UP_PITCH).
+        let mut rounds = 0u32;
         let mut next_search = Instant::now();
         let mut last_glance = Instant::now();
-        let mut last_up = Instant::now();
         let mut osc: Option<Osc> = None;
         while !stop.load(Ordering::SeqCst) {
             let (running, here, room) = {
@@ -574,26 +625,16 @@ impl Follower {
                     _ => None,
                 }
             };
-            // Near them yet not reading their name tag: it may be over the
-            // top of the view (a short avatar close to a tall one): a look
-            // up their way before taking them for lost.
-            let look_up = if glance.is_none() && !lost && unseen > LOST_AFTER && last_up.elapsed() > LOOK_UP_EVERY {
-                let t = track.lk();
-                t.target_now().filter(|g| (g[0] - t.pos[0]).hypot(g[1] - t.pos[1]) < LOOK_UP_WITHIN_M).map(|g| bearing(t.pos, g))
-            } else {
-                None
-            };
             let result = if let Some(to) = glance {
                 last_glance = Instant::now();
-                self.look(&bridge, &track, &target, &room, metres, Some((to, PITCH)), &stop).map(|_| ())
-            } else if let Some(to) = look_up {
-                last_up = Instant::now();
-                self.look(&bridge, &track, &target, &room, metres, Some((to, LOOK_UP_PITCH)), &stop).map(|_| ())
+                let pitch = track.lk().tag_pitch().unwrap_or(PITCH);
+                self.look(&bridge, &track, &target, &room, metres, Some((to, pitch)), &stop).map(|_| ())
             } else if !lost {
                 self.look(&bridge, &track, &target, &room, metres, None, &stop).map(|_| ())
             } else if Instant::now() >= next_search {
                 if !searching {
                     searching = true;
+                    rounds = 0;
                     {
                         let t = track.lk();
                         let (gap, off, up) = match (t.target, t.target_now()) {
@@ -609,7 +650,7 @@ impl Follower {
                         bridge.send_event(json!({"type": "follow", "state": "searching", "target": target}));
                     }
                 }
-                let found = self.search(&bridge, &track, &target, &room, metres, &stop);
+                let found = self.search(&bridge, &track, &target, &room, metres, &mut rounds, &stop);
                 if !matches!(found, Ok(true)) {
                     // Nobody all round: walk toward where they were a while.
                     let mut t = track.lk();
@@ -644,7 +685,8 @@ impl Follower {
 
     /// The search: one view at a time, from where the target was last seen
     /// outwards; true as soon as a view finds them.
-    fn search(&self, bridge: &Arc<Bridge>, track: &Arc<Mutex<Track>>, target: &str, room: &[String], metres: f32, stop: &AtomicBool) -> anyhow::Result<bool> {
+    #[allow(clippy::too_many_arguments)]
+    fn search(&self, bridge: &Arc<Bridge>, track: &Arc<Mutex<Track>>, target: &str, room: &[String], metres: f32, rounds: &mut u32, stop: &AtomicBool) -> anyhow::Result<bool> {
         let from = {
             let t = track.lk();
             match t.target_now() {
@@ -652,16 +694,58 @@ impl Follower {
                 None => t.facing,
             }
         };
-        for offset in SEARCH {
-            if stop.load(Ordering::SeqCst) {
-                return Ok(false);
-            }
-            let yaw = wrap(from + offset);
-            if self.look(bridge, track, target, room, metres, Some((yaw, PITCH)), stop)? {
-                return Ok(true);
-            }
+        bridge.anim.owner_hands.store(true, Ordering::SeqCst);
+        // (turn to, pitch, how long, head tilt, head raised, look there):
+        // left, over to the right in one sweep, on round to behind (a round);
+        // then the same round behind. Some rounds look up.
+        let mut plan = Vec::new();
+        for center in [from, wrap(from + 180.0)] {
+            *rounds += 1;
+            let pitch = if *rounds % 3 == 2 { SEARCH_UP_PITCH } else { PITCH };
+            plan.push((wrap(center - SEARCH_SIDE_DEG), pitch, SEARCH_SIDE_S, -SEARCH_TILT, 0.0, true));
+            plan.push((wrap(center + SEARCH_SIDE_DEG), pitch, SEARCH_SWEEP_S, SEARCH_TILT, SEARCH_SWEEP_NOD, true));
+            plan.push((wrap(center + 180.0), pitch, SEARCH_ROUND_S, SEARCH_TILT * 1.5, 0.0, true));
         }
-        Ok(false)
+        let result = (|| {
+            for (yaw, pitch, secs, tilt, nod, looks) in plan {
+                if stop.load(Ordering::SeqCst) {
+                    return Ok(false);
+                }
+                {
+                    let whitelist = bridge.social.whitelist_names();
+                    let mut vr = bridge.vr.lk();
+                    vr.rig(&whitelist)?.hmd.hold_still(true)?;
+                    let turned = vr.turn_gently(yaw, pitch, secs, tilt, nod);
+                    if turned.is_ok() && looks {
+                        std::thread::sleep(SEARCH_SETTLE);
+                    }
+                    vr.rig(&whitelist)?.hmd.hold_still(false)?;
+                    turned?;
+                    track.lk().facing = yaw;
+                }
+                if !looks {
+                    continue;
+                }
+                if self.look(bridge, track, target, room, metres, Some((yaw, pitch)), stop)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })();
+        // The head level again (gently, after a round looking up), the hands
+        // back at the sides, wherever it ended.
+        {
+            let mut vr = bridge.vr.lk();
+            let yaw = vr.yaw;
+            if (vr.pitch - PITCH).abs() > 1.0 {
+                let _ = vr.rig(&[]).and_then(|r| r.hmd.hold_still(true));
+                let _ = vr.turn_gently(yaw, PITCH, SEARCH_LEVEL_S, 0.0, 0.0);
+                let _ = vr.rig(&[]).and_then(|r| r.hmd.hold_still(false));
+            }
+            let _ = vr.face(yaw, PITCH);
+        }
+        bridge.anim.owner_hands.store(false, Ordering::SeqCst);
+        result
     }
 
     /// One look: the newest frame (or, with `aim`, the first one looking
@@ -678,15 +762,22 @@ impl Follower {
                 Some((yaw, pitch)) => {
                     // Exactly that way: the animation's sway would miss it.
                     vr.rig(&whitelist)?.hmd.hold_still(true)?;
-                    let turned = if glance { vr.aim(yaw, pitch) } else { vr.face(yaw, pitch) };
+                    // (After a gentle turn the bot already faces that way:
+                    // the hands stay a little back of rest.)
+                    let there = vrc_vr::scan::angle_diff(yaw, vr.yaw).abs() < 1.0 && (vr.pitch - pitch).abs() < 1.0;
+                    let turned = if glance {
+                        vr.aim(yaw, pitch)
+                    } else if there {
+                        Ok(())
+                    } else {
+                        vr.face(yaw, pitch)
+                    };
                     let frame = turned.and_then(|()| scan::rendered_at(&mut vr.rig(&whitelist)?.tap, yaw, pitch, Duration::from_secs(1)));
                     // The head back the way the walk goes: walking follows
                     // the head, and the next view judges from it.
-                    // (Level again after a look up.)
                     let back = if glance {
-                        vr.aim(track.lk().facing, PITCH)
-                    } else if pitch != PITCH {
-                        vr.aim(yaw, PITCH)
+                        let t = track.lk();
+                        vr.aim(t.facing, t.tag_pitch().unwrap_or(PITCH))
                     } else {
                         Ok(())
                     };
@@ -727,17 +818,20 @@ impl Follower {
         }
         let points: Vec<[f32; 3]> = stereo.points(&disp, 2).into_iter().map(|(p, _)| p).collect();
         let hit = seen.iter().filter(|s| match_score(&s.name, target) >= 0.6).max_by(|a, b| a.score.total_cmp(&b.score));
+        let feet_up = hit.and_then(|h| feet_height(&points, h.tag, metres, floor));
         let mut t = track.lk();
         let then = t.pos_at(at);
         let found = if let Some(hit) = hit {
             let rel = [(hit.feet[0] - eye[0]) * metres, (hit.feet[2] - eye[2]) * metres];
-            t.add_fix(at, [then[0] + rel[0], then[1] + rel[1]], (hit.feet[1] - floor) * metres);
+            // Up (or down) stairs: where their feet are; not seen, as before.
+            let up = feet_up.or(t.target.map(|f| f.up)).unwrap_or(0.0);
+            t.add_fix(at, [then[0] + rel[0], then[1] + rel[1]], up, (hit.tag[1] - eye[1]) * metres);
             t.misses = 0;
             t.seek = None;
             if let Some(mut s) = self.inner_for(stop) {
                 s.last_seen = Some(at);
                 s.distance = rel[0].hypot(rel[1]);
-                s.target_up = (hit.feet[1] - floor) * metres;
+                s.target_up = t.target.map_or(0.0, |f| f.up);
             }
             true
         } else {
@@ -876,7 +970,10 @@ impl Follower {
         let mut osc: Option<Osc> = None;
         let mut last = Instant::now();
         let mut axis = 0.0f32;
-        let mut aimed = f32::NAN;
+        // What was last sent: the body's yaw, the head's yaw and pitch.
+        let mut aimed = [f32::NAN; 3];
+        let (mut head_yaw, mut head_pitch) = (f32::NAN, PITCH);
+        let mut squaring = false;
         let mut last_jump: Option<Instant> = None;
         let mut slow_since: Option<Instant> = None;
         let mut pushed_since: Option<Instant> = None;
@@ -926,6 +1023,8 @@ impl Follower {
                 t.pos[k] += (vz * ahead[k] + vx * right[k]) * dt;
             }
             let pos = t.pos;
+            // Up or down stairs from the bot: right up to them.
+            let stand = if t.target.is_some_and(|f| f.up.abs() > STEP_M) { stand.min(OTHER_FLOOR_STAND_M) } else { stand };
             t.history.push_back((now, pos));
             while t.history.front().is_some_and(|h| now - h.0 > ODOMETRY_KEPT) {
                 t.history.pop_front();
@@ -944,10 +1043,20 @@ impl Follower {
                     // next view (one may take longer than DETOUR_FOR): never
                     // straight at them through the wall meanwhile.
                     let detour = t.detour.filter(|d| now < d.0 || walling).map(|d| d.1);
+                    // Walking, the body turns the way it goes; standing, it
+                    // squares up to them once they are well off the middle
+                    // (the head alone follows them nearer it).
+                    let walks = detour.is_some() || axis > 0.0 || gap - stand > WALK_MARGIN;
                     if gap > 0.3 || detour.is_some() {
                         let to = detour.unwrap_or_else(|| bearing(pos, goal));
-                        let step = angle_diff(to, t.facing).clamp(-TURN_RATE * dt, TURN_RATE * dt);
-                        t.facing = wrap(t.facing + step);
+                        let off = angle_diff(to, t.facing);
+                        if walks || squaring || off.abs() > SQUARE_FROM_DEG {
+                            squaring = !walks && off.abs() > SQUARE_TO_DEG;
+                            let step = off.clamp(-TURN_RATE * dt, TURN_RATE * dt);
+                            t.facing = wrap(t.facing + step);
+                        }
+                    } else {
+                        squaring = false;
                     }
                     let speed = vz.max(0.0);
                     let left = gap - stand - speed * LAG_S;
@@ -1013,7 +1122,29 @@ impl Follower {
                 slow_since = None;
             }
             let facing = t.facing;
+            // The head: at them (their face, under the tag), within reach of
+            // the body's facing; along a wall or round something, the way it
+            // walks.
+            if !fresh {
+                (head_yaw, head_pitch) = (f32::NAN, PITCH);
+            }
+            let want_pitch = t.tag_pitch().filter(|_| fresh).unwrap_or(PITCH);
+            let want_yaw = match t.target_now() {
+                Some(goal) if fresh && !walling && !t.detour.is_some_and(|d| now < d.0) => {
+                    let gap = (goal[0] - pos[0]).hypot(goal[1] - pos[1]);
+                    if gap > 0.3 { wrap(facing + angle_diff(bearing(pos, goal), facing).clamp(-HEAD_MAX_DEG, HEAD_MAX_DEG)) } else { facing }
+                }
+                _ => facing,
+            };
             drop(t);
+            if head_yaw.is_nan() {
+                head_yaw = facing;
+            }
+            let reach = HEAD_RATE * dt;
+            head_yaw = wrap(head_yaw + angle_diff(want_yaw, head_yaw).clamp(-reach, reach));
+            // Never further off the body than the head turns.
+            head_yaw = wrap(facing + angle_diff(head_yaw, facing).clamp(-HEAD_MAX_DEG, HEAD_MAX_DEG));
+            head_pitch += (want_pitch - head_pitch).clamp(-reach, reach);
             // Walking goes where the head looks: split the stick so the walk
             // keeps to the facing while a glance turns the head.
             let off = heading.map_or(0.0, |h| angle_diff(facing, h));
@@ -1046,11 +1177,15 @@ impl Follower {
                     s.jumps += 1;
                 }
             }
-            if fresh && (aimed.is_nan() || angle_diff(facing, aimed).abs() >= 1.0) {
+            let now_aim = [facing, head_yaw, head_pitch];
+            let moved = aimed.iter().zip(now_aim).any(|(a, b)| a.is_nan() || angle_diff(b, *a).abs() >= 1.0);
+            if fresh {
                 // The eyes may hold the headset a moment: next tick then.
                 if let Some(mut vr) = bridge.vr.try_lk() {
-                    if vr.face(facing, PITCH).is_ok() {
-                        aimed = facing;
+                    // Something else turned the head meanwhile (a glance): again.
+                    let elsewhere = angle_diff(vr.yaw, aimed[1]).abs() >= 1.0 || (vr.pitch - aimed[2]).abs() >= 1.0;
+                    if (moved || elsewhere) && vr.face_and_look(facing, head_yaw, head_pitch).is_ok() {
+                        aimed = now_aim;
                     }
                 }
             }
@@ -1135,6 +1270,24 @@ pub fn corridor_report(frame: &EyeFrame, yaw: Option<f32>, metres: f32) -> anyho
     }))
 }
 
+/// Where the feet are under a name tag at `tag` (tracking space): the
+/// lowest of the points within FEET_RADIUS_M round under it (their feet,
+/// the floor they stand on, a stair's edge before them), over the bot's
+/// floor (world metres); `None` with too few there.
+fn feet_height(points: &[[f32; 3]], tag: [f32; 3], metres: f32, floor: f32) -> Option<f32> {
+    let mut under: Vec<f32> = points
+        .iter()
+        .filter(|p| ((p[0] - tag[0]) * metres).hypot((p[2] - tag[2]) * metres) < FEET_RADIUS_M && (tag[1] - p[1]) * metres > 0.3)
+        .map(|p| (p[1] - floor) * metres)
+        .collect();
+    if under.len() < FEET_POINTS {
+        return None;
+    }
+    // Low, but not a stray point below the floor.
+    under.sort_by(f32::total_cmp);
+    Some(under[under.len() / 20])
+}
+
 /// The middle of the eyes of `frame` (tracking space, stereo units).
 fn eye_of(frame: &EyeFrame) -> [f32; 3] {
     let (a, b) = (frame.views[0].pose.position, frame.views[1].pose.position);
@@ -1170,13 +1323,13 @@ mod tests {
     fn fixes_estimate_motion() {
         let t0 = Instant::now() - Duration::from_secs(1);
         let mut t = Track::default();
-        t.add_fix(t0, [0.0, -3.0], 0.0);
-        t.add_fix(t0 + Duration::from_millis(500), [0.0, -3.5], 0.0);
+        t.add_fix(t0, [0.0, -3.0], 0.0, 0.5);
+        t.add_fix(t0 + Duration::from_millis(500), [0.0, -3.5], 0.0, 0.5);
         let v = t.target.unwrap().vel;
         // Half of 1 m/s (smoothed from rest), away along -z.
         assert!((v[1] + 0.5).abs() < 1e-4, "{v:?}");
         // Jitter of a few centimetres is standing still.
-        t.add_fix(t0 + Duration::from_millis(900), [0.02, -3.5], 0.0);
+        t.add_fix(t0 + Duration::from_millis(900), [0.02, -3.5], 0.0, 0.5);
         assert!(t.target.unwrap().vel[0].abs() < 0.3);
     }
 
@@ -1249,6 +1402,41 @@ mod tests {
             z += 0.05;
         }
         assert!(corridor(&ramp, eye, 0.0, 1.0, 0.0, FROM_ANYWAY).is_none());
+        // Stairs from 1 m out (0.18 m risers, 0.25 m treads, up to 2.5 m
+        // high), seen from a short avatar: climbed, not in the way; a wall
+        // behind the landing (up past the eyes over it) is.
+        let eye_short = [0.0, 1.18, 0.0];
+        let mut stairs = Vec::new();
+        floor_to(&mut stairs, 0.4, 1.0, 0.0);
+        for k in 0..14 {
+            let (z0, y) = (1.0 + 0.25 * k as f32, 0.18 * (k + 1) as f32);
+            for j in 0..9 {
+                for i in 0..5 {
+                    stairs.push([-0.2 + 0.1 * i as f32, y - 0.18 + 0.02 * j as f32, -z0]);
+                }
+            }
+            floor_to(&mut stairs, z0, z0 + 0.25, y);
+        }
+        assert!(corridor(&stairs, eye_short, 0.0, 1.0, 0.0, FROM_ANYWAY).is_none());
+        let mut landing = Vec::new();
+        floor_to(&mut landing, 0.4, 1.0, 0.0);
+        for k in 0..4 {
+            let (z0, y) = (1.0 + 0.25 * k as f32, 0.18 * (k + 1) as f32);
+            for j in 0..9 {
+                for i in 0..5 {
+                    landing.push([-0.2 + 0.1 * i as f32, y - 0.18 + 0.02 * j as f32, -z0]);
+                }
+            }
+            floor_to(&mut landing, z0, z0 + 0.25, y);
+        }
+        floor_to(&mut landing, 2.0, 2.5, 0.72);
+        for j in 0..40 {
+            for i in 0..5 {
+                landing.push([-0.2 + 0.1 * i as f32, 0.72 + 0.05 * j as f32, -2.5]);
+            }
+        }
+        let b = corridor(&landing, eye_short, 0.0, 1.0, 0.0, FROM_ANYWAY).expect("the wall over the landing");
+        assert!((b.distance - 2.5).abs() < 0.05 && b.tall, "{b:?}");
         // Near: a prop at the bot's side at 0.6 m (up to 1.1 m high) is not
         // in the way; a ledge across it is; a wall there (up past the
         // eyes) is.

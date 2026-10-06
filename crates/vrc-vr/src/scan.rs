@@ -32,24 +32,29 @@ pub fn ring(count: usize, pitch: f32) -> Vec<(f32, f32)> {
 
 /// Turns the head through `views` (yaw, pitch in degrees, relative to the
 /// tracking space) and returns the first frame rendered looking at each; the
-/// head goes back to where it was at the end. The hands stay where the
-/// caller put them: down at the sides ([`crate::remote::State::hands_at_rest`])
-/// keeps the arms out of the views. An animator's overlay is held off
-/// meanwhile (`RemoteHmd::hold_still`).
+/// head goes back to where it was at the end. The body turns with the head
+/// (the hands down at its sides, [`crate::remote::State::hands_at_rest`]: the
+/// trackers' feet step after it), and back at the end. An animator's overlay
+/// is held off meanwhile (`RemoteHmd::hold_still`).
 pub fn scan(hmd: &mut RemoteHmd, tap: &mut EyeTap, views: &[(f32, f32)], timeout: Duration) -> Result<Vec<Shot>> {
     let home = hmd.state.head;
     let mut shots = Vec::with_capacity(views.len());
+    // The body turns with the head, view by view (its feet step after it),
+    // and back to where it faced.
+    let body_home = hmd.state.body_yaw;
     hmd.hold_still(true)?;
     let result = (|| {
         for &(yaw, pitch) in views {
             let started = Instant::now();
-            hmd.set_head(Pose::looking(yaw, pitch, home.position))?;
+            hmd.state.hands_at_rest(home.position, yaw);
+                hmd.set_head(Pose::looking(yaw, pitch, home.position))?;
             let frame = rendered_at(tap, yaw, pitch, timeout)?;
             shots.push(Shot { yaw, pitch, frame, waited: started.elapsed() });
         }
         Ok(())
     })();
     // Back home, and the overlay let go, whatever failed.
+    hmd.state.hands_at_rest(home.position, body_home);
     let back = hmd.set_head(home);
     hmd.hold_still(false)?;
     back?;
@@ -71,6 +76,9 @@ pub fn scan_pipelined(
     let home = hmd.state.head;
     let started = Instant::now();
     let mut got: Vec<Option<Shot>> = views.iter().map(|_| None).collect();
+    // The body turns with the head, view by view (its feet step after it),
+    // and back to where it faced.
+    let body_home = hmd.state.body_yaw;
     hmd.hold_still(true)?;
     let result = (|| {
         let mut next = 0usize;
@@ -82,6 +90,7 @@ pub fn scan_pipelined(
             let now = Instant::now();
             if next < views.len() && now >= switch_at {
                 let (yaw, pitch) = views[next];
+                hmd.state.hands_at_rest(home.position, yaw);
                 hmd.set_head(Pose::looking(yaw, pitch, home.position))?;
                 next += 1;
                 switch_at = now + hold;
@@ -114,6 +123,7 @@ pub fn scan_pipelined(
         // Whatever the stream missed, one by one.
         for (i, &(yaw, pitch)) in views.iter().enumerate() {
             if got[i].is_none() {
+                hmd.state.hands_at_rest(home.position, yaw);
                 hmd.set_head(Pose::looking(yaw, pitch, home.position))?;
                 let frame = rendered_at(tap, yaw, pitch, timeout)?;
                 got[i] = Some(Shot { yaw, pitch, frame, waited: started.elapsed() });
@@ -122,6 +132,7 @@ pub fn scan_pipelined(
         Ok(())
     })();
     // Back home, and the overlay let go, whatever failed.
+    hmd.state.hands_at_rest(home.position, body_home);
     let back = hmd.set_head(home);
     hmd.hold_still(false)?;
     back?;

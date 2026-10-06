@@ -21,7 +21,7 @@ from astrbot.api import llm_tool
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 
-from .vrchat_adapter import EMOTES, find_adapter, goto_words, survey_words
+from .vrchat_adapter import MOTIONS, find_adapter, goto_words, motion_body, posture_body, survey_words
 
 
 def _json(data) -> str:
@@ -108,7 +108,7 @@ class VRChatPlugin(Star):
 
     async def _vr(self, event: AstrMessageEvent, action) -> mcp.types.CallToolResult | str:
         """Runs a VR action for the room's own chat: ``action(adapter)``
-        returns (text, panorama JPEG, map PNG)."""
+        returns (text, view or panorama JPEG, map PNG or None)."""
         adapter = find_adapter(self.context)
         if adapter is None:
             return _json({"error": "VRChat 平台未运行"})
@@ -118,35 +118,40 @@ class VRChatPlugin(Star):
             text, pano, top = await action(adapter)
         except Exception as exc:  # noqa: BLE001 - reported to the model
             return _json({"error": str(exc)})
-        return mcp.types.CallToolResult(content=[
+        content = [
             mcp.types.TextContent(type="text", text=text),
             mcp.types.ImageContent(type="image", data=base64.b64encode(pano).decode(), mimeType="image/jpeg"),
-            mcp.types.ImageContent(type="image", data=base64.b64encode(top).decode(), mimeType="image/png"),
-        ])
+        ]
+        if top is not None:
+            content.append(mcp.types.ImageContent(type="image", data=base64.b64encode(top).decode(), mimeType="image/png"))
+        return mcp.types.CallToolResult(content=content)
 
-    @llm_tool("vrchat_look_around")
-    async def vrchat_look_around(self, event: AstrMessageEvent, players: bool = True):
-        """原地转头环视一圈（约 2 秒），返回两张带相同编号的图：全景图（中间是正前方，两边是身后）和俯视地图（你在中间、朝上；绿色地面、红色障碍、暗色未知），以及编号地点列表（玩家按名牌认出，白名单好友标出；可走的地面、已见区域的边缘、可跳上去的高台），各带距离和方位（相对正前方，正数在右）。用 vrchat_walk_to 走到某个编号。
+    @llm_tool("vrchat_view")
+    async def vrchat_view(self, event: AstrMessageEvent, around: bool = False, players: bool = True):
+        """看正前方的画面，带编号地点（玩家按名牌认出，白名单好友标出；可走的地面、已见区域的边缘、可跳上去的高台），各带距离和方位（相对正前方，正数在右）。用 vrchat_walk_to 走到某个编号。around 为 true 时原地转一圈（要几秒，房间里的人都看得到你在四处张望），返回全景图（中间是正前方，两边是身后）和俯视地图（你在中间、朝上；绿色地面、红色障碍、暗色未知）。尽量少用 around：只在要找的东西不在前方、又不知道在哪个方向时才用；否则先转向（vrchat_step）再看前方。
 
         Args:
+            around(boolean): 是否环视一圈（慢，少用；默认 false，只看前方）。
             players(boolean): 是否读名牌找玩家（默认 true；false 稍快）。
         """
 
         async def look(adapter):
-            data, pano, top = await adapter.vr_survey(bool(players), who="text")
+            data, pano, top = await adapter.vr_survey(bool(players), who="text", around=bool(around))
             return survey_words(data), pano, top
 
         return await self._vr(event, look)
 
     @llm_tool("vrchat_walk_to")
     async def vrchat_walk_to(self, event: AstrMessageEvent, place: int = -1, bearing: float = 0.0,
-                             distance: float = 0.0):
-        """走到上一次 vrchat_look_around 的某个编号地点（绕开障碍、分段走、每段后重新环视），或按方位走一段距离；走完返回新的全景图、地图和编号地点。
+                             distance: float = 0.0, pace: str = "walk", around: bool = False):
+        """走到上一次 vrchat_view 的某个编号地点（绕开障碍、分段走），或按方位走一段距离；走完返回正前方的新画面和编号地点（around 为 true 时返回环视全景图和地图，少用）。
 
         Args:
             place(number): 上一次环视里的地点编号；不按编号走时留空（-1）。
             bearing(number): 不按编号时：相对正前方的角度（正数向右，180 为身后）。
             distance(number): 配合 bearing：走多少米（默认 2）。
+            pace(string): walk（走，默认）或 run（跑）。
+            around(boolean): 到了以后是否环视一圈（慢，少用；默认 false，只看前方）。
         """
 
         async def walk(adapter):
@@ -156,6 +161,10 @@ class VRChatPlugin(Star):
                 body = {"bearing": float(bearing), "distance": float(distance or 2.0)}
             else:
                 raise RuntimeError("给一个地点编号，或者方位和距离")
+            if pace in ("walk", "run"):
+                body["pace"] = pace
+            if around:
+                body["around"] = True
             data, pano, top = await adapter.vr_goto(body, who="text")
             return goto_words(data) + " " + survey_words(data["after"]), pano, top
 
@@ -242,7 +251,7 @@ class VRChatPlugin(Star):
 
     @llm_tool("vrchat_step")
     async def vrchat_step(self, event: AstrMessageEvent, turn: float = 0.0, direction: str = "forward",
-                          meters: float = 0.0, jump: bool = False) -> str:
+                          meters: float = 0.0, jump: bool = False, pace: str = "walk") -> str:
         """小而精确的动作（不是赶路，赶路用 vrchat_walk_to）：先按角度转身（正为右），再朝某个方向走几米（按角色自身速度计量，被挡住就停），或者跳。
 
         Args:
@@ -250,8 +259,9 @@ class VRChatPlugin(Star):
             direction(string): 往哪走（相对转身后的朝向）：forward、back、left、right。
             meters(number): 走多少米，0 到 5（0 不走）。
             jump(boolean): 起步时跳（不走时原地跳）。
+            pace(string): walk（走，默认）或 run（跑）。
         """
-        return await self._act(event, lambda a: a.step(turn, direction, meters, jump))
+        return await self._act(event, lambda a: a.step(turn, direction, meters, jump, pace))
 
     @llm_tool("vrchat_height")
     async def vrchat_height(self, event: AstrMessageEvent, metres: float | None = None,
@@ -280,16 +290,36 @@ class VRChatPlugin(Star):
         """在 VRChat 里跳一下。"""
         return await self._act(event, lambda a: a.request("POST", "/v1/jump"))
 
-    @llm_tool("vrchat_emote")
-    async def vrchat_emote(self, event: AstrMessageEvent, name: str) -> str:
-        """在 VRChat 里做一个表情动作（当前 avatar 支持默认表情菜单时）。
+    @llm_tool("vrchat_motion")
+    async def vrchat_motion(self, event: AstrMessageEvent, name: str, other_hand: bool = False, times: int = 1,
+                            seconds: float = 0.0) -> str:
+        """在 VRChat 里用全身做一个动作（挥手、再见、点头、摇头、摆手拒绝、思考、环顾、转身、后空翻、跳舞等）。
 
         Args:
-            name(string): wave、clap、point、cheer、dance、backflip、sadness、die 之一。
+            name(string): wave、bye、byebye、nod、shake_head、refuse、think、look_around、turn、backflip、dance、dance_short、chicken_dance、idle_talk、fold_arms 之一。
+            other_hand(boolean): 换另一只手（镜像）。
+            times(number): 做几次（1-5）。
+            seconds(number): 跳舞、待机类动作持续多久（秒）。
         """
-        if name not in EMOTES:
-            return _json({"error": f"name 必须是 {', '.join(EMOTES)} 之一"})
-        return await self._act(event, lambda a: a.request("POST", "/v1/emote", {"name": name}))
+        try:
+            body = motion_body({"name": name, "other_hand": other_hand, "times": times, "seconds": seconds})
+        except ValueError as e:
+            return _json({"error": str(e), "names": list(MOTIONS)})
+        return await self._act(event, lambda a: a.request("POST", "/v1/motion", body))
+
+    @llm_tool("vrchat_posture")
+    async def vrchat_posture(self, event: AstrMessageEvent, posture: str, way: str = "back") -> str:
+        """在 VRChat 里坐下、躺下或站起来；躺着时可以翻身换方向。保持该姿势直到被要求改变或开始移动。
+
+        Args:
+            posture(string): stand（站起来）、sit（坐下，翘二郎腿）、lie（躺下）之一。
+            way(string): 躺下时的方向：back（仰躺）、left（左侧躺）、right（右侧躺）、front（趴着）。
+        """
+        try:
+            body = posture_body({"posture": posture, "way": way})
+        except ValueError as e:
+            return _json({"error": str(e)})
+        return await self._act(event, lambda a: a.request("POST", "/v1/motion", body))
 
     @llm_tool("vrchat_stop")
     async def vrchat_stop(self, event: AstrMessageEvent) -> str:

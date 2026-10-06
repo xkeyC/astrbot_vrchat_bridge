@@ -23,6 +23,7 @@ mod api;
 mod bridge;
 mod calibrate;
 mod follow;
+mod motion;
 mod game;
 mod sightings;
 mod social;
@@ -189,6 +190,9 @@ async fn main() -> Result<()> {
         .route("/v1/vr/input", post(vr_input))
         .route("/v1/vr/head", post(vr_head))
         .route("/v1/vr/calibrate", get(vr_calibrate_status).post(vr_calibrate))
+        .route("/v1/motion", get(motion_status).post(motion_play))
+        .route("/v1/motion/stop", post(motion_stop))
+        .route("/v1/motion/reload", post(motion_reload))
         .route("/v1/vr/survey/pano.jpg", get(vr_pano))
         .route("/v1/vr/survey/map.png", get(vr_map))
         .route_layer(middleware::from_fn_with_state(bridge.clone(), auth))
@@ -359,11 +363,13 @@ async fn jump(State(b): State<App>) -> Reply {
 }
 
 async fn step(State(b): State<App>, Body(body): Body) -> Reply {
+    let_go_of_motion(&b).await;
     b.require_game()?;
     let turn = num(&body, "turn", 0.0).clamp(-180.0, 180.0) as f32;
     let meters = num(&body, "meters", 0.0).clamp(0.0, vr::STEP_MAX_M as f64) as f32;
     let direction = body["direction"].as_str().unwrap_or("forward").to_string();
     let jump = body["jump"].as_bool().unwrap_or(false);
+    let axis = vr::pace_axis(body["pace"].as_str())?;
     b.take_over();
     let since = vrc_vr::walk::stops();
     let v = on_headset(&b, move |vr, b| {
@@ -379,6 +385,7 @@ async fn step(State(b): State<App>, Body(body): Body) -> Reply {
             meters,
             jump,
             since,
+            axis,
         )
     })
     .await;
@@ -417,6 +424,9 @@ async fn follow_status(State(b): State<App>) -> Json<Value> {
 }
 
 async fn follow(State(b): State<App>, Body(body): Body) -> Reply {
+    if !body["stop"].as_bool().unwrap_or(false) {
+        let_go_of_motion(&b).await;
+    }
     if body["stop"].as_bool().unwrap_or(false) {
         b.end_takeover();
         b.follower.stop();
@@ -554,16 +564,20 @@ async fn game_stop(State(_b): State<App>) -> Reply {
 // -- VR ---------------------------------------------------------------------------------
 
 async fn vr_survey(State(b): State<App>, Body(body): Body) -> Reply {
+    let_go_of_motion(&b).await;
     let players = body["players"].as_bool().unwrap_or(true);
+    // All around (the default here), or only ahead.
+    let around = body["around"].as_bool().unwrap_or(true);
     // The scan turns the head, and a follow walks where the head looks.
     b.take_over();
     let whitelist = b.social.whitelist_names();
-    let result = on_headset(&b, move |vr, _| vr.survey(&whitelist, players)).await;
+    let result = on_headset(&b, move |vr, _| vr.survey(&whitelist, players, around)).await;
     b.idle_later();
     Ok(Json(result?))
 }
 
 async fn vr_goto(State(b): State<App>, Body(body): Body) -> Reply {
+    let_go_of_motion(&b).await;
     b.require_game()?;
     b.take_over();
     let whitelist = b.social.whitelist_names();
@@ -599,6 +613,7 @@ async fn vr_set_height(State(b): State<App>, Body(body): Body) -> Reply {
 /// Like SteamVR's reset: stops moving, connects the headset again, looks
 /// level ahead with the hands at rest, and recenters Monado's local spaces.
 async fn vr_reset(State(b): State<App>) -> Reply {
+    let_go_of_motion(&b).await;
     b.take_over();
     vrc_vr::walk::stop_all();
     for axis in ["/input/Vertical", "/input/Horizontal"] {
@@ -685,7 +700,7 @@ async fn vr_set_trackers(State(b): State<App>, Body(body): Body) -> Reply {
     let mut v = serde_json::to_value(b.anim.trackers.lk().clone())?;
     for (k, val) in body.as_object().into_iter().flatten() {
         if v.get(k).is_none() {
-            return Err(anyhow::anyhow!("no setting {k} (on, parts, head, shift, scale, auto_calibrate)").into());
+            return Err(anyhow::anyhow!("no setting {k} (on, parts, head, shift, scale, gait, auto_calibrate)").into());
         }
         v[k] = val.clone();
     }
@@ -699,6 +714,7 @@ async fn vr_set_trackers(State(b): State<App>, Body(body): Body) -> Reply {
 /// "press_ms": 150}` (a press: let go after); `{"release": true}` gives
 /// the hands back to the animation, at rest.
 async fn vr_hand(State(b): State<App>, Body(body): Body) -> Reply {
+    let_go_of_motion(&b).await;
     use std::sync::atomic::Ordering;
     if body["release"].as_bool() == Some(true) {
         b.anim.manual_hands.store(false, Ordering::Relaxed);
@@ -763,6 +779,7 @@ async fn vr_input(State(b): State<App>, Body(body): Body) -> Reply {
 /// (then `/v1/screenshot?pitch=-80`); or `{"lean": [right, up, ahead]}`
 /// moves the head alone (metres).
 async fn vr_head(State(b): State<App>, Body(body): Body) -> Reply {
+    let_go_of_motion(&b).await;
     use std::sync::atomic::Ordering;
     let (head, off) = if let Some(deg) = body["bend"].as_f64() {
         if !(0.0..=75.0).contains(&deg) {
@@ -816,4 +833,76 @@ async fn vr_calibrate(State(b): State<App>, Body(body): Body) -> Reply {
     b.require_game()?;
     let report = tokio::task::spawn_blocking(move || calibrate::now(&b, force)).await??;
     Ok(Json(report))
+}
+
+// -- motion programs ----------------------------------------------------------------
+
+/// The clips, and the program playing.
+async fn motion_status(State(b): State<App>) -> Json<Value> {
+    let playing = b.anim.motion.lk().as_ref().map(motion::Program::status);
+    Json(json!({"clips": b.motions.list(), "playing": playing}))
+}
+
+/// Plays a program: `{"steps": [{"clip": "wave", "mirror": false, "speed":
+/// 1, "seconds": 5, "in_place": false, "fade": 0.6}, ...]}`, one clip as
+/// `{"clip": "wave", ...}`, or a posture: `{"posture": "lie", "way":
+/// "left"}` (stand, sit, lie: back, left, right, front). Answers at once unless `{"wait": true}`; a new
+/// program stops the one playing.
+async fn motion_play(State(b): State<App>, Body(body): Body) -> Reply {
+    b.require_game()?;
+    let steps: Vec<motion::Step> = if let Some(posture) = body["posture"].as_str() {
+        let held = motion::holding(&b);
+        match motion::posture_steps(posture, body["way"].as_str(), held.as_deref())? {
+            Some(steps) => steps,
+            None => {
+                // Standing: whatever holds a posture gets up.
+                motion::STOP.store(true, std::sync::atomic::Ordering::SeqCst);
+                return Ok(Json(json!({"ok": true, "standing_up": held.is_some()})));
+            }
+        }
+    } else {
+        match body.get("steps") {
+            Some(s) => serde_json::from_value(s.clone())?,
+            None => vec![serde_json::from_value(body.clone())?],
+        }
+    };
+    for s in &steps {
+        if b.motions.get(&s.clip).is_none() {
+            return Err(anyhow::anyhow!("no motion {} (GET /v1/motion lists them)", s.clip).into());
+        }
+    }
+    let wait = body["wait"].as_bool().unwrap_or(false);
+    let task = tokio::task::spawn_blocking({
+        let b = b.clone();
+        move || motion::play(&b, steps)
+    });
+    if wait {
+        return Ok(Json(task.await??));
+    }
+    tokio::spawn(async move {
+        match task.await {
+            Ok(Ok(v)) => tracing::info!("motion: {v}"),
+            Ok(Err(e)) => tracing::warn!("motion: {e:#}"),
+            Err(e) => tracing::warn!("motion: {e}"),
+        }
+    });
+    Ok(Json(json!({"ok": true, "playing": true})))
+}
+
+/// Stops the program playing (a held posture gets up first).
+async fn motion_stop(State(_b): State<App>) -> Json<Value> {
+    motion::STOP.store(true, std::sync::atomic::Ordering::SeqCst);
+    Json(json!({"ok": true}))
+}
+
+async fn motion_reload(State(b): State<App>) -> Reply {
+    let names = b.motions.reload()?;
+    Ok(Json(json!({"clips": names})))
+}
+
+/// Stops a motion program (a held posture gets up first) and waits until it
+/// lets go of the headset: before anything else moves the body.
+async fn let_go_of_motion(b: &App) {
+    let b = b.clone();
+    let _ = tokio::task::spawn_blocking(move || motion::stop_and_wait(&b)).await;
 }
