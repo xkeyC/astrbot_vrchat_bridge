@@ -35,6 +35,17 @@ pub const CHATBOX_LIMIT: usize = 144;
 /// VRChat throttles chatbox spam; messages are paced at least this far apart.
 const CHATBOX_INTERVAL: Duration = Duration::from_millis(1600);
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
+/// A follow the model's own moves paused resumes this long after its last
+/// move (a step, a walk, a look around).
+pub const TAKEOVER_IDLE: Duration = Duration::from_secs(10);
+
+/// A follow paused while the model moves the avatar itself.
+#[derive(Clone, Debug)]
+pub struct Takeover {
+    pub target: String,
+    /// Its standing distance (world metres).
+    pub distance: Option<f32>,
+}
 
 pub struct Bridge {
     pub args: Args,
@@ -55,6 +66,11 @@ pub struct Bridge {
     pub follower: Arc<Follower>,
     pub sightings: Arc<Sightings>,
     pub anim: Arc<Anim>,
+    /// The follow the model's moves paused, given back TAKEOVER_IDLE after
+    /// its last (take_over, idle_later).
+    takeover: Mutex<Option<Takeover>>,
+    /// Counts the model's moves: a resume scheduled before the latest is off.
+    takeover_moves: AtomicU64,
 }
 
 #[derive(Default)]
@@ -94,6 +110,8 @@ impl Bridge {
             sightings: Arc::new(Sightings::default()),
             anim,
             args,
+            takeover: Mutex::new(None),
+            takeover_moves: AtomicU64::new(0),
         });
         (bridge, chat_rx)
     }
@@ -127,7 +145,10 @@ impl Bridge {
         }
         let f = self.follower.status();
         snap["follow"] = if f["state"] == "idle" { Value::Null } else { json!({"target": f["target"], "state": f["state"]}) };
-        snap["takeover"] = Value::Null;
+        snap["takeover"] = match self.takeover.lk().as_ref() {
+            Some(t) => json!({"target": t.target, "distance": t.distance}),
+            None => Value::Null,
+        };
         snap
     }
 
@@ -135,6 +156,63 @@ impl Bridge {
     pub fn notify_state(&self) {
         if let Some((_, tx)) = self.client.lk().as_ref() {
             let _ = tx.try_send(Message::Text(json!({"type": "state", "state": self.room_state()}).to_string().into()));
+        }
+    }
+
+    // -- the model's moves pause following ------------------------------------
+
+    /// The model moves the avatar: a follow is paused, resumed by itself
+    /// once the model is done (idle_later). A move while one is paused
+    /// keeps it paused.
+    pub fn take_over(&self) {
+        self.takeover_moves.fetch_add(1, Ordering::SeqCst);
+        if self.follower.is_idle() {
+            return;
+        }
+        let s = self.follower.status();
+        if let Some(target) = s["target"].as_str() {
+            *self.takeover.lk() = Some(Takeover {
+                target: target.to_string(),
+                distance: s["distance"].as_f64().map(|d| d as f32),
+            });
+            tracing::info!(target, "takeover: following paused while the model moves");
+        }
+        self.follower.stop();
+        self.notify_state();
+    }
+
+    /// After a move: unless the model moves again within TAKEOVER_IDLE, the
+    /// follow it paused resumes.
+    pub fn idle_later(self: &Arc<Self>) {
+        let moves = self.takeover_moves.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.takeover.lk().is_none() {
+            return;
+        }
+        let me = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(TAKEOVER_IDLE).await;
+            if me.takeover_moves.load(Ordering::SeqCst) == moves {
+                me.resume_following();
+            }
+        });
+    }
+
+    fn resume_following(self: &Arc<Self>) {
+        let Some(t) = self.takeover.lk().take() else { return };
+        if !self.follower.is_idle() || self.require_game().is_err() {
+            self.notify_state();
+            return;
+        }
+        tracing::info!(target = t.target, "takeover over: following again");
+        self.follower.start(self, &t.target, t.distance);
+        self.send_event(json!({"type": "follow", "state": "resumed", "target": t.target}));
+    }
+
+    /// Drops a paused follow without resuming it (a stop, a new follow).
+    pub fn end_takeover(&self) {
+        self.takeover_moves.fetch_add(1, Ordering::SeqCst);
+        if self.takeover.lk().take().is_some() {
+            self.notify_state();
         }
     }
 
@@ -272,6 +350,7 @@ impl Bridge {
         if !p.ptt_held {
             let _ = self.osc.send_i32("/input/Voice", 1);
             p.ptt_held = true;
+            tracing::info!("timing: the bot speaks (push-to-talk on)");
         }
         let now = Instant::now();
         let len = Duration::from_secs_f64(pcm.len() as f64 / (SAMPLE_RATE as f64 * 2.0));
@@ -306,6 +385,7 @@ impl Bridge {
         let _ = self.osc.send_i32("/input/Voice", 0);
         p.ptt_held = false;
         p.release_pending = false;
+        tracing::info!("timing: the bot stops speaking (push-to-talk off)");
     }
 
     /// Lets go of every input VRChat keeps the last value of (the stick,
@@ -434,6 +514,51 @@ pub fn split_chatbox(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    fn bridge() -> Arc<Bridge> {
+        let dir = std::env::temp_dir().join(format!("vrc-bridge-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let token = dir.join("token");
+        let args = Args::parse_from(["vrc-bridge", "--token-file", token.to_str().unwrap()]);
+        Bridge::new(args, "t".to_string()).0
+    }
+
+    fn paused(b: &Bridge) {
+        *b.takeover.lk() = Some(Takeover { target: "xkeyC".to_string(), distance: Some(1.5) });
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_paused_follow_resumes_after_the_models_last_move() {
+        let b = bridge();
+        paused(&b);
+        b.idle_later();
+        tokio::time::sleep(TAKEOVER_IDLE / 2).await;
+        b.take_over(); // another move: the first resume is off
+        b.idle_later();
+        tokio::time::sleep(TAKEOVER_IDLE - Duration::from_secs(1)).await;
+        assert!(b.takeover.lk().is_some());
+        assert_eq!(b.room_state()["takeover"], json!({"target": "xkeyC", "distance": 1.5}));
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        // Handed back (with no game running, not followed).
+        assert!(b.takeover.lk().is_none());
+        assert!(b.follower.is_idle());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_drops_a_paused_follow() {
+        let b = bridge();
+        paused(&b);
+        b.idle_later();
+        b.end_takeover();
+        assert!(b.takeover.lk().is_none());
+        assert_eq!(b.room_state()["takeover"], Value::Null);
+        // A move after it pauses nothing: nobody is followed.
+        b.take_over();
+        b.idle_later();
+        tokio::time::sleep(TAKEOVER_IDLE * 2).await;
+        assert!(b.takeover.lk().is_none());
+    }
 
     #[test]
     fn chatbox_parts() {

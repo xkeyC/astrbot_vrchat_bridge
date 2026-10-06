@@ -334,6 +334,7 @@ async fn chatbox(State(b): State<App>, Body(body): Body) -> Reply {
 }
 
 async fn stop(State(b): State<App>) -> Json<Value> {
+    b.end_takeover(); // stopping means staying stopped
     b.follower.stop();
     vrc_vr::walk::stop_all();
     for axis in ["/input/Vertical", "/input/Horizontal"] {
@@ -357,7 +358,7 @@ async fn step(State(b): State<App>, Body(body): Body) -> Reply {
     let meters = num(&body, "meters", 0.0).clamp(0.0, vr::STEP_MAX_M as f64) as f32;
     let direction = body["direction"].as_str().unwrap_or("forward").to_string();
     let jump = body["jump"].as_bool().unwrap_or(false);
-    b.follower.stop();
+    b.take_over();
     let since = vrc_vr::walk::stops();
     let v = on_headset(&b, move |vr, b| {
         let osc = &b.osc;
@@ -374,8 +375,9 @@ async fn step(State(b): State<App>, Body(body): Body) -> Reply {
             since,
         )
     })
-    .await?;
-    Ok(Json(v))
+    .await;
+    b.idle_later();
+    Ok(Json(v?))
 }
 
 async fn emote(State(b): State<App>, Body(body): Body) -> Reply {
@@ -410,6 +412,7 @@ async fn follow_status(State(b): State<App>) -> Json<Value> {
 
 async fn follow(State(b): State<App>, Body(body): Body) -> Reply {
     if body["stop"].as_bool().unwrap_or(false) {
+        b.end_takeover();
         b.follower.stop();
         b.notify_state();
         return Ok(Json(b.follower.status()));
@@ -441,6 +444,7 @@ async fn follow(State(b): State<App>, Body(body): Body) -> Reply {
         bail_fail("nobody to follow: name someone, or a whitelisted player must be here")?;
     }
     let distance = body["distance"].as_f64().map(|d| d as f32);
+    b.end_takeover();
     b.follower.start(&b, &name, distance);
     Ok(Json(b.follower.status()))
 }
@@ -546,17 +550,21 @@ async fn game_stop(State(_b): State<App>) -> Reply {
 async fn vr_survey(State(b): State<App>, Body(body): Body) -> Reply {
     let players = body["players"].as_bool().unwrap_or(true);
     // The scan turns the head, and a follow walks where the head looks.
-    b.follower.stop();
+    b.take_over();
     let whitelist = b.social.whitelist_names();
-    Ok(Json(on_headset(&b, move |vr, _| vr.survey(&whitelist, players)).await?))
+    let result = on_headset(&b, move |vr, _| vr.survey(&whitelist, players)).await;
+    b.idle_later();
+    Ok(Json(result?))
 }
 
 async fn vr_goto(State(b): State<App>, Body(body): Body) -> Reply {
     b.require_game()?;
-    b.follower.stop();
+    b.take_over();
     let whitelist = b.social.whitelist_names();
     let since = vrc_vr::walk::stops();
-    Ok(Json(on_headset(&b, move |vr, _| vr.goto(&whitelist, &body, since)).await?))
+    let result = on_headset(&b, move |vr, _| vr.goto(&whitelist, &body, since)).await;
+    b.idle_later();
+    Ok(Json(result?))
 }
 
 async fn vr_height(State(b): State<App>) -> Json<Value> {
@@ -585,7 +593,7 @@ async fn vr_set_height(State(b): State<App>, Body(body): Body) -> Reply {
 /// Like SteamVR's reset: stops moving, connects the headset again, looks
 /// level ahead with the hands at rest, and recenters Monado's local spaces.
 async fn vr_reset(State(b): State<App>) -> Reply {
-    b.follower.stop();
+    b.take_over();
     vrc_vr::walk::stop_all();
     for axis in ["/input/Vertical", "/input/Horizontal"] {
         let _ = b.osc.send_f32(axis, 0.0);
@@ -597,7 +605,9 @@ async fn vr_reset(State(b): State<App>) -> Reply {
         vr.face(yaw, 0.0)?;
         Ok(yaw)
     })
-    .await?;
+    .await;
+    b.idle_later();
+    let yaw = yaw?;
     let recentered = if b.args.monado_ctl.is_empty() {
         None
     } else {

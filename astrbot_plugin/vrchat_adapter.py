@@ -54,6 +54,8 @@ WATCHDOG_INTERVAL = 5.0
 PREROLL_SECONDS = 2.0
 # A voice session that failed to start is not retried for this long.
 START_RETRY_SECONDS = 30.0
+# A pause this long ends a stretch of speech (timing logs).
+SPEECH_GAP_SECONDS = 0.6
 # Upper bound of the bot's speech queued ahead.
 REALTIME_BUFFER = 3.0
 # The local voice server sends speech at real-time pace: a short playout
@@ -219,6 +221,10 @@ def room_context(state: dict) -> str:
     if follow.get("target") and follow.get("state", "idle") != "idle":
         how = {"following": "", "searching": ", looking around for them"}.get(follow["state"], "")
         text += f" You are following {follow['target']}{how}."
+    takeover = state.get("takeover") or {}
+    if takeover.get("target"):
+        text += (f" Following {takeover['target']} is paused while you move yourself; it resumes"
+                 " by itself about 10 s after your last move (vrchat_stop to stay put).")
     return f"({text})"
 
 
@@ -410,6 +416,12 @@ class VRChatPlatformAdapter(Platform):
         self.state: dict[str, Any] = {}
         self.session = None  # the room's VoiceSession, if any
         self._detector = SpeechDetector()
+        # Timing logs (where a reply's delay goes): the room's speech as the
+        # plugin gets it, and the bot's speech as it sends it.
+        self._talk = SpeechDetector()
+        self._talk_loud_at = 0.0
+        self._talking = False
+        self._sent_at = 0.0
         self._preroll: deque[tuple[float, bytes]] = deque()
         self._retry_at = 0.0
         self._http: aiohttp.ClientSession | None = None
@@ -538,6 +550,10 @@ class VRChatPlatformAdapter(Platform):
     def _send_audio(self, chunk: bytes) -> None:
         if self._ws is None:
             return
+        now = time.monotonic()
+        if now - self._sent_at > SPEECH_GAP_SECONDS:
+            logger.info("VRChat timing: the bot's speech starts (to the bridge)")
+        self._sent_at = now
         if self._out.full():  # the bridge fell behind: drop the oldest audio
             with contextlib.suppress(asyncio.QueueEmpty):
                 self._out.get_nowait()
@@ -815,6 +831,7 @@ class VRChatPlatformAdapter(Platform):
     def _on_audio(self, pcm: bytes) -> None:
         if self.session is not None:
             self.session.media.feed(pcm)
+            self._time_speech(pcm)
             return
         # Standby: keep a short pre-roll and wait for real speech.
         now = time.monotonic()
@@ -832,6 +849,21 @@ class VRChatPlatformAdapter(Platform):
         for _, chunk in self._preroll:
             session.media.feed(chunk)
         self._preroll.clear()
+
+    def _time_speech(self, pcm: bytes) -> None:
+        """Logs when the room's speech starts and ends as the plugin gets it
+        (an energy VAD, like standby's): set against the voice server's
+        turn records (GET /v1/inferences?kind=voice.turn), what came before."""
+        now = time.monotonic()
+        loud = self._talk.feed(pcm)
+        if loud:
+            self._talk_loud_at = now
+            if not self._talking:
+                self._talking = True
+                logger.info("VRChat timing: room speech starts")
+        elif self._talking and now - self._talk_loud_at > SPEECH_GAP_SECONDS:
+            self._talking = False
+            logger.info("VRChat timing: room speech ended %.1f s ago", now - self._talk_loud_at)
 
     def _start_voice(self):
         from astrbot.core.voice.chat import VoiceChat
