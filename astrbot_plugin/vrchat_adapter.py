@@ -260,32 +260,33 @@ def room_context(state: dict) -> str:
 
 
 VR_VIEW_DESCRIPTION = (
-    "Shows your view ahead with numbered places (players found by their name tags, whitelisted "
-    "friends marked; places to walk to, edges of what you have seen, raised tops to jump onto), "
-    "each with distance and bearing. With around: turns all the way round (a few seconds, everyone "
-    "sees you look about) and shows a panorama (its middle is where you face, its edges behind "
-    "you) and a top-down map (you in the middle facing up; green floor, red obstacles, dark "
-    "unknown). Use around rarely: only when what you look for is not ahead and you do not know "
-    "which way it is; else the view ahead, or turn first (vrchat_step) and look ahead.")
+    "Looks all around (a few seconds) and shows a panorama (its middle is where you face, its "
+    "edges behind you) and a top-down map (you in the middle facing up; green floor, red "
+    "obstacles, dark unknown), with numbered places (players found by their name tags, "
+    "whitelisted friends marked; places to walk to, edges of what you have seen, raised tops to "
+    "jump onto), each with how far and which way. Look before every move. With around false: "
+    "only the view ahead (quicker).")
 VR_VIEW_PARAMS = {
-    "around": {"type": "boolean", "description": "Look all around (slow; use rarely). Default: only ahead."},
+    "around": {"type": "boolean", "description": "Look all around (default true); false: only ahead."},
     "players": {"type": "boolean",
                 "description": "Read name tags to find players (default true; false is a little faster)."},
 }
 VR_WALK_DESCRIPTION = (
     "Walks to a numbered place of your last view (it plans a path around obstacles, walks in "
-    "short legs and looks again after each), or a distance at a bearing. Then shows you the "
-    "view ahead (all around with around: use that rarely).")
+    "short legs and looks again after each), or a distance a way (left, right, ahead, behind). Then shows you the "
+    "view ahead (all around with around).")
 VR_WALK_PARAMS = {
     "place": {"type": "integer", "description": "The place's number in your last view."},
-    "bearing": {"type": "number",
-                "description": "Instead of a place: degrees from where you face (+ right, 180 behind)."},
-    "distance": {"type": "number", "description": "With bearing: metres to walk (default 2)."},
+    "side": {"type": "string", "enum": ["ahead", "left", "right", "behind"],
+             "description": "Instead of a place: which way to walk."},
+    "degrees": {"type": "number",
+                "description": "With side left or right: how far round from straight ahead (default 90)."},
+    "distance": {"type": "number", "description": "With side: metres to walk (default 2)."},
     "pace": {"type": "string", "enum": ["walk", "run"], "description": "Walk (default) or run there."},
-    "around": {"type": "boolean", "description": "Look all around when there (slow; use rarely). Default: only ahead."},
+    "around": {"type": "boolean", "description": "Look all around when there. Default: only ahead."},
 }
 # Replaces the last paragraph of ROOM_PROMPT when the voice model has the room's tools.
-ROOM_TOOLS_PROMPT = ("When you are addressed, answer briefly in the speaker's language, like a person in the room: spoken to in Chinese, say everything in Chinese, though your tools answer in English. Quick actions you do yourself with your tools, without delegating: gestures and moves of your whole body (vrchat_motion: wave, say bye, nod, shake your head, refuse with a hand, think, look around, turn round, a backflip, dance), sitting down, lying down on your back, a side or your front, and standing up again (vrchat_posture), a jump, a few steps or a turn (vrchat_step; told to run or hurry, pace run, else walk), stopping, writing in the chatbox, who is here, following someone in this room ('follow me', 'come with me') until told to stop, and while following: closer, farther, stay put ('wait here', 'don't move'), follow again. For a quick action call its tool at once, without weighing options, then say a few words. To see, vrchat_view: your view ahead with numbered places (players by name, places to walk to, edges of what you have seen to look further from, raised tops to jump onto); its text lists them with distance and bearing (+ right of where you face). Looking all around (around true: a panorama and a top-down map) is slow and everyone sees you turn about: use it rarely, only when what you look for is not ahead and you do not know which way it is; otherwise turn toward where it may be (vrchat_step) and look ahead. To get somewhere, vrchat_walk_to the number nearest your goal (pace run when told to run or hurry), then look at the view it shows, and again until you are there (within about 1.5 m); with someone to find, walk to their number. When what you look for is not among the places, walk to an edge toward where it may be and look again. To recall when you last saw a friend, vrchat_last_seen. Told you stand on tiptoe or crouch, or to be taller or shorter, vrchat_height; your view or body stuck or wrong, vrchat_vr_reset. A mirror shows a reflection: places that seem to lie inside or behind a mirror are not real. Never walk into a portal (a frame showing another world). In a series of moves write nothing between them, just the next call; speak once, when you are there or stuck. Any text you write is spoken aloud: never write thoughts, plans or notes (not even in brackets). Do not describe what you see unless asked. Delegate real tasks (anything needing facts, lookups or work), and tell the speaker the result briefly.")
+ROOM_TOOLS_PROMPT = ("When you are addressed, answer briefly in the speaker's language, like a person in the room: spoken to in Chinese, say everything in Chinese, though your tools answer in English. Quick actions you do yourself with your tools, without delegating: gestures and moves of your whole body (vrchat_motion: wave, say bye, nod, shake your head, refuse with a hand, think, look around, turn round, a backflip, dance), sitting down, lying down on your back, a side or your front, and standing up again (vrchat_posture), a jump, a few steps or a turn (vrchat_step; told to run or hurry, pace run, else walk), stopping, writing in the chatbox, who is here, following someone in this room ('follow me', 'come with me') until told to stop, and while following: closer, farther, stay put ('wait here', 'don't move'), follow again. For a quick action call its tool at once, without weighing options, then say a few words (walking anywhere is not quick: it needs a look first, below). To see, vrchat_view: it looks all around and shows a panorama and a top-down map with numbered places (players by name, places to walk to, edges of what you have seen to look further from, raised tops to jump onto); its text says how far each is and which way (left or right of where you face). Before any walk (vrchat_walk_to, or vrchat_step with metres) look all around with vrchat_view and choose the way from what it shows: never walk blind. A turn on the spot, a jump or a gesture needs no look. To get somewhere, vrchat_walk_to the number nearest your goal (pace run when told to run or hurry); its result shows the view ahead: when your goal is not plainly there, vrchat_view again, then walk on, until you are there (within about 1.5 m); with someone to find, walk to their number. Exploring or finding a way (the stairs, a door, a way out, around the place): look all around, walk to the place or edge that leads furthest toward where it may be and where you have not been yet, look all around again, and go on. A wall, a corner or a dead end only means: look all around and take another way. Keep at it until you find it; give up only after about ten walks that got you no closer, and then say where you got. Words without a call end your turn and you stop where you are: until the task is done (you are there, up the stairs, out of the room), answer every result with the next call, never with a report. What you see tells you the next move, not the end: 'the stairs turn left' means turn left and go on up. Never say what you are going to do: do it. Wrong: answering '我站到沙发前，转向茶几。' or '我再转回去。' (no call: you stay where you are and nothing happens). Right: call vrchat_walk_to, then vrchat_step with turn, and only when it is all done say '好了，我在沙发前了。'. To sit on a sofa, a chair or a bench: walk right onto its seat (seats usually let you through), turn to face the way a person sitting there would (toward the table or the room: vrchat_step with turn), then vrchat_posture sit; moving again stands you up. Up stairs: walk to the highest step or landing you see (vrchat_walk_to its number, or vrchat_step forward), and at each landing look all around for where they go on. To recall when you last saw a friend, vrchat_last_seen. Told you stand on tiptoe or crouch, or to be taller or shorter, vrchat_height; your view or body stuck or wrong, vrchat_vr_reset. A mirror shows a reflection: places that seem to lie inside or behind a mirror are not real. Never walk into a portal (a frame showing another world). In a series of moves and looks write nothing between them, just the next call (no words on what you see or plan to do); speak once at the end: when you are there, or when you give up. Any text you write is spoken aloud: never write thoughts, plans or notes (not even in brackets). Do not describe what you see unless asked. Delegate real tasks (anything needing facts, lookups or work), and tell the speaker the result briefly.")
 
 
 HEIGHT_DESCRIPTION = ("Sets how high your virtual headset stands above the floor, which is your avatar's posture: "
@@ -314,6 +315,36 @@ KIND_WORDS = {
 }
 
 
+def side_words(bearing: float) -> str:
+    """A bearing (degrees, + right of where the bot faces) in words."""
+    b = round(float(bearing))
+    if abs(b) <= 10:
+        return "straight ahead"
+    if abs(b) >= 170:
+        return "right behind you"
+    side = "right" if b > 0 else "left"
+    behind = " (behind you)" if abs(b) > 100 else ""
+    return f"{abs(b)} deg to your {side}{behind}"
+
+
+def turn_degrees(turn, degrees=None) -> float:
+    """A turn as the bridge takes it (degrees, + right): ``left``,
+    ``right`` (by ``degrees``, default 90) or ``around``; a number as is."""
+    if isinstance(turn, (int, float)) and not isinstance(turn, bool):
+        return float(turn)
+    way = str(turn or "").strip().lower()
+    by = abs(float(degrees)) if degrees else 90.0
+    if way == "around":
+        return 180.0
+    if way == "left":
+        return -by
+    if way == "right":
+        return by
+    if not way:
+        return 0.0
+    raise RuntimeError("turn is left, right or around")
+
+
 def survey_words(data: dict) -> str:
     """A survey's places and players in words for the model."""
     lines = []
@@ -324,13 +355,13 @@ def survey_words(data: dict) -> str:
         elif c["kind"] == "platform" and c.get("rise_m") is not None:
             what += f" ({c['rise_m']:.1f} m up)"
         walk = f", walk {c['walk_m']:.1f} m" if c.get("walk_m") is not None else ", no path seen"
-        lines.append(f"{c['id']}: {what}, {c['distance_m']:.1f} m at {c['bearing_deg']:+.0f} deg{walk}")
+        lines.append(f"{c['id']}: {what}, {c['distance_m']:.1f} m, {side_words(c['bearing_deg'])}{walk}")
     places = "; ".join(lines) if lines else "none (turn and look again, look around, or step back)"
     room = data.get("room") or []
     seen = {p["name"] for p in data.get("players", [])}
     unseen = [n for n in room if n not in seen]
     others = f" In the room but not in sight: {', '.join(unseen)}." if unseen else ""
-    return f"Numbered places (bearing from where you face, + right): {places}.{others}"
+    return f"Numbered places (from where you face now): {places}.{others}"
 
 
 def goto_words(data: dict) -> str:
@@ -340,17 +371,20 @@ def goto_words(data: dict) -> str:
     if data.get("arrived"):
         return f"You are there ({data['remaining_m']:.1f} m off, {data['took_s']:.0f} s{bumps})."
     return (f"You stopped {data['remaining_m']:.1f} m short ({data.get('reason') or 'stuck'}"
-            f"{bumps}).")
+            f"{bumps}): look all around (vrchat_view) and go on another way.")
 
 
 STEP_DESCRIPTION = (
     "Small precise moves, not for getting somewhere (that is vrchat_walk_to): turn by degrees, "
     "then walk a few metres a way (measured: it stops there, or where something stops it), or "
-    "jump. Says how far you went.")
+    "jump. Says how far you went and, after a turn or a walk, shows the view ahead with numbered "
+    "places. Look around with vrchat_view before walking.")
 STEP_PARAMS = {
-    "turn": {"type": "number", "description": "Degrees to turn first, + right, - left (180 around)."},
+    "turn": {"type": "string", "enum": ["left", "right", "around"], "description": "Turn first: left, right or around."},
+    "degrees": {"type": "number", "description": "With turn left or right: by how many degrees (default 90)."},
     "direction": {"type": "string", "enum": ["forward", "back", "left", "right"],
-                  "description": "Which way to walk (of where you face after the turn)."},
+                  "description": "Which way to walk; you keep facing ahead (back: step back, "
+                                 "left / right: side steps)."},
     "meters": {"type": "number", "description": "How far to walk, 0-5 (0: no walk)."},
     "jump": {"type": "boolean", "description": "Jump as you start (in place without meters)."},
     "pace": {"type": "string", "enum": ["walk", "run"], "description": "Walk (default) or run."},
@@ -358,7 +392,13 @@ STEP_PARAMS = {
 
 
 def step_words(result: dict) -> str:
-    done = f"Turned {result['turned']:+.0f} degrees. " if result.get("turned") else ""
+    turned = float(result.get("turned") or 0)
+    if abs(turned) >= 179:
+        done = "Turned around. "
+    elif turned:
+        done = f"Turned {abs(turned):.0f} deg {'right' if turned > 0 else 'left'}. "
+    else:
+        done = ""
     moved = result.get("moved") or {}
     ahead, right = moved.get("ahead_m", 0), moved.get("right_m", 0)
     parts = [p for p in (f"{abs(ahead)} m {'ahead' if ahead > 0 else 'back'}" if ahead else "",
@@ -368,7 +408,7 @@ def step_words(result: dict) -> str:
     if result.get("stopped"):
         done += " You were told to stop."
     elif result.get("blocked"):
-        done += " Something stopped you."
+        done += " Something stopped you: look all around (vrchat_view) and go on another way."
     return done or "Done."
 
 
@@ -377,10 +417,13 @@ def vr_goto_body(a: dict) -> dict:
         if int(a["place"]) < 1:
             raise RuntimeError("places are numbered from 1")
         body = {"candidate": int(a["place"])}
+    elif a.get("side"):
+        way = {"ahead": "", "behind": "around"}.get(str(a["side"]), a["side"])
+        body = {"bearing": turn_degrees(way, a.get("degrees")), "distance": float(a.get("distance") or 2.0)}
     elif a.get("bearing") is not None:
         body = {"bearing": float(a["bearing"]), "distance": float(a.get("distance") or 2.0)}
     else:
-        raise RuntimeError("give a place number, or a bearing")
+        raise RuntimeError("give a place number, or a side")
     if a.get("pace") in ("walk", "run"):
         body["pace"] = a["pace"]
     if a.get("around"):
@@ -695,6 +738,20 @@ class VRChatPlatformAdapter(Platform):
             "turn": float(turn), "direction": direction, "meters": float(meters), "jump": bool(jump),
             "pace": "run" if pace == "run" else "walk"})
 
+    async def step_and_look(self, turn: float = 0.0, direction: str = "forward", meters: float = 0.0,
+                            jump: bool = False, pace: str = "walk", who: str = "voice") -> tuple[str, bytes | None]:
+        """A step (``step``), then, after a turn or a walk, the view ahead
+        (its numbered places are what ``who`` walks to next): the words and
+        the view's JPEG (None without one)."""
+        words = step_words(await self.step(turn, direction, meters, jump, pace))
+        if not turn and not meters:
+            return words, None
+        try:
+            data, pano, _ = await self.vr_survey(True, who=who, around=False)
+        except Exception as exc:  # noqa: BLE001 - the step itself went fine
+            return f"{words} (No view ahead: {exc})", None
+        return f"{words} Now ahead: {survey_words(data)}", pano
+
     async def last_seen(self, name: str = "") -> tuple[dict, bytes] | None:
         """The last sighting of a whitelisted friend (``name``, or whoever
         was seen last): its details (name, at, age_s, world) and frame."""
@@ -785,17 +842,19 @@ class VRChatPlatformAdapter(Platform):
             return "Here: " + ", ".join(names) if names else "Nobody else is here."
 
         async def view(a: dict) -> list[dict]:
-            data, pano, top = await self.vr_survey(bool(a.get("players", True)), around=bool(a.get("around")))
+            data, pano, top = await self.vr_survey(bool(a.get("players", True)), around=bool(a.get("around", True)))
             return pictures(survey_words(data), pano, top)
 
         async def walk_to(a: dict) -> list[dict]:
             data, pano, top = await self.vr_goto(vr_goto_body(a))
             return pictures(goto_words(data) + " " + survey_words(data["after"]), pano, top)
 
-        async def step(a: dict) -> str:
-            result = await self.step(a.get("turn") or 0, str(a.get("direction") or "forward"),
-                                     a.get("meters") or 0, bool(a.get("jump")), str(a.get("pace") or "walk"))
-            return step_words(result)
+        async def step(a: dict) -> list[dict] | str:
+            words, view = await self.step_and_look(turn_degrees(a.get("turn"), a.get("degrees")),
+                                                   str(a.get("direction") or "forward"),
+                                                   a.get("meters") or 0, bool(a.get("jump")),
+                                                   str(a.get("pace") or "walk"))
+            return words if view is None else picture(words, view)
 
         async def last_seen(a: dict) -> list[dict] | str:
             found = await self.last_seen(str(a.get("name") or ""))

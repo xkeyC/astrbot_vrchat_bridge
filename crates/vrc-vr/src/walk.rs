@@ -82,11 +82,20 @@ pub fn leg(hmd: &mut RemoteHmd, osc: &Osc, yaw_deg: f32, metres: f32, p: &WalkPa
 /// [`leg`], stopped by any stop after `begun` ([`stops`] when the walk was
 /// asked for: a stop while it waited counts).
 pub fn leg_since(hmd: &mut RemoteHmd, osc: &Osc, yaw_deg: f32, metres: f32, p: &WalkParams, begun: u64) -> Result<Leg> {
-    anyhow::ensure!(yaw_deg.is_finite() && metres.is_finite(), "a walk needs a finite way and length");
+    leg_facing(hmd, osc, yaw_deg, 0.0, metres, p, begun)
+}
+
+/// [`leg_since`] facing `yaw_deg` but walking `way_deg` off it (+ right):
+/// 180 steps back, 90 to the right, the head and body still facing
+/// `yaw_deg` (the thumbstick pushed that way).
+pub fn leg_facing(hmd: &mut RemoteHmd, osc: &Osc, yaw_deg: f32, way_deg: f32, metres: f32, p: &WalkParams, begun: u64) -> Result<Leg> {
+    anyhow::ensure!(yaw_deg.is_finite() && way_deg.is_finite() && metres.is_finite(), "a walk needs a finite way and length");
     let head = hmd.state.head.position;
     // The whole body faces the way: the hands too.
     hmd.state.hands_at_rest(head, yaw_deg);
     hmd.set_head(Pose::looking(yaw_deg, 0.0, head))?;
+    let (side, ahead) = way_deg.to_radians().sin_cos();
+    let (vertical, horizontal) = (p.axis * ahead, p.axis * side);
     sleep(Duration::from_millis(60)); // a frame or two for the body to follow
     let started = Instant::now();
     let mut last = started;
@@ -100,7 +109,10 @@ pub fn leg_since(hmd: &mut RemoteHmd, osc: &Osc, yaw_deg: f32, metres: f32, p: &
             stopped = true;
             return Ok(());
         }
-        osc.send_f32("/input/Vertical", p.axis)?;
+        osc.send_f32("/input/Vertical", vertical)?;
+        if horizontal.abs() > 1e-3 {
+            osc.send_f32("/input/Horizontal", horizontal)?;
+        }
         loop {
             sleep(Duration::from_millis(40));
             if stopped_since(begun) {
@@ -132,8 +144,9 @@ pub fn leg_since(hmd: &mut RemoteHmd, osc: &Osc, yaw_deg: f32, metres: f32, p: &
             }
         }
     })();
-    osc.send_f32("/input/Vertical", 0.0)?;
+    let released = osc.send_f32("/input/Vertical", 0.0).and(osc.send_f32("/input/Horizontal", 0.0));
     result?;
+    released?;
     // The coast after letting go counts too.
     let stop = Instant::now();
     while stop.elapsed() < Duration::from_millis(400) {

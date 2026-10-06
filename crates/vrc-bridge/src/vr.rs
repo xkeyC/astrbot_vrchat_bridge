@@ -378,8 +378,9 @@ impl VrCore {
     }
 
     /// /v1/step: turns by `turn` degrees, then walks `meters` (world) a way
-    /// (forward, back, left, right of where it then faces; the head turns
-    /// to the way walked), jumping as it starts if asked. `since`: the
+    /// (forward, back, left, right of where it then faces; still facing
+    /// there: back steps back, left and right step aside), jumping as it
+    /// starts if asked. `since`: the
     /// stops when it was asked for ([`walk::stops`]).
     #[allow(clippy::too_many_arguments)]
     pub fn step(&mut self, osc_jump: impl Fn(), turn: f32, direction: &str, meters: f32, jump: bool, since: u64, axis: Option<f32>) -> Result<Value> {
@@ -400,7 +401,6 @@ impl VrCore {
         if meters <= 0.0 {
             return Ok(json!({"ok": true, "turned": turn, "blocked": false, "moved": {"ahead_m": 0.0, "right_m": 0.0}}));
         }
-        let way = facing + offset;
         let rig = self.rig(&[])?;
         let osc = rig.osc.as_ref().context("walking needs VRChat's OSC")?;
         let osc = Osc::with_ports_from(osc)?;
@@ -408,10 +408,10 @@ impl VrCore {
         if let Some(a) = axis {
             params.axis = a;
         }
-        let leg = walk::leg_since(&mut rig.hmd, &osc, way, meters.min(STEP_MAX_M), &params, since);
+        let leg = walk::leg_facing(&mut rig.hmd, &osc, facing, offset, meters.min(STEP_MAX_M), &params, since);
         self.forget_places();
         let leg = leg?;
-        self.yaw = (way + 540.0).rem_euclid(360.0) - 180.0;
+        self.yaw = (facing + 540.0).rem_euclid(360.0) - 180.0;
         self.pitch = 0.0;
         let (s, c) = offset.to_radians().sin_cos();
         Ok(json!({
@@ -506,7 +506,14 @@ pub fn survey_json(serial: u64, s: &Survey) -> Value {
 /// some frame saw (a look ahead: that one view).
 pub fn pano_jpeg(s: &Survey) -> Result<Vec<u8>> {
     let p = s.marked_panorama(2048);
-    let px = |r: usize, c: usize| &p.rgb[(r * p.width + c) * 3..(r * p.width + c + 1) * 3];
+    // What the frames saw, from the panorama before the marks (a place's
+    // number may lie outside them), turned like the marked one.
+    let plain = s.panorama(p.width);
+    let shift = ((s.yaw / 360.0) * p.width as f32).round() as i64;
+    let px = |r: usize, c: usize| {
+        let c = (c as i64 + shift).rem_euclid(p.width as i64) as usize;
+        &plain.rgb[(r * p.width + c) * 3..(r * p.width + c + 1) * 3]
+    };
     let row_seen = |r: usize| (0..p.width).any(|c| px(r, c).iter().any(|&b| b != 0));
     let col_seen = |c: usize| (0..p.height).any(|r| px(r, c).iter().any(|&b| b != 0));
     let first = (0..p.height).find(|&r| row_seen(r)).unwrap_or(0);

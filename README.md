@@ -35,9 +35,9 @@ VRChat 以 **VR 模式** 运行在一个虚拟头显上（Monado + xrizer，没�
 
 | 工具 | 作用 |
 |---|---|
-| `vrchat_view` | 看正前方，返回带编号的画面和每个地点、玩家的距离、方位；`around` 时原地环视一圈，返回全景图和俯视地图（少用） |
+| `vrchat_view` | 原地环视一圈（默认），返回带编号的全景图和俯视地图，以及每个地点、玩家的距离、方位；`around: false` 只看正前方。每次移动前先用它看一圈 |
 | `vrchat_walk_to` | 走到上一次 `vrchat_view` 里的某个编号，或者按方位走一段距离；走完返回正前方画面（可选 `around`） |
-| `vrchat_step` | 小而精确的动作：转多少度、朝某个方向走几米、跳 |
+| `vrchat_step` | 小而精确的动作：左转、右转或掉头，朝前、后（原地后退）、左右（横移）走几米，跳；转身或走了之后返回正前方画面 |
 | `vrchat_follow_player` / `vrchat_follow_adjust` | 在房间里跟随某人；靠近、离远、原地别动、继续跟 |
 | `vrchat_last_seen` | 最后一次看到某位白名单好友时的画面 |
 | `vrchat_emote`、`vrchat_jump`、`vrchat_stop`、`vrchat_chatbox`、`vrchat_who` | 表情、跳、停下、头顶文字、房间里有谁 |
