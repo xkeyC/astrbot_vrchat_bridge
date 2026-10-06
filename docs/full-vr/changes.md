@@ -29,6 +29,16 @@
 | `astrbot_plugin/` | 新工具 `vrchat_height`、`vrchat_vr_reset`（语音和文字） |
 | `tools/mocap/` | 从 CMU 动作捕捉数据统计头和双腕运动的脚本，以及按相位平均的曲线（D25） |
 | `crates/vrc-bridge` 的 `follow` | 绕障、跳过矮障碍、卡住时脱困；跟随的双目匹配限 6 线程（D25） |
+| `crates/vrc-vr` 的 `trackers` | OSC 追踪器（髋、双脚）和头部对齐，Unity 坐标（fbt-research.md） |
+| `crates/vrc-bridge` 的 `calibrate` | 全身自动校准：OCR 找按钮、悬停提示二次确认、`TrackingType` 验证；跟随中也会自动校准（agent-vr-use.md 第 5 节） |
+| `crates/vrc-vr` 的 `motion`、`crates/vrc-bridge` 的 `motion` | 动作片段格式和片段库、动作程序（编排、淡入淡出、坐和躺的姿势及退出）；`/v1/motion`、`/v1/motion/stop`、`/v1/motion/reload`（motion.md、D30） |
+| `crates/vrc-bridge` 的 `anim` | 步态层（走跑循环按速度推进、跳跃收腿、手臂随步态）、脚步层（脚踩原地、转身后踏步跟上）；待机摇晃在跟随移动时收住 |
+| `crates/vrc-vr` 的 `scan` | 环视时身体跟着头转，结束后转回 |
+| `crates/vrc-bridge` 的 `follow` | 身体正对目标、头看目标（含俯仰）；找人动作重做（左、扫到右、转到身后，每 3 圈抬头一圈）；楼梯当地面跟、读目标脚下高度、不同层时走到身边（D30） |
+| `crates/vrc-nav` | `SurveyOptions::ahead`：只看正前方（加低头一眼）；`/v1/vr/survey` 和 `/v1/vr/goto` 的 `around` 参数 |
+| `tools/motion/` | 动作片段的离线生成：`fetch.py`（下载源）、`library.py`（片段表）、`retarget.py`、`postures.py`、`keyframes.py`、`poses/` |
+| `tools/agent-vr/` | 操作 VR 菜单、校准和冷重启测试的脚本 |
+| `astrbot_plugin/` | `vrchat_emote` 换成 `vrchat_motion`、`vrchat_posture`；走路工具加 `pace`（walk / run）；`vrchat_look_around` 改回 `vrchat_view`（默认只看前方，`around` 可选并提示少用），`vrchat_walk_to` 走完默认只返回前方画面 |
 | `docs/full-vr/` | 本文档集 |
 
 ## 其他项目

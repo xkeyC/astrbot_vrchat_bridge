@@ -8,6 +8,9 @@
 | [changes.md](changes.md) | 修改点：本仓库、其他项目（补丁）、服务器上改了什么 |
 | [decisions.md](decisions.md) | 决策：选了什么、没选什么、为什么 |
 | [deploy-log.md](deploy-log.md) | 部署记录（脱敏）：按时间顺序 |
+| [fbt-research.md](fbt-research.md) | 全身动作接管调研：OSC 追踪器、全身追踪校准 |
+| [motion.md](motion.md) | 动作系统：片段库、步态、姿势、跟随里的身体和头 |
+| [agent-vr-use.md](agent-vr-use.md) | 代理怎样操作 VRChat 的 VR 菜单（像素到手柄射线、自动校准） |
 
 ## 链路
 
@@ -49,6 +52,8 @@ crates/vrc-nav/         环视（survey）和走到某点（goto）
 crates/vrc-bridge/      bridge：HTTP/WebSocket 给 AstrBot 插件（音频、状态、输入、Web API、跟随、VR 能力）
 crates/vr-probe/        手动调试工具：info / grab / look / sweep / depth / scan
 astrbot_plugin/         AstrBot 插件（Python，AstrBot 只认 Python 插件；本分支只支持 VR）
+tools/motion/           动作片段的离线生成：下载开源动捕、重定向到规范骨架、关键帧姿势（motion.md）
+tools/agent-vr/         操作 VR 菜单和自动校准的调试脚本（agent-vr-use.md）
 third_party/monado/     上游基础提交 + 补丁
 third_party/xrizer/     上游基础提交 + 补丁
 ops/vr/                 构建、安装脚本和配置（已脱敏，路径和用户用参数传入）

@@ -42,6 +42,15 @@
 | 22:3x | 头显高度：1.6 m 踮脚，1.45 m 屈膝，`monado-ctl -c` 重新居中无效果，最后定为 1.56 m | 保存在 bridge 配置目录的 `anim.json` |
 | 22:44 | 部署 `vrchat_height`、`vrchat_vr_reset`：先备份插件、数据库和 bridge 环境文件，环境文件加上 `--monado-ctl`；更新插件，Mon3tr 人格的文字工具白名单加入这两个工具，重启 AstrBot | 两个接口实测正常（`monado-ctl -c` 返回成功，但如 22:3x 所记，重新居中看不出效果）；AstrBot 日志里只有原有的无关报错 |
 
+## 2026-10-06
+
+| 时间 | 操作 | 结果 |
+|---|---|---|
+| 白天 | OSC 追踪器和全身自动校准（fbt-research.md）；每只眼分辨率 1280 → 1920，镜子分辨率、抗锯齿、细节层次调高 | 冷重启 VRChat 4 次，自动校准 4 次都成功 |
+| 白天 | 动作片段生成后复制到 bridge 配置目录的 `motions/`，`POST /v1/motion/reload`；VRChat 设置里关掉"全身追踪时启用运动动画" | 每次改完 bridge 都重新部署，并重新开启对用户的跟随 |
+| 19:01–19:18 | bridge：跟随时身体正对、头看人、找人每 3 圈抬头、楼梯；`vrchat_view` / `around`。插件：先备份插件目录，换成新版，重启 AstrBot | AstrBot 正常运行，插件已加载，bridge 音频流已连上；日志里只有原有的无关报错（`get_dim`） |
+| 待办 | Mon3tr 人格的文字工具白名单里，`vrchat_look_around` 要换回 `vrchat_view` | 未做（需要用户在 WebUI 改或授权） |
+
 ### 当前服务器状态
 
 - VRChat 以 VR 模式运行，`monado-service` 是临时单元（systemd-run）：合成器 30 fps（可通过 `/dev/shm/vrc-fps` 临时调整），每帧都抓（8 槽环形缓冲区），视场 100°。
