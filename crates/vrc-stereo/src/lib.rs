@@ -10,6 +10,8 @@
 //! consistent with its own eye height above the floor, not necessarily the
 //! world's. See docs/full-vr/decisions.md.
 
+#[cfg(feature = "cuda")]
+pub mod gpu;
 pub mod sgm;
 
 use rayon::prelude::*;
@@ -49,7 +51,13 @@ impl Stereo {
         })
     }
 
+    /// The disparities, on the GPU when there is one (the same, bit for
+    /// bit), else on the CPU.
     pub fn disparity(&self, params: &SgmParams) -> Disparity {
+        #[cfg(feature = "cuda")]
+        if let Some(d) = gpu::sgm(&self.left, &self.right, params) {
+            return d;
+        }
         sgm::sgm(&self.left, &self.right, params)
     }
 

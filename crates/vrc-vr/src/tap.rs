@@ -15,11 +15,11 @@
 //! A slot's `seq` is `2n` while frame `n` (from 1) is in it and odd while it
 //! is being written: a seqlock, and a frame's identity across slots.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{fence, AtomicU64, Ordering};
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{bail, Context, Result};
 use memmap2::Mmap;
@@ -103,15 +103,42 @@ impl EyeFrame {
 pub struct EyeTap {
     path: PathBuf,
     map: Option<Mmap>,
+    /// The file whose touch asks Monado to tap (`<path>.want`, its
+    /// XRT_NULL_TAP_DEMAND): with nobody reading it copies nothing.
+    want: PathBuf,
+    wanted: Option<Instant>,
 }
+
+/// The demand file is touched at most this often; Monado taps while it is
+/// newer than its XRT_NULL_TAP_DEMAND_MS (3 s).
+const WANT_EVERY: Duration = Duration::from_millis(500);
+const WANT_LASTS: Duration = Duration::from_millis(2500);
 
 impl EyeTap {
     pub fn open(path: impl AsRef<Path>) -> EyeTap {
-        EyeTap { path: path.as_ref().to_owned(), map: None }
+        let path = path.as_ref().to_owned();
+        let mut want = path.clone().into_os_string();
+        want.push(".want");
+        EyeTap { path, map: None, want: want.into(), wanted: None }
+    }
+
+    /// Asks Monado to tap (touches the demand file); true when it may have
+    /// stopped meanwhile, so the latest frame may be old.
+    fn want(&mut self) -> bool {
+        let now = Instant::now();
+        if self.wanted.is_some_and(|at| now - at < WANT_EVERY) {
+            return false;
+        }
+        let woke = self.wanted.is_none_or(|at| now - at > WANT_LASTS);
+        // A Monado without demand taps anyway: errors do not matter.
+        let _ = OpenOptions::new().create(true).truncate(false).write(true).open(&self.want).and_then(|f| f.set_modified(SystemTime::now()));
+        self.wanted = Some(now);
+        woke
     }
 
     /// Frames written so far (0 before the first, or while there is no tap).
     pub fn written(&mut self) -> Result<u64> {
+        self.want();
         Ok(match self.ring()? {
             Some(ring) => ring.written(),
             None => 0,
@@ -131,6 +158,7 @@ impl EyeTap {
 
     /// Every frame still in the ring, without pixels, oldest first.
     pub fn peek_all(&mut self) -> Result<Vec<EyeFrame>> {
+        self.want();
         let Some(ring) = self.ring()? else { return Ok(Vec::new()) };
         let mut frames: Vec<EyeFrame> =
             (0..ring.slots).filter_map(|i| ring.slot(i, false).ok().flatten()).collect();
@@ -140,6 +168,7 @@ impl EyeTap {
 
     /// The frame with this `seq`, if it is still in the ring.
     pub fn read_seq(&mut self, seq: u64) -> Result<Option<EyeFrame>> {
+        self.want();
         let Some(ring) = self.ring()? else { return Ok(None) };
         if seq < 2 {
             return Ok(None);
@@ -149,6 +178,15 @@ impl EyeTap {
     }
 
     fn latest(&mut self, pixels: bool) -> Result<Option<EyeFrame>> {
+        if self.want() {
+            // Tapping again: the newest frame is from when it stopped; wait
+            // (a second at most) for one rendered now.
+            let before = self.ring()?.map_or(0, |r| r.written());
+            let since = Instant::now();
+            while since.elapsed() < Duration::from_secs(1) && self.ring()?.map_or(0, |r| r.written()) == before {
+                sleep(Duration::from_millis(5));
+            }
+        }
         for _ in 0..100 {
             let Some(ring) = self.ring()? else { return Ok(None) };
             let n = ring.written();

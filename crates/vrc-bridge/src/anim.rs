@@ -22,6 +22,8 @@ use crate::bridge::{Bridge, SAMPLE_RATE};
 use crate::Lock;
 
 const TICK: Duration = Duration::from_millis(22);
+/// A headset not there is tried again this often.
+const RECONNECT_EVERY: Duration = Duration::from_secs(5);
 /// The speed is read every few ticks (an HTTP request each).
 const SPEED_EVERY: u32 = 3;
 /// Loudness is measured over windows this long.
@@ -119,17 +121,32 @@ impl Anim {
         let mut tick = 0u32;
         let mut last = Instant::now();
         let mut off_sent = false;
+        let mut tried = Instant::now().checked_sub(RECONNECT_EVERY).unwrap_or_else(Instant::now);
         loop {
             std::thread::sleep(TICK);
             tick = tick.wrapping_add(1);
             let now = Instant::now();
             let dt = (now - last).as_secs_f32();
             last = now;
-            // The headset connection, once the rig is up (and again after a reset).
+            // The headset connection: the rig's; none yet (nothing used the
+            // headset since the bridge started) or a dead one (Monado
+            // restarted): the animation connects it, or the avatar stands
+            // stiff until something else does.
             let owner = link.as_ref().and_then(HmdLink::owner);
             let Some(owner) = owner else {
-                link = bridge.vr.try_lk().and_then(|vr| vr.link());
                 off_sent = false;
+                if let Some(mut vr) = bridge.vr.try_lk() {
+                    let dead = vr.link().as_ref().and_then(HmdLink::owner).is_none();
+                    if dead && tried.elapsed() >= RECONNECT_EVERY {
+                        tried = Instant::now();
+                        vr.reset();
+                        match vr.rig(&[]) {
+                            Ok(_) => tracing::info!("animation: headset connected"),
+                            Err(e) => tracing::debug!("animation: no headset yet: {e:#}"),
+                        }
+                    }
+                    link = vr.link();
+                }
                 continue;
             };
             if tick.is_multiple_of(SPEED_EVERY) {

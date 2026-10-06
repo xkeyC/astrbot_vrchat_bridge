@@ -64,7 +64,7 @@ diff -ruN a/src/xrt/compositor/null/null_compositor.h b/src/xrt/compositor/null/
 diff -ruN a/src/xrt/compositor/null/null_tap.c b/src/xrt/compositor/null/null_tap.c
 --- a/src/xrt/compositor/null/null_tap.c
 +++ b/src/xrt/compositor/null/null_tap.c
-@@ -0,0 +1,393 @@
+@@ -0,0 +1,420 @@
 +// Copyright 2026, xkeyC.
 +// SPDX-License-Identifier: BSL-1.0
 +/*!
@@ -119,9 +119,12 @@ diff -ruN a/src/xrt/compositor/null/null_tap.c b/src/xrt/compositor/null/null_ta
 +#include <string.h>
 +#include <sys/mman.h>
 +#include <sys/stat.h>
++#include <time.h>
 +#include <unistd.h>
 +
 +DEBUG_GET_ONCE_OPTION(tap_path, "XRT_NULL_TAP", NULL)
++DEBUG_GET_ONCE_OPTION(tap_demand, "XRT_NULL_TAP_DEMAND", NULL)
++DEBUG_GET_ONCE_NUM_OPTION(tap_demand_ms, "XRT_NULL_TAP_DEMAND_MS", 3000)
 +DEBUG_GET_ONCE_NUM_OPTION(tap_fps, "XRT_NULL_TAP_FPS", 10)
 +DEBUG_GET_ONCE_NUM_OPTION(tap_slots, "XRT_NULL_TAP_SLOTS", 8)
 +
@@ -177,6 +180,10 @@ diff -ruN a/src/xrt/compositor/null/null_tap.c b/src/xrt/compositor/null/null_ta
 +	int64_t interval_ns;
 +	int64_t last_ns;
 +	bool warned;
++
++	//! Tap only while this file was touched within demand_ns (NULL: always).
++	const char *demand;
++	int64_t demand_ns;
 +};
 +
 +static uint32_t
@@ -214,6 +221,13 @@ diff -ruN a/src/xrt/compositor/null/null_tap.c b/src/xrt/compositor/null/null_ta
 +	int64_t slots = debug_get_num_option_tap_slots();
 +	tap->slots = (uint32_t)(slots < 1 ? 1 : slots > TAP_MAX_SLOTS ? TAP_MAX_SLOTS : slots);
 +	U_LOG_I("null tap: eyes to '%s' at up to %d fps (0: all), %u slots", path, (int)fps, tap->slots);
++	const char *demand = debug_get_option_tap_demand();
++	if (demand != NULL && demand[0] != '\0') {
++		tap->demand = demand;
++		tap->demand_ns = debug_get_num_option_tap_demand_ms() * U_TIME_1MS_IN_NS;
++		U_LOG_I("null tap: only while '%s' was touched in the last %d ms", demand,
++		        (int)debug_get_num_option_tap_demand_ms());
++	}
 +	return tap;
 +}
 +
@@ -320,6 +334,19 @@ diff -ruN a/src/xrt/compositor/null/null_tap.c b/src/xrt/compositor/null/null_ta
 +	int64_t now_ns = os_monotonic_get_ns();
 +	if (tap->last_ns != 0 && now_ns - tap->last_ns < tap->interval_ns) {
 +		return;
++	}
++	// Nobody reading: no copy (13 MB a frame of GPU readback and memcpy).
++	if (tap->demand != NULL) {
++		struct stat st;
++		struct timespec now;
++		if (stat(tap->demand, &st) != 0 || clock_gettime(CLOCK_REALTIME, &now) != 0) {
++			return;
++		}
++		int64_t age = (int64_t)(now.tv_sec - st.st_mtim.tv_sec) * U_TIME_1S_IN_NS +
++		              (int64_t)(now.tv_nsec - st.st_mtim.tv_nsec);
++		if (age > tap->demand_ns) {
++			return;
++		}
 +	}
 +
 +	struct comp_layer_accum *accum = &base->layer_accum;
@@ -461,7 +488,7 @@ diff -ruN a/src/xrt/compositor/null/null_tap.c b/src/xrt/compositor/null/null_ta
 diff -ruN a/src/xrt/compositor/null/null_tap.h b/src/xrt/compositor/null/null_tap.h
 --- a/src/xrt/compositor/null/null_tap.h
 +++ b/src/xrt/compositor/null/null_tap.h
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,38 @@
 +// Copyright 2026, xkeyC.
 +// SPDX-License-Identifier: BSL-1.0
 +/*!
@@ -469,7 +496,9 @@ diff -ruN a/src/xrt/compositor/null/null_tap.h b/src/xrt/compositor/null/null_ta
 + * @brief  Frame tap of the null compositor: the eyes an app submits, to shared memory.
 + *
 + * Enabled by XRT_NULL_TAP (a file path, e.g. /dev/shm/monado-eyes); at most
-+ * XRT_NULL_TAP_FPS (default 10) frames a second. Layout in null_tap.c.
++ * XRT_NULL_TAP_FPS (default 10) frames a second. With XRT_NULL_TAP_DEMAND (a
++ * file path), only while a reader touched that file within
++ * XRT_NULL_TAP_DEMAND_MS (default 3000). Layout in null_tap.c.
 + *
 + * @ingroup comp_null
 + */
