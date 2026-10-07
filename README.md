@@ -51,7 +51,7 @@ VRChat 以 **VR 模式** 运行在一个虚拟头显上（Monado + xrizer，没�
 ## 组成
 
 - **AstrBot 插件**（`astrbot_plugin/`）：注册 `vrchat` 平台。
-  - 房间语音交给 AstrBot 的实时语音会话；
+  - 房间语音交给 AstrBot 的实时语音会话，游戏一启动（或进入房间）就预先建好，上线后第一句话不用等它启动；
   - 提供语音工具和 LLM 工具，以及管理员命令 `/vrc status|start|stop|restart`；
   - 决策由 AstrBot 里的 Codex agent 做，插件只负责平台适配和工具。
 - **bridge**（`crates/vrc-bridge`，Rust）：和 VRChat 客户端运行在同一台机器上，通过 HTTP/WebSocket 提供能力：
@@ -130,6 +130,7 @@ VRChat 以 **VR 模式** 运行在一个虚拟头显上（Monado + xrizer，没�
 
 - bridge 地址和 token（就是上面 token 文件的内容）；
 - 语音唤醒名、别名，以及语音提示词；
+- 唤醒词检测：自动（除 bot 外有两人及以上时，只回应叫到名字的话）、强制开启（无论几个人都要叫名字）或关闭（所有话都交给模型判断）；
 - 好友白名单（显示名或 `usr_` id，按优先级排列），以及是否自动接受邀请、是否跨房间跟随。
 
 文字会话里能用哪些工具，由人格的工具白名单决定，新加的工具（比如 `vrchat_remember_place`）要手动加进去。地图存在 bridge 配置目录的 `maps/` 下，每个世界一个文件。

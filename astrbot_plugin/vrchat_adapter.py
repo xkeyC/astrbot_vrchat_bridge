@@ -72,6 +72,8 @@ DEFAULT_CONFIG = {
     "vrchat_bridge_token": "",
     "vrchat_voice_name": "AstrBot",
     "vrchat_voice_aliases": [],
+    # When the room's voice hears only what calls the bot by name.
+    "vrchat_voice_wake": "auto",
     "vrchat_voice_prompt": "",
     "vrchat_voice_idle_timeout": 300,
     # Friends (display names or usr_ ids) in priority order: their invites and
@@ -103,6 +105,13 @@ CONFIG_METADATA = {
         "type": "list",
         "items": {"type": "string"},
         "hint": "名字的其他叫法，例如中文名或昵称。",
+    },
+    "vrchat_voice_wake": {
+        "description": "唤醒词检测",
+        "type": "string",
+        "options": ["auto", "always", "off"],
+        "labels": ["自动（除 bot 外还有两人及以上时）", "强制开启（无论几个人都要叫名字）", "关闭（听所有人说话，由模型判断）"],
+        "hint": "自动：房间里只有一位玩家时听他说的所有话，人更多或不清楚时只听叫到名字的话。强制开启：无论几个人，都要叫名字（唤醒名或别名）才回应。关闭：所有话都交给模型，由它判断是不是在叫自己。",
     },
     "vrchat_voice_prompt": {
         "description": "语音附加提示词",
@@ -461,16 +470,18 @@ def vr_goto_body(a: dict) -> dict:
 OLD_RULE = """The one rule that matters most: speak ONLY when the speaker says your name{aliases} to you in that utterance, or is directly continuing an exchange with you from a few seconds ago. In every other case produce no audio and no text at all - complete silence. Do not acknowledge, do not react, do not say "mm", do not comment, do not delegate."""
 
 
-def room_prompt(name: str, aliases: list[str], tools: bool) -> str:
+def room_prompt(name: str, aliases: list[str], tools: bool, gated: bool | None = None) -> str:
     """The room's prompt. ``tools``: the voice model runs the room's tools
-    (the local_infra backend), whose voice server passes on only what calls
-    the bot by name (everything to one other player)."""
+    (the local_infra backend). ``gated`` (default: ``tools``): its voice
+    server passes on only what calls the bot by name (everything to one
+    other player); wake words off, it hears everything and tells for
+    itself."""
     try:
         from astrbot.core.voice.session import VoiceOptions, group_rule
     except ImportError:
         group_rule = None
     if group_rule is not None:
-        rule = group_rule(VoiceOptions(name=name, aliases=aliases), gated=tools)
+        rule = group_rule(VoiceOptions(name=name, aliases=aliases), gated=tools if gated is None else gated)
     else:
         others = [a for a in aliases if a and a != name]
         alias_text = (
@@ -525,11 +536,19 @@ class VRChatPlatformAdapter(Platform):
 
         from astrbot.core.voice.session import VoiceOptions
 
+        wake = str(cfg["vrchat_voice_wake"] or "auto").strip().lower()
         self.voice_options = VoiceOptions(
             name=str(cfg["vrchat_voice_name"] or "AstrBot"),
             aliases=as_list(cfg["vrchat_voice_aliases"]),
             extra_prompt=str(cfg["vrchat_voice_prompt"] or ""),
         )
+        if wake in ("auto", "always", "off"):
+            # (A core without wake modes has no such option: it goes by the
+            # headcount, as `auto`.)
+            if hasattr(self.voice_options, "wake_mode"):
+                self.voice_options.wake_mode = wake
+        else:
+            logger.warning("VRChat: unknown vrchat_voice_wake %r, using auto", wake)
         self.state: dict[str, Any] = {}
         self.session = None  # the room's VoiceSession, if any
         self._detector = SpeechDetector()
@@ -684,7 +703,15 @@ class VRChatPlatformAdapter(Platform):
         if kind == "state":
             old = {p["id"] for p in self.state.get("players", [])}
             had_world = bool(self.state.get("running") and self.state.get("world"))
+            was_running = bool(self.state.get("running"))
             self.state = data.get("state") or {}
+            # The game started, or the bot came into a room: the voice thread
+            # warms up now, not when someone first speaks (the room's first
+            # call waited for the session to start).
+            if (bool(self.state.get("running")) and not was_running) or (
+                bool(self.state.get("running") and self.state.get("world")) and not had_world
+            ):
+                self._warm_up_voice()
             new = {p["id"]: p["name"] for p in self.state.get("players", [])}
             joined = [name for pid, name in new.items() if pid not in old]
             if joined:
@@ -988,6 +1015,19 @@ class VRChatPlatformAdapter(Platform):
 
     # -- voice ------------------------------------------------------------
 
+    def _warm_up_voice(self) -> None:
+        """Starts the room's voice session ahead of speech (the game started
+        or the bot came into a room), unless one is on or a failed start is
+        still being waited out. Its idle timeout counts from now."""
+        if self.session is not None or time.monotonic() < self._retry_at or self._ws is None:
+            return
+        try:
+            self._start_voice()
+            logger.info("VRChat: voice session warmed up (%s)", self.state.get("world") or "the game starting")
+        except Exception as exc:  # noqa: BLE001 - speech starts it later
+            logger.error("VRChat voice session could not warm up: %s", exc)
+            self._retry_at = time.monotonic() + START_RETRY_SECONDS
+
     def _on_audio(self, pcm: bytes) -> None:
         if self.session is not None:
             self.session.media.feed(pcm)
@@ -1038,7 +1078,13 @@ class VRChatPlatformAdapter(Platform):
         session = new_voice_session(
             key=ROOM_SESSION,
             scope_id=f"{self.meta().id}:voice:{ROOM_SESSION}",
-            prompt=room_prompt(self.voice_options.name, self.voice_options.aliases, bool(tools)),
+            # Wake words off: the model hears everything and tells for itself.
+            prompt=room_prompt(
+                self.voice_options.name,
+                self.voice_options.aliases,
+                bool(tools),
+                gated=bool(tools) and getattr(self.voice_options, "wake_mode", "auto") != "off",
+            ),
             options=self.voice_options,
             media=PcmMedia(
                 self._send_audio,
