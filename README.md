@@ -94,7 +94,7 @@ VRChat 以 **VR 模式** 运行在一个虚拟头显上（Monado + xrizer，没�
 
 ## 依赖
 
-- **AstrBot**：需要带 Codex 运行器和实时语音核心（`astrbot.core.voice`）的分支，例如 [xkeyC/AstrBot](https://github.com/xkeyC/AstrBot) 的 `codex_agent_runtime` 分支。
+- **AstrBot**：需要带 Codex 运行器和实时语音核心（`astrbot.core.voice`）的分支，例如 [xkeyC/AstrBotX](https://github.com/xkeyC/AstrBotX) 的 `codex_agent_runtime` 分支。
 - **[local-multimodal-infra](https://github.com/mercallureAI/local-multimodal-infra)**：
   - 名牌识别用它的 PP-OCRv5（`POST /v1/ocr/lines`）；
   - 物品检测用它的 YOLO（`POST /v1/detect/objects`，和 OCR 同一个服务）；
@@ -165,7 +165,7 @@ VRChat 的服务条款对自动化或机器人账号有限制，请自行评估�
 ### AstrBot 生态与推理服务
 
 - [AstrBot](https://github.com/AstrBotDevs/AstrBot)：本项目作为它的平台插件运行
-  - **fork**：[xkeyC/AstrBot](https://github.com/xkeyC/AstrBot) 的 `codex_agent_runtime` 分支（Codex 运行器、实时语音核心 `astrbot.core.voice`、语音工具）
+  - **fork**：[xkeyC/AstrBotX](https://github.com/xkeyC/AstrBotX) 的 `codex_agent_runtime` 分支（Codex 运行器、实时语音核心 `astrbot.core.voice`、语音工具）
 - [OpenAI Codex](https://github.com/openai/codex)：AstrBot 里做决策的 agent 运行时
   - **fork**：[xkeyC/codex_for_astrbot](https://github.com/xkeyC/codex_for_astrbot) 的 `astrbot` 分支（AstrBot 的 Python 绑定、本地语音后端、Chat Completions 线路等；随上游版本合并更新）
 - [local-multimodal-infra](https://github.com/mercallureAI/local-multimodal-infra)：OCR、物品检测和本地语音的推理服务，其中用到：
