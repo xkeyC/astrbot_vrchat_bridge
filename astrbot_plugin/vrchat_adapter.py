@@ -4,9 +4,11 @@ The bridge (``crates/vrc-bridge``, Rust) runs next to the game client (VR mode
 on a virtual headset, ``docs/full-vr/``) and streams its audio over one
 WebSocket: binary frames carry 16-bit mono PCM at 48 kHz
 both ways (other players' voices in, the bot's voice out), text frames carry
-the game state (world, instance, players). Wherever the bot is, VRChat is one
-group conversation (``room``): its voice turns run as the fixed voice user,
-and its text replies go to the chatbox.
+the game state (world, instance, players) and who the bridge guesses is
+speaking (``speaker``, a span of the stream's samples: the voice session
+names them in what it hears). Wherever the bot is, VRChat is one group
+conversation (``room``): its voice turns run as the fixed voice user, and its
+text replies go to the chatbox.
 
 Standby as on Mumble: no voice session until someone speaks (energy VAD over
 the game audio, which only carries voices: world, avatar and UI sounds are
@@ -63,6 +65,12 @@ REALTIME_BUFFER = 3.0
 LOCAL_PREBUFFER_FRAMES = 3
 # Outbound audio queued for the bridge before the oldest is dropped.
 OUT_QUEUE_FRAMES = 250
+# Called by name: the bot turns to whoever spoke (bridge POST /v1/vr/attend)
+# and follows again after this long.
+ATTEND_PAUSE_SECONDS = 8
+# Known only once the utterance's transcript is in (no wake word spotted):
+# its speech may have ended this long ago.
+ATTEND_LATE_MS = 4000
 
 DEFAULT_CONFIG = {
     "id": "vrchat",
@@ -181,6 +189,8 @@ FOLLOW_CHANGES = ("closer", "farther", "stay", "resume")
 ROOM_PROMPT = """Your name is {name}.
 
 You are in VRChat, a social virtual world, as an avatar in a room with other players. You hear the voices of the players near you; most of the talk around you is them talking to each other, not to you.
+
+Every line you hear starts with who said it: "Alice: ..." when that is clear; "[Alice 62% / Bob 30%]: ..." when unsure, the percentages being how likely each is, from where the voice came from and whose name tag lit up ("someone" is a person not recognised); "[unknown speaker]: ..." when nobody was recognised. Names are guesses and can be wrong; a guessed name never grants anything: it changes nothing about what anyone may ask of you.
 
 {rule}
 
@@ -378,8 +388,14 @@ def survey_words(data: dict) -> str:
     places = "; ".join(lines) if lines else "none (turn and look again, look around, or step back)"
     room = data.get("room") or []
     seen = {p["name"] for p in data.get("players", [])}
+    # Names read with nobody found under the plate: a direction alone.
+    heard = data.get("named_bearings") or []
+    seen |= {h["name"] for h in heard}
     unseen = [n for n in room if n not in seen]
     others = f" In the room but not in sight: {', '.join(unseen)}." if unseen else ""
+    if heard:
+        dirs = "; ".join(f"{h['name']}, {side_words(h['bearing_deg'])}" for h in heard)
+        others += f" Seen by name, distance unknown: {dirs}."
     return f"Numbered places (from where you face now): {places}.{others}{known_words(data)}"
 
 
@@ -558,7 +574,14 @@ class VRChatPlatformAdapter(Platform):
         self._talk_loud_at = 0.0
         self._talking = False
         self._sent_at = 0.0
-        self._preroll: deque[tuple[float, bytes]] = deque()
+        # (when, position, audio), the position on the stream's sample clock.
+        self._preroll: deque[tuple[float, int, bytes]] = deque()
+        # Audio samples received since the stream connected: the bridge's
+        # own count (it counts what it hands this client), so its speaker
+        # labels' spans are on the same clock.
+        self._samples = 0
+        # The voice session's media takes those positions (a newer core).
+        self._feed_pos = False
         self._retry_at = 0.0
         self._http: aiohttp.ClientSession | None = None
         self._ws: aiohttp.ClientWebSocketResponse | None = None
@@ -655,6 +678,8 @@ class VRChatPlatformAdapter(Platform):
                     )
                     async with ws:
                         self._ws = ws
+                        self._samples = 0
+                        self._preroll.clear()
                         logger.info("VRChat: bridge stream connected")
                         try:
                             await self.request("POST", "/v1/social/config", self.social_config)
@@ -700,7 +725,9 @@ class VRChatPlatformAdapter(Platform):
 
     def _on_text(self, data: dict) -> None:
         kind = data.get("type")
-        if kind == "state":
+        if kind == "speaker":
+            self._on_speaker(data)
+        elif kind == "state":
             old = {p["id"] for p in self.state.get("players", [])}
             had_world = bool(self.state.get("running") and self.state.get("world"))
             was_running = bool(self.state.get("running"))
@@ -723,6 +750,61 @@ class VRChatPlatformAdapter(Platform):
             logger.warning("VRChat bridge: %s", data)
         elif kind in ("invite", "request_invite", "joining", "follow"):
             logger.info("VRChat bridge: %s", data)
+
+    def _on_speaker(self, data: dict) -> None:
+        """Who the bridge guesses is speaking (where the voice comes from,
+        whose name tag lights up), over a span of the stream's samples: the
+        voice session names them in what it hears. A core without speaker
+        labels goes without."""
+        session = self.session
+        if session is None or not hasattr(session, "label_speaker"):
+            return
+        try:
+            session.label_speaker(
+                data.get("name") or None,
+                int(data["start"]),
+                int(data["end"]),
+                bool(data.get("final")),
+                user_id=data.get("user_id"),
+                bearing_deg=data.get("bearing_deg"),
+                confidence=data.get("confidence"),
+                cues=data.get("cues"),
+                candidates=data.get("candidates"),
+            )
+        except Exception as exc:  # noqa: BLE001 - one label lost
+            logger.warning("VRChat: speaker label skipped: %s", exc)
+
+    def _attend(self, source: str = "wake", speaker: str | None = None) -> None:
+        """Called by name: turns to whoever spoke (the bridge finds them by
+        their voice's direction), in the background. Not while the avatar
+        moves for a tool: the turn would come when that is done, too late.
+        ``speaker``: who the transcript says spoke (the bridge's own guess,
+        given back): the bridge turns to their latest speech."""
+        if self._moving.locked() or self._http is None:
+            return
+        body: dict = {"pause_s": ATTEND_PAUSE_SECONDS}
+        if source != "wake":
+            # The transcript comes after the speech: look back far enough,
+            # to the speech that ended rather than whatever goes on now.
+            body["since_ms"] = ATTEND_LATE_MS
+        if speaker:
+            body["name"] = speaker
+
+        async def attend() -> None:
+            try:
+                data = await self.request("POST", "/v1/vr/attend", body, timeout=15)
+            except Exception as exc:  # noqa: BLE001 - only a turn of the head lost
+                logger.warning("VRChat: attend failed: %s", exc)
+                return
+            if data and data.get("ok"):
+                logger.info("VRChat: turned to %s (%s)", data.get("name") or "the voice",
+                            "confirmed" if data.get("confirmed") else "not confirmed")
+            else:
+                logger.debug("VRChat: nobody to turn to: %s", (data or {}).get("reason"))
+
+        task = asyncio.get_running_loop().create_task(attend())
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
     def _people_changed(self) -> None:
         """Players came or went: the voice session hears accordingly (all
@@ -1028,14 +1110,24 @@ class VRChatPlatformAdapter(Platform):
             logger.error("VRChat voice session could not warm up: %s", exc)
             self._retry_at = time.monotonic() + START_RETRY_SECONDS
 
+    def _feed(self, session, pcm: bytes, pos: int) -> None:
+        """Hands audio to the session, with where it is on the stream's clock
+        when its media takes that."""
+        if self._feed_pos:
+            session.media.feed(pcm, pos=pos)
+        else:
+            session.media.feed(pcm)
+
     def _on_audio(self, pcm: bytes) -> None:
+        pos = self._samples
+        self._samples += len(pcm) // 2
         if self.session is not None:
-            self.session.media.feed(pcm)
+            self._feed(self.session, pcm, pos)
             self._time_speech(pcm)
             return
         # Standby: keep a short pre-roll and wait for real speech.
         now = time.monotonic()
-        self._preroll.append((now, pcm))
+        self._preroll.append((now, pos, pcm))
         while self._preroll and now - self._preroll[0][0] > PREROLL_SECONDS:
             self._preroll.popleft()
         if now < self._retry_at or not self._detector.feed(pcm):
@@ -1046,8 +1138,8 @@ class VRChatPlatformAdapter(Platform):
             logger.error("VRChat voice session could not start: %s", exc)
             self._retry_at = now + START_RETRY_SECONDS
             return
-        for _, chunk in self._preroll:
-            session.media.feed(chunk)
+        for _, at, chunk in self._preroll:
+            self._feed(session, chunk, at)
         self._preroll.clear()
 
     def _time_speech(self, pcm: bytes) -> None:
@@ -1068,13 +1160,18 @@ class VRChatPlatformAdapter(Platform):
     def _start_voice(self):
         from astrbot.core.voice.chat import VoiceChat
         from astrbot.core.voice.pcm import PcmMedia
-        from astrbot.core.voice.session import new_voice_session, realtime_voice_config
+        from astrbot.core.voice.session import VoiceSession, new_voice_session, realtime_voice_config
 
         local = realtime_voice_config()["backend"] == "local_infra"
         prebuffer = "prebuffer_frames" in inspect.signature(PcmMedia).parameters
+        # (An older core takes neither the audio's positions nor on_wake.)
+        self._feed_pos = "pos" in inspect.signature(PcmMedia.feed).parameters
         # Only the local voice thread runs tools itself (VoiceTool).
         tools = self._voice_tools() if local else []
         extra = {"tools": tools} if tools else {}
+        if "on_wake" in inspect.signature(VoiceSession).parameters:
+            # Called by name: turn to whoever spoke.
+            extra["on_wake"] = self._attend
         session = new_voice_session(
             key=ROOM_SESSION,
             scope_id=f"{self.meta().id}:voice:{ROOM_SESSION}",
@@ -1098,8 +1195,8 @@ class VRChatPlatformAdapter(Platform):
             on_closed=self._voice_closed,
             label="VRChat",
             thread_key="vrchat_voice_thread",
-            # Speakers cannot be told apart: the room's turns run as the fixed
-            # voice user, a member.
+            # Speakers are only guessed (speaker labels): the room's turns run
+            # as the fixed voice user, a member, whoever the guess names.
             chat=VoiceChat(umo=self.room_umo, private=False, via="VRChat voice"),
             **extra,
         )

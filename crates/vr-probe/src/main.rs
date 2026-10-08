@@ -388,7 +388,7 @@ fn goto_cmd(cli: &Cli, prefix: &Path, candidate: Option<usize>, bearing: f32, di
             [s.eye[0] + yaw.sin() * d, s.eye[2] - yaw.cos() * d]
         }
     };
-    let report = vrc_nav::goto(&mut rig, s, target, &GotoOptions::default())?;
+    let report = vrc_nav::goto(&mut rig, s, target, &GotoOptions::default(), &mut vrc_nav::survey)?;
     for (i, l) in report.legs.iter().enumerate() {
         println!(
             "  leg {}: {:.1} m left, heading {:+.0} deg, walked {:.2} of {:.2} m{}",

@@ -150,6 +150,23 @@ impl EyeTap {
         self.latest(true)
     }
 
+    /// The latest frame without asking Monado to tap: as fresh as another
+    /// reader's asking keeps it ([`EyeTap::tapping`]), else as old as the
+    /// last tap.
+    pub fn read_unasked(&mut self) -> Result<Option<EyeFrame>> {
+        self.newest(true)
+    }
+
+    /// Whether some reader (this one or another, the follower say) asked
+    /// Monado to tap lately, so it taps now without being asked again.
+    pub fn tapping(&self) -> bool {
+        std::fs::metadata(&self.want)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| SystemTime::now().duration_since(t).ok())
+            .is_some_and(|age| age < WANT_LASTS)
+    }
+
     /// The latest frame without its pixels (`pixels` empty): cheap enough
     /// to poll for a frame rendered at some pose.
     pub fn peek(&mut self) -> Result<Option<EyeFrame>> {
@@ -187,6 +204,11 @@ impl EyeTap {
                 sleep(Duration::from_millis(5));
             }
         }
+        self.newest(pixels)
+    }
+
+    /// The newest frame in the ring as it is.
+    fn newest(&mut self, pixels: bool) -> Result<Option<EyeFrame>> {
         for _ in 0..100 {
             let Some(ring) = self.ring()? else { return Ok(None) };
             let n = ring.written();

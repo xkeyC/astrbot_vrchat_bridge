@@ -9,6 +9,9 @@
 //! 1-8 x columns 1-20 the 160 bits: magic 0x5A, x, y, z (f32 bits), yaw
 //! (u16 of a turn), pitch (i16, centidegrees), seq (u8), CRC-16/CCITT-FALSE
 //! of the 144 before it. Unity's world: +x right, +y up, +z ahead.
+//!
+//! The grid's reading ([`read_grid`]) is shared: the avatar's panorama rig
+//! draws its own code (magic 0x5B) the same way, right above (`vrc-pano`).
 
 use crate::tap::EyeFrame;
 
@@ -44,8 +47,16 @@ impl Beacon {
 /// (`col`, `row`, row 0 at the marker's top) when drawn the usual way up
 /// (`flipped`: upside down at the top-left).
 pub fn block_centre(w: u32, h: u32, col: usize, row: usize, flipped: bool) -> (f32, f32) {
-    let x = -1.0 + MARGIN_NDC + (col as f32 + 0.5) * BLOCK_NDC;
-    let y = -1.0 + MARGIN_NDC + ROWS as f32 * BLOCK_NDC - (row as f32 + 0.5) * BLOCK_NDC;
+    block_centre_at(w, h, [-1.0 + MARGIN_NDC, -1.0 + MARGIN_NDC], col, row, flipped)
+}
+
+/// The middle of block (`col`, `row`) of a 22 x 10 grid whose bottom-left
+/// corner is `origin` (NDC, y up) in an eye `w` x `h` (pixels, top-left
+/// origin); `flipped`: the image upside down. The pano rig's code (magic
+/// 0x5B) is such a grid too, above the beacon (avatar-panorama.md 3.5).
+pub fn block_centre_at(w: u32, h: u32, origin: [f32; 2], col: usize, row: usize, flipped: bool) -> (f32, f32) {
+    let x = origin[0] + (col as f32 + 0.5) * BLOCK_NDC;
+    let y = origin[1] + ROWS as f32 * BLOCK_NDC - (row as f32 + 0.5) * BLOCK_NDC;
     let px = (x + 1.0) / 2.0 * w as f32;
     let py = if flipped { (1.0 + y) / 2.0 * h as f32 } else { (1.0 - y) / 2.0 * h as f32 };
     (px, py)
@@ -76,8 +87,32 @@ pub fn read_pixels(px: &[u8], w: u32, h: u32) -> Option<Beacon> {
 }
 
 fn read_way(px: &[u8], w: u32, h: u32, flipped: bool) -> Option<Beacon> {
+    let bits = read_grid(px, w, h, [-1.0 + MARGIN_NDC, -1.0 + MARGIN_NDC], flipped)?;
+    if field(&bits, 0, 8) != MAGIC {
+        return None;
+    }
+    let position = [f32::from_bits(field(&bits, 8, 32)), f32::from_bits(field(&bits, 40, 32)), f32::from_bits(field(&bits, 72, 32))];
+    if !position.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    Some(Beacon {
+        position,
+        yaw: field(&bits, 104, 16) as f32 / 65536.0 * 360.0,
+        pitch: field(&bits, 120, 16) as u16 as i16 as f32 / 100.0,
+        seq: field(&bits, 136, 8) as u8,
+    })
+}
+
+/// The 160 bits of a 22 x 10 grid with its bottom-left corner at `origin`
+/// (NDC), when its levels, border and CRC (over the first 144, in the last
+/// 16) hold; the magic is the caller's to check. Tightly packed 4-byte
+/// pixels, any channel order.
+pub fn read_grid(px: &[u8], w: u32, h: u32, origin: [f32; 2], flipped: bool) -> Option<[u8; 160]> {
+    if px.len() < (w as usize) * (h as usize) * 4 {
+        return None;
+    }
     let level = |col: usize, row: usize| -> f32 {
-        let (cx, cy) = block_centre(w, h, col, row, flipped);
+        let (cx, cy) = block_centre_at(w, h, origin, col, row, flipped);
         let (cx, cy) = (cx as i64, cy as i64);
         let mut sum = 0u32;
         let mut n = 0u32;
@@ -121,20 +156,12 @@ fn read_way(px: &[u8], w: u32, h: u32, flipped: bool) -> Option<Beacon> {
         let (row, col) = (1 + k / (COLS - 2), 1 + k % (COLS - 2));
         *b = (level(col, row) >= mid) as u8;
     }
-    let field = |from: usize, len: usize| bits[from..from + len].iter().fold(0u32, |a, &b| (a << 1) | b as u32);
-    if field(0, 8) != MAGIC || field(144, 16) != crc16(&bits[..144]) {
-        return None;
-    }
-    let position = [f32::from_bits(field(8, 32)), f32::from_bits(field(40, 32)), f32::from_bits(field(72, 32))];
-    if !position.iter().all(|v| v.is_finite()) {
-        return None;
-    }
-    Some(Beacon {
-        position,
-        yaw: field(104, 16) as f32 / 65536.0 * 360.0,
-        pitch: field(120, 16) as u16 as i16 as f32 / 100.0,
-        seq: field(136, 8) as u8,
-    })
+    (field(&bits, 144, 16) == crc16(&bits[..144])).then_some(bits)
+}
+
+/// Bits `from..from + len` (at most 32) as a number, the first the highest.
+pub fn field(bits: &[u8], from: usize, len: usize) -> u32 {
+    bits[from..from + len].iter().fold(0u32, |a, &b| (a << 1) | b as u32)
 }
 
 /// CRC-16/CCITT-FALSE over bits (most significant first).

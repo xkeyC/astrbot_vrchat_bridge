@@ -82,6 +82,12 @@ impl Mapping {
         std::thread::spawn(move || me.odometry(&bridge));
     }
 
+    /// Whether the odometry moved the feet within `d` (the avatar's own
+    /// speed: walking, falling, pushed).
+    pub fn moved_within(&self, d: Duration) -> bool {
+        self.moving.lk().is_some_and(|t| t.elapsed() < d)
+    }
+
     /// A look for the map, when the map thread is free.
     pub fn observe(&self, obs: Observation) {
         if let Err(TrySendError::Full(_)) = self.tx.try_send(obs) {

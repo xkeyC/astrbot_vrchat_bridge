@@ -18,13 +18,16 @@ use crate::game::{self, GameState, LogTail};
 use crate::mapping::Mapping;
 use crate::sightings::Sightings;
 use crate::social::Social;
+use crate::speaker::Speakers;
 use crate::vr::VrCore;
 use crate::Args;
 use crate::Lock;
 
 pub const SAMPLE_RATE: u32 = 48_000;
-/// 20 ms of 16-bit mono.
-pub const FRAME_BYTES: usize = 960 * 2;
+/// 20 ms: what goes to the client as 16-bit mono.
+pub const FRAME_SAMPLES: usize = 960;
+/// 20 ms of the capture: float32 stereo.
+const CAPTURE_BYTES: usize = FRAME_SAMPLES * 2 * 4;
 /// Push-to-talk stays held this long after the bot's audio has played out,
 /// so the end of a sentence is not cut by the release.
 const PTT_TAIL: Duration = Duration::from_millis(300);
@@ -32,6 +35,9 @@ const PTT_TAIL: Duration = Duration::from_millis(300);
 const PLAYBACK_LATENCY_MS: u64 = 60;
 /// Outbound frames queued for a slow client before new ones are dropped.
 const CLIENT_QUEUE: usize = 200;
+/// Blocks waiting for the speaker tracker's analysis (1 s) before new ones
+/// go unanalysed (the client still gets them).
+const ANALYSIS_QUEUE: usize = 50;
 pub const CHATBOX_LIMIT: usize = 144;
 /// VRChat throttles chatbox spam; messages are paced at least this far apart.
 const CHATBOX_INTERVAL: Duration = Duration::from_millis(1600);
@@ -39,6 +45,29 @@ const WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
 /// A follow the model's own moves paused resumes this long after its last
 /// move (a step, a walk, a look around).
 pub const TAKEOVER_IDLE: Duration = Duration::from_secs(10);
+
+/// The stream client: its id, its outbound queue, and its sample clock (the
+/// audio samples actually queued to it since it attached; a frame a full
+/// queue dropped does not count: `docs/full-vr/speaker.md`).
+struct Client {
+    id: u64,
+    tx: mpsc::Sender<Message>,
+    clock: u64,
+}
+
+/// A block of the capture for the speaker tracker's analysis: where it
+/// landed on the client's clock (and whether it reached the client), the
+/// head and the bot's voice then, and when it was read.
+struct Captured {
+    left: Vec<f32>,
+    right: Vec<f32>,
+    clock: u64,
+    counted: bool,
+    client: u64,
+    head: Option<(Instant, vrc_vr::Pose)>,
+    bot_until: Option<Instant>,
+    at: Instant,
+}
 
 /// A follow paused while the model moves the avatar itself.
 #[derive(Clone, Debug)]
@@ -53,8 +82,8 @@ pub struct Bridge {
     pub token: String,
     pub osc: Osc,
     pub game: Mutex<GameState>,
-    /// The stream client (one at a time): an id and its outbound queue.
-    client: Mutex<Option<(u64, mpsc::Sender<Message>)>>,
+    /// The stream client (one at a time).
+    client: Mutex<Option<Client>>,
     client_ids: AtomicU64,
     player: tokio::sync::Mutex<Player>,
     chatbox: mpsc::Sender<(String, bool)>,
@@ -79,6 +108,19 @@ pub struct Bridge {
     takeover: Mutex<Option<Takeover>>,
     /// Counts the model's moves: a resume scheduled before the latest is off.
     takeover_moves: AtomicU64,
+    /// Who is speaking: direction and nameplates (`speaker`).
+    pub speaker: Arc<Speakers>,
+    /// When the bot's own voice has played out (what other players' open
+    /// speakers may play back for a while after).
+    pub bot_voice_until: Mutex<Option<Instant>>,
+    /// VRChat's user camera as a remote eye (`usercam`).
+    pub usercam: crate::usercam::UserCam,
+    /// Its lens round the bot, and the names it reads (`orbit`).
+    pub orbit: Arc<crate::orbit::Orbit>,
+    /// The avatar's panorama rig (`pano`).
+    pub pano: Arc<crate::pano::Pano>,
+    /// The people near the bot, and the idle sweep (`people`).
+    pub people: Arc<crate::people::People>,
 }
 
 #[derive(Default)]
@@ -101,6 +143,9 @@ impl Bridge {
         let anim = Arc::new(Anim::new(config_dir.join("anim.json")));
         let motions = Arc::new(crate::motion::Library::new(config_dir.join("motions")));
         let mapping = Mapping::new(config_dir.join("maps"));
+        let speaker = Arc::new(Speakers::new(&args));
+        let pano = crate::pano::Pano::new(&args);
+        let orbit = Arc::new(crate::orbit::Orbit::new(Osc::with_ports_from(&osc).expect("an OSC socket"), anim.clone()));
         let mut core = VrCore::new(&args);
         core.head_height = anim.params().head_height;
         core.map = Some(mapping.nav.clone());
@@ -126,6 +171,12 @@ impl Bridge {
             args,
             takeover: Mutex::new(None),
             takeover_moves: AtomicU64::new(0),
+            speaker,
+            bot_voice_until: Mutex::new(None),
+            usercam: crate::usercam::UserCam::new(config_dir.join("usercam.json")),
+            orbit,
+            pano,
+            people: Arc::new(crate::people::People::default()),
         });
         (bridge, chat_rx)
     }
@@ -135,8 +186,8 @@ impl Bridge {
     /// Sends a text event to the stream client, if any.
     pub fn send_event(&self, data: Value) {
         let follow = data["type"] == "follow";
-        if let Some((_, tx)) = self.client.lk().as_ref() {
-            let _ = tx.try_send(Message::Text(data.to_string().into()));
+        if let Some(c) = self.client.lk().as_ref() {
+            let _ = c.tx.try_send(Message::Text(data.to_string().into()));
         }
         if follow {
             self.notify_state(); // whom it follows, and how, is room state
@@ -168,8 +219,8 @@ impl Bridge {
 
     /// Pushes the room state (and guards the instance).
     pub fn notify_state(&self) {
-        if let Some((_, tx)) = self.client.lk().as_ref() {
-            let _ = tx.try_send(Message::Text(json!({"type": "state", "state": self.room_state()}).to_string().into()));
+        if let Some(c) = self.client.lk().as_ref() {
+            let _ = c.tx.try_send(Message::Text(json!({"type": "state", "state": self.room_state()}).to_string().into()));
         }
     }
 
@@ -198,13 +249,19 @@ impl Bridge {
     /// After a move: unless the model moves again within TAKEOVER_IDLE, the
     /// follow it paused resumes.
     pub fn idle_later(self: &Arc<Self>) {
+        self.idle_later_for(TAKEOVER_IDLE);
+    }
+
+    /// [`Bridge::idle_later`] after `idle` instead (turning to a speaker
+    /// pauses the follow for as long as asked).
+    pub fn idle_later_for(self: &Arc<Self>, idle: Duration) {
         let moves = self.takeover_moves.fetch_add(1, Ordering::SeqCst) + 1;
         if self.takeover.lk().is_none() {
             return;
         }
         let me = self.clone();
         self.rt.spawn(async move {
-            tokio::time::sleep(TAKEOVER_IDLE).await;
+            tokio::time::sleep(idle).await;
             if me.takeover_moves.load(Ordering::SeqCst) == moves {
                 me.resume_following();
             }
@@ -223,6 +280,11 @@ impl Bridge {
     }
 
     /// Drops a paused follow without resuming it (a stop, a new follow).
+    /// Whether a follow is paused while the model moves.
+    pub fn follow_paused(&self) -> bool {
+        self.takeover.lk().is_some()
+    }
+
     pub fn end_takeover(&self) {
         self.takeover_moves.fetch_add(1, Ordering::SeqCst);
         if self.takeover.lk().take().is_some() {
@@ -275,35 +337,51 @@ impl Bridge {
 
     // -- the stream client ------------------------------------------------------
 
-    /// A new stream client: the old one is dropped; its outbound queue.
+    /// A new stream client: the old one is dropped; its outbound queue. Its
+    /// sample clock starts at 0.
     pub fn attach_client(&self) -> (u64, mpsc::Receiver<Message>) {
         let id = self.client_ids.fetch_add(1, Ordering::SeqCst) + 1;
         let (tx, rx) = mpsc::channel(CLIENT_QUEUE);
         let _ = tx.try_send(Message::Text(json!({"type": "state", "state": self.room_state()}).to_string().into()));
-        if let Some((_, old)) = self.client.lk().replace((id, tx)) {
-            let _ = old.try_send(Message::Close(None));
+        if let Some(old) = self.client.lk().replace(Client { id, tx, clock: 0 }) {
+            let _ = old.tx.try_send(Message::Close(None));
         }
         (id, rx)
     }
 
     pub fn detach_client(&self, id: u64) {
         let mut c = self.client.lk();
-        if c.as_ref().is_some_and(|(cid, _)| *cid == id) {
+        if c.as_ref().is_some_and(|c| c.id == id) {
             *c = None;
+        }
+    }
+
+    /// Queues a text event to client `id` if it is still the one attached;
+    /// whether it was queued.
+    fn send_to(&self, id: u64, data: &Value) -> bool {
+        match self.client.lk().as_ref() {
+            Some(c) if c.id == id => c.tx.try_send(Message::Text(data.to_string().into())).is_ok(),
+            _ => false,
         }
     }
 
     // -- audio ------------------------------------------------------------------
 
-    /// Reads what the game plays and hands it to the client, if any.
+    /// Reads what the game plays (both ears) and hands the client a mono mix
+    /// of it, if there is a client; the speaker tracker hears both ears (on
+    /// a thread of its own) and sends its events in the same queue, after
+    /// the audio they are about.
     pub async fn capture(self: Arc<Self>) {
+        let analysis = self.clone().analysis();
+        let (mut unanalysed, mut warned) = (0u64, None::<Instant>);
         loop {
             let child = Command::new("parec")
                 .args([
                     &format!("--device={}", self.args.capture_device),
-                    "--format=s16le",
+                    "--format=float32le",
                     &format!("--rate={SAMPLE_RATE}"),
-                    "--channels=1",
+                    "--channels=2",
+                    "--channel-map=front-left,front-right",
                     "--latency-msec=20",
                     "--raw",
                 ])
@@ -312,12 +390,45 @@ impl Bridge {
                 .spawn();
             match child {
                 Ok(mut child) => {
-                    tracing::info!("capturing {}", self.args.capture_device);
+                    tracing::info!("capturing {} (stereo)", self.args.capture_device);
                     let mut out = child.stdout.take().unwrap();
-                    let mut buf = vec![0u8; FRAME_BYTES];
+                    let mut buf = vec![0u8; CAPTURE_BYTES];
+                    let (mut left, mut right) = (vec![0f32; FRAME_SAMPLES], vec![0f32; FRAME_SAMPLES]);
                     while out.read_exact(&mut buf).await.is_ok() {
-                        if let Some((_, tx)) = self.client.lk().as_ref() {
-                            let _ = tx.try_send(Message::Binary(buf.clone().into())); // a full queue drops it
+                        for (i, f) in buf.chunks_exact(8).enumerate() {
+                            let (l, r) = (f32::from_le_bytes(f[..4].try_into().unwrap()), f32::from_le_bytes(f[4..].try_into().unwrap()));
+                            (left[i], right[i]) = if self.args.swap_ears { (r, l) } else { (l, r) };
+                        }
+                        let mono = self.speaker.mix(&left, &right);
+                        let bytes: Vec<u8> = mono.iter().flat_map(|s| s.to_le_bytes()).collect();
+                        // Counted only if queued (a full queue drops it).
+                        let (id, clock, counted) = match self.client.lk().as_mut() {
+                            Some(c) => {
+                                let before = c.clock;
+                                let queued = c.tx.try_send(Message::Binary(bytes.into())).is_ok();
+                                if queued {
+                                    c.clock += FRAME_SAMPLES as u64;
+                                }
+                                (c.id, before, queued)
+                            }
+                            None => (0, 0, false),
+                        };
+                        let block = Captured {
+                            left: left.clone(),
+                            right: right.clone(),
+                            clock,
+                            counted,
+                            client: id,
+                            head: *self.anim.head.lk(),
+                            bot_until: *self.bot_voice_until.lk(),
+                            at: Instant::now(),
+                        };
+                        if analysis.try_send(block).is_err() {
+                            unanalysed += 1;
+                            if warned.is_none_or(|t| t.elapsed() > Duration::from_secs(10)) {
+                                tracing::warn!("speakers: the analysis falls behind ({unanalysed} blocks left out so far)");
+                                warned = Some(Instant::now());
+                            }
                         }
                     }
                     let _ = child.kill().await;
@@ -327,6 +438,33 @@ impl Bridge {
             tracing::warn!("capture ended, restarting");
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
+    }
+
+    /// The speaker tracker's analysis, on a thread of its own: the blocks in
+    /// order, each with its own clock and time; its `speaker` events into
+    /// the client's queue (finals a full queue refused tried again with the
+    /// next blocks, for the client they were for, a while).
+    fn analysis(self: Arc<Self>) -> std::sync::mpsc::SyncSender<Captured> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Captured>(ANALYSIS_QUEUE);
+        std::thread::Builder::new()
+            .name("speakers-audio".into())
+            .spawn(move || {
+                let mut retry: Vec<(u64, Value, u32)> = Vec::new();
+                for c in rx {
+                    let events = self.speaker.analyse(&c.left, &c.right, c.clock, c.counted, c.client, c.head, c.bot_until, c.at);
+                    retry.retain_mut(|(to, ev, tries)| {
+                        *tries += 1;
+                        *to == c.client && *tries < 50 && !self.send_to(*to, ev)
+                    });
+                    for ev in events {
+                        if !self.send_to(c.client, &ev) && ev["final"] == true {
+                            retry.push((c.client, ev, 0));
+                        }
+                    }
+                }
+            })
+            .expect("a thread for the speaker tracker");
+        tx
     }
 
     /// Plays the bot's voice into the microphone, holding push-to-talk.
@@ -371,6 +509,7 @@ impl Bridge {
         let starts = p.speech_until.filter(|t| *t > now).unwrap_or(now);
         self.anim.heard_bot(pcm, starts + Duration::from_millis(PLAYBACK_LATENCY_MS));
         p.speech_until = Some(p.speech_until.filter(|t| *t > now).unwrap_or(now) + len);
+        *self.bot_voice_until.lk() = p.speech_until.map(|t| t + Duration::from_millis(PLAYBACK_LATENCY_MS));
         if !p.release_pending {
             p.release_pending = true;
             let me = self.clone();
@@ -525,17 +664,24 @@ pub fn split_chatbox(text: &str) -> Vec<String> {
     parts
 }
 
+/// A bridge for tests: no game, no headset, its files in a temporary
+/// directory.
+#[cfg(test)]
+pub(crate) fn test_bridge() -> Arc<Bridge> {
+    use clap::Parser;
+    let dir = std::env::temp_dir().join(format!("vrc-bridge-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let token = dir.join("token");
+    let args = Args::parse_from(["vrc-bridge", "--token-file", token.to_str().unwrap()]);
+    Bridge::new(args, "t".to_string()).0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
 
     fn bridge() -> Arc<Bridge> {
-        let dir = std::env::temp_dir().join(format!("vrc-bridge-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let token = dir.join("token");
-        let args = Args::parse_from(["vrc-bridge", "--token-file", token.to_str().unwrap()]);
-        Bridge::new(args, "t".to_string()).0
+        test_bridge()
     }
 
     fn paused(b: &Bridge) {

@@ -1,0 +1,11 @@
+[package]
+name = "vrc-audio"
+version = "0.1.0"
+description = "Where a voice comes from in the game's binaural output: STFT, speech activity, segments, direction by HRTF templates, a mono mix that keeps side voices whole"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+realfft = "3.5"

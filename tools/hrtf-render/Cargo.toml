@@ -1,0 +1,12 @@
+[package]
+name = "hrtf-render"
+version = "0.1.0"
+description = "Renders Steam Audio's default HRTF into an HRIR table (VRCHRTF1) for vrc-audio's direction finder, by calling the official SDK's phonon library"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+libloading = "0.9"
+vrc-audio.workspace = true

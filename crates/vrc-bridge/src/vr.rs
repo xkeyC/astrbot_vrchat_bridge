@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
-use vrc_nav::{GotoOptions, Rig, Survey, SurveyOptions};
+use vrc_nav::{GotoOptions, Look, Rig, Survey, SurveyOptions};
 use vrc_vr::osc::Osc;
 use vrc_vr::scan;
 use vrc_vr::tap::EyeFrame;
@@ -169,6 +169,30 @@ impl VrCore {
         Ok(())
     }
 
+    /// Turns the head alone to `yaw`, `pitch` (degrees) in `secs`, eased in
+    /// and out; the body (and the hands) stay where they face.
+    pub fn turn_head_gently(&mut self, yaw: f32, pitch: f32, secs: f32) -> Result<()> {
+        let (y0, p0) = (self.yaw, self.pitch);
+        let d = vrc_vr::scan::angle_diff(yaw, y0);
+        let steps = (secs.max(0.1) / 0.022).ceil() as usize;
+        for i in 1..=steps {
+            let w = i as f32 / steps as f32;
+            let e = w * w * (3.0 - 2.0 * w);
+            let rig = self.rig(&[])?;
+            let at = rig.hmd.state.head.position;
+            rig.hmd.set_head(Pose::looking(y0 + d * e, p0 + (pitch - p0) * e, at))?;
+            std::thread::sleep(Duration::from_millis(22));
+        }
+        self.yaw = (yaw + 540.0).rem_euclid(360.0) - 180.0;
+        self.pitch = pitch;
+        Ok(())
+    }
+
+    /// Where the body faces (degrees), as the hands were last placed for.
+    pub fn body_yaw(&mut self) -> Result<f32> {
+        Ok(self.rig(&[])?.hmd.state.body_yaw)
+    }
+
     /// Turns the whole bot: the head (degrees; pitch clamped to +-80) and
     /// the body under it (the hands at its sides).
     /// The body facing `body_yaw` (the hands at its sides, the feet
@@ -304,11 +328,34 @@ impl VrCore {
         rig.hmd.send()
     }
 
-    /// Lets go of both hands' triggers and buttons, keeping where they are.
+    /// Squeezes a hand's grip (0..1: VRChat grabs a pickup with it), the
+    /// last three fingers curled with it; it holds until set again or
+    /// [`VrCore::release_hands`].
+    pub fn set_squeeze(&mut self, hand: &str, squeeze: f32) -> Result<()> {
+        let rig = self.rig(&[])?;
+        let c = match hand {
+            "left" => &mut rig.hmd.state.left,
+            "right" => &mut rig.hmd.state.right,
+            _ => bail!("hand is left or right"),
+        };
+        let s = squeeze.clamp(0.0, 1.0);
+        (c.squeeze, c.squeeze_force) = (s, s);
+        // Little, ring and middle (the order of the curls) close round the
+        // grip, from their rest.
+        let rest = vrc_vr::anim::AnimParams::default().curl;
+        for (curl, rest) in c.hand_curl[..3].iter_mut().zip(rest) {
+            *curl = rest.max(s);
+        }
+        rig.hmd.send()
+    }
+
+    /// Lets go of both hands' triggers, grips and buttons, keeping where
+    /// they are.
     pub fn release_hands(&mut self) -> Result<()> {
         let rig = self.rig(&[])?;
         for c in [&mut rig.hmd.state.left, &mut rig.hmd.state.right] {
             (c.trigger, c.trigger_touch, c.trigger_click) = (0.0, false, false);
+            (c.squeeze, c.squeeze_force) = (0.0, 0.0);
             (c.a_click, c.a_touch, c.b_click, c.b_touch) = (false, false, false, false);
             (c.system_click, c.system_touch, c.thumbstick_click, c.thumbstick_touch) = (false, false, false, false);
         }
@@ -317,10 +364,11 @@ impl VrCore {
 
     // -- surveys and walks --------------------------------------------------------
 
-    /// Looks: all around (`around`), else only ahead (and down at the feet).
-    pub fn survey(&mut self, whitelist: &[String], players: bool, around: bool) -> Result<Value> {
+    /// Looks: all around (`around`), else only ahead (and down at the feet);
+    /// by `look` (`panolook::surveyor`: the panorama when there is one).
+    pub fn survey(&mut self, whitelist: &[String], players: bool, around: bool, look: &mut Look) -> Result<Value> {
         let opts = SurveyOptions { players, ahead: !around, ..Default::default() };
-        let s = vrc_nav::survey(self.rig(whitelist)?, &opts, &[])?;
+        let s = look(self.rig(whitelist)?, &opts, &[])?;
         if let Some(map) = &self.map {
             vrc_nav::observe(map, &s);
         }
@@ -335,7 +383,7 @@ impl VrCore {
     /// Walks to a place of the last look around or a bearing; `since`: the
     /// stops when it was asked for ([`walk::stops`]). Then looks ahead (all
     /// around with `around`).
-    pub fn goto(&mut self, whitelist: &[String], input: &Value, since: u64) -> Result<Value> {
+    pub fn goto(&mut self, whitelist: &[String], input: &Value, since: u64, look: &mut Look) -> Result<Value> {
         // A place number of a look around the caller did not see (another
         // caller looked since) would lead elsewhere.
         if input["candidate"].is_u64() {
@@ -344,7 +392,7 @@ impl VrCore {
             }
         }
         // A fresh survey to plan from (people move, and so may the bot).
-        let s = vrc_nav::survey(self.rig(whitelist)?, &SurveyOptions { players: false, ..Default::default() }, &[])?;
+        let s = look(self.rig(whitelist)?, &SurveyOptions { players: false, ..Default::default() }, &[])?;
         // How high the place is over the floor (up the stairs, not under).
         let mut target_up = None;
         // A place on the lasting map: stepped onto exactly, and faced as then.
@@ -384,13 +432,13 @@ impl VrCore {
         if let Some(a) = pace_axis(input["pace"].as_str())? {
             opts.walk.axis = a;
         }
-        let report = vrc_nav::goto(self.rig(whitelist)?, s, target, &opts)?;
+        let report = vrc_nav::goto(self.rig(whitelist)?, s, target, &opts, look)?;
         let settled = match (&self.map.clone(), settle_to) {
             (Some(map), Some((goal, heading))) if report.reason.as_deref() != Some("stopped") => Some(self.settle(map, goal, heading, since)?),
             _ => None,
         };
         let around = input["around"].as_bool().unwrap_or(false);
-        let after = vrc_nav::survey(self.rig(whitelist)?, &SurveyOptions { ahead: !around, ..Default::default() }, &[])?;
+        let after = look(self.rig(whitelist)?, &SurveyOptions { ahead: !around, ..Default::default() }, &[])?;
         if let Some(map) = &self.map {
             vrc_nav::observe(map, &after);
         }
@@ -637,6 +685,17 @@ impl VrCore {
     }
 }
 
+/// A view out of a pano frame as JPEG: along world yaw `yaw` (the
+/// beacon's) and `pitch` (+ up), `fov` degrees wide, `width` square (as the
+/// eyes' usual view).
+pub fn view_jpeg(frame: &vrc_pano::PanoFrame, yaw: f32, pitch: f32, fov: f32, width: u32) -> Result<Vec<u8>> {
+    let w = width.clamp(64, 3840) as usize;
+    let rgb = frame.perspective(yaw, pitch, fov, w, w);
+    let mut jpeg = Vec::new();
+    jpeg_encoder::Encoder::new(&mut jpeg, 85).encode(&rgb, w as u16, w as u16, jpeg_encoder::ColorType::Rgb)?;
+    Ok(jpeg)
+}
+
 /// The left eye of `frame` as JPEG, `width` pixels wide (0: as is).
 pub fn eye_jpeg(frame: &EyeFrame, width: u32) -> Result<Vec<u8>> {
     let rgb = frame.eye_rgb8(0)?;
@@ -683,14 +742,25 @@ fn r2(v: f32) -> f64 {
 
 pub fn survey_json(serial: u64, s: &Survey) -> Value {
     let ms = |d: Duration| (d.as_secs_f64() * 1e3).round();
-    json!({
+    // From the head, as the candidates are.
+    let way = |p: [f32; 3]| {
+        let (dx, dz) = (p[0] - s.eye[0], p[2] - s.eye[2]);
+        (r2(dx.hypot(dz) * s.metres), vrc_vr::scan::angle_diff(dx.atan2(-dz).to_degrees(), s.yaw).round())
+    };
+    let mut v = json!({
         "survey": serial,
+        "source": if s.pano.is_some() { "pano" } else { "head scan" },
         "candidates": s.candidates_json(),
-        "players": s.players.iter().map(|p| json!({
-            "name": p.name,
-            "whitelist_rank": p.whitelist_rank,
-            "ocr": p.text,
-        })).collect::<Vec<_>>(),
+        "players": s.players.iter().map(|p| {
+            let (distance, bearing) = way(p.feet);
+            json!({
+                "name": p.name,
+                "whitelist_rank": p.whitelist_rank,
+                "ocr": p.text,
+                "distance_m": distance,
+                "bearing_deg": bearing,
+            })
+        }).collect::<Vec<_>>(),
         "room": s.room,
         // Things found (each view's: one thing seen in two is listed twice).
         "objects": s.objects.iter().map(|o| {
@@ -706,7 +776,15 @@ pub fn survey_json(serial: u64, s: &Survey) -> Value {
             "scan": ms(s.timings.scan), "stereo": ms(s.timings.stereo),
             "ocr": ms(s.timings.ocr), "detect": ms(s.timings.detect), "map": ms(s.timings.map),
         },
-    })
+    });
+    if let Some(look) = &s.pano {
+        // Names read with nobody found under the plate: a direction alone.
+        v["named_bearings"] = json!(look.bearings.iter().map(|(n, y)| json!({
+            "name": n,
+            "bearing_deg": vrc_vr::scan::angle_diff(*y, s.yaw).round(),
+        })).collect::<Vec<_>>());
+    }
+    v
 }
 
 /// The latest survey's panorama as JPEG, cropped to the rows and columns

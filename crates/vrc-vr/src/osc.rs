@@ -10,6 +10,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -17,6 +18,36 @@ use anyhow::{bail, Context, Result};
 /// Where VRChat's logs are for the bot user (Proton prefix), under `$HOME`.
 pub const LOG_DIR: &str =
     ".local/share/Steam/steamapps/compatdata/438100/pfx/drive_c/users/steamuser/AppData/LocalLow/VRChat/VRChat";
+
+/// The movement inputs: while one of them is held, the avatar moves (or,
+/// with VRChat's user camera flying, the camera does).
+pub const MOVE_INPUTS: [&str; 7] =
+    ["/input/Vertical", "/input/Horizontal", "/input/Jump", "/input/MoveForward", "/input/MoveBackward", "/input/MoveLeft", "/input/MoveRight"];
+
+/// Called before every movement input is sent, with its address and value
+/// (0 lets go): it may hold a push back a moment (the user camera's orbit
+/// turns flying off first, `vrc-bridge`'s `orbit`). Every `Osc` goes
+/// through it: the one choke point of the bot's locomotion.
+pub type MoveGate = Arc<dyn Fn(&str, f32) + Send + Sync>;
+
+static MOVE_GATE: RwLock<Option<MoveGate>> = RwLock::new(None);
+
+/// Sets the gate every movement input goes through (None: none).
+pub fn set_move_gate(gate: Option<MoveGate>) {
+    *MOVE_GATE.write().unwrap_or_else(|e| e.into_inner()) = gate;
+}
+
+/// The gate for `address` (a movement input) about to be sent `value`.
+fn gate(address: &str, value: f32) {
+    if !MOVE_INPUTS.contains(&address) {
+        return;
+    }
+    // Cloned out: the gate may block, and may be set meanwhile.
+    let g = MOVE_GATE.read().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(g) = g {
+        g(address, value);
+    }
+}
 
 pub struct Osc {
     udp: UdpSocket,
@@ -44,6 +75,17 @@ impl Osc {
     /// Sends a message with any arguments (`/chatbox/input` takes a string
     /// and two booleans).
     pub fn send(&self, address: &str, args: &[Arg]) -> Result<()> {
+        if let Some(a) = args.first() {
+            gate(
+                address,
+                match a {
+                    Arg::Int(i) => *i as f32,
+                    Arg::Float(f) => *f,
+                    Arg::Bool(b) => *b as i32 as f32,
+                    Arg::Str(_) => 0.0,
+                },
+            );
+        }
         self.udp.send_to(&encode(address, args), &self.send_to)?;
         Ok(())
     }
@@ -56,12 +98,14 @@ impl Osc {
 
     /// Sends a float (`/input/Vertical`, `/avatar/eyeheight`, ...).
     pub fn send_f32(&self, address: &str, value: f32) -> Result<()> {
+        gate(address, value);
         self.udp.send_to(&message(address, b",f", &value.to_be_bytes()), &self.send_to)?;
         Ok(())
     }
 
     /// Sends an int (`/input/Jump`, buttons).
     pub fn send_i32(&self, address: &str, value: i32) -> Result<()> {
+        gate(address, value as f32);
         self.udp.send_to(&message(address, b",i", &value.to_be_bytes()), &self.send_to)?;
         Ok(())
     }
@@ -182,6 +226,27 @@ mod tests {
         assert_eq!(m.len(), 12 + 4 + 4);
         assert_eq!(&m[..12], b"/input/Jump\0");
         assert_eq!(&m[12..16], b",i\0\0");
+    }
+
+    #[test]
+    fn movement_inputs_go_through_the_gate() {
+        use std::sync::Mutex;
+        static SEEN: Mutex<Vec<(String, f32)>> = Mutex::new(Vec::new());
+        set_move_gate(Some(Arc::new(|a: &str, v: f32| SEEN.lock().unwrap().push((a.to_string(), v)))));
+        let osc = Osc::with_ports("127.0.0.1:9", 0).unwrap();
+        osc.send_f32("/input/Vertical", 0.6).unwrap();
+        osc.send_i32("/input/Jump", 1).unwrap();
+        osc.send("/input/MoveForward", &[Arg::Int(1)]).unwrap();
+        osc.send_f32("/avatar/eyeheight", 1.2).unwrap();
+        osc.send_i32("/input/Voice", 1).unwrap();
+        osc.send_f32("/input/Horizontal", 0.0).unwrap();
+        set_move_gate(None);
+        osc.send_f32("/input/Vertical", 0.3).unwrap();
+        let seen = SEEN.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![("/input/Vertical".into(), 0.6), ("/input/Jump".into(), 1.0), ("/input/MoveForward".into(), 1.0), ("/input/Horizontal".into(), 0.0)]
+        );
     }
 
     #[test]

@@ -22,8 +22,10 @@ tokio.workspace = true
 tokio-tungstenite.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+vrc-audio.workspace = true
 vrc-map.workspace = true
 vrc-nav.workspace = true
+vrc-pano.workspace = true
 vrc-players.workspace = true
 vrc-scene.workspace = true
 vrc-stereo.workspace = true
@@ -31,3 +33,4 @@ vrc-vr.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+vrc-pano = { workspace = true, features = ["synth"] }

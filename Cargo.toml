@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/vrc-vr", "crates/vrc-stereo", "crates/vrc-scene", "crates/vrc-map", "crates/vrc-players", "crates/vrc-nav", "crates/vrc-bridge", "crates/vr-probe"]
+members = ["crates/vrc-audio", "crates/vrc-vr", "crates/vrc-stereo", "crates/vrc-scene", "crates/vrc-map", "crates/vrc-players", "crates/vrc-nav", "crates/vrc-pano", "crates/vrc-bridge", "crates/vr-probe", "tools/hrtf-render"]
 
 [workspace.package]
 edition = "2021"
@@ -24,8 +24,10 @@ tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+vrc-audio = { path = "crates/vrc-audio" }
 vrc-map = { path = "crates/vrc-map" }
 vrc-nav = { path = "crates/vrc-nav" }
+vrc-pano = { path = "crates/vrc-pano" }
 vrc-players = { path = "crates/vrc-players" }
 vrc-scene = { path = "crates/vrc-scene" }
 vrc-stereo = { path = "crates/vrc-stereo" }
@@ -39,4 +41,10 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.vrc-map]
+opt-level = 3
+
+[profile.dev.package.vrc-audio]
+opt-level = 3
+
+[profile.dev.package.vrc-pano]
 opt-level = 3

@@ -23,6 +23,10 @@ impl Survey {
     /// 2`, longitude 0 the tracking space's -Z (the look down at the feet is
     /// left out: it shows mostly the bot's own body).
     pub fn panorama(&self, width: usize) -> Panorama {
+        if let Some(look) = &self.pano {
+            // The same convention: the middle is the tracking space's -Z.
+            return look.frame.equirect(width, look.tracking.world_yaw(0.0)).pano;
+        }
         let frames: Vec<&EyeFrame> = self.shots.iter().filter(|s| s.pitch > -60.0).map(|s| &s.frame).collect();
         Panorama::stitch(&frames, width)
     }

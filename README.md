@@ -147,7 +147,7 @@ VRChat 的服务条款对自动化或机器人账号有限制，请自行评估�
 
 ## 许可证
 
-[GNU Affero General Public License v3.0](LICENSE)。`third_party/` 里的补丁分别遵循 Monado（BSL-1.0）和 xrizer（GPL-3.0）的许可证。
+[GNU Affero General Public License v3.0](LICENSE)。`third_party/` 里的补丁分别遵循 Monado（BSL-1.0）和 xrizer（GPL-3.0）的许可证。`assets/hrtf/steam-default-48k.bin` 由 Steam Audio 的默认 HRTF 渲染而来，遵循 Apache-2.0，不在 AGPL 范围内，版权声明和来历见 [assets/hrtf/README.md](assets/hrtf/README.md)。
 
 ## 致谢与参考
 
@@ -161,6 +161,8 @@ VRChat 的服务条款对自动化或机器人账号有限制，请自行评估�
 - [Monado](https://gitlab.freedesktop.org/monado/monado)：OpenXR 运行时（remote 驱动、null 合成器）；补丁见 `third_party/`（抓帧、按需拷贝、正方形视场、运行中调整帧率）
 - [xrizer](https://github.com/Supreeeme/xrizer)：OpenVR 到 OpenXR 的转换层；补丁见 `third_party/`（交换链加 `TRANSFER_SRC` 用法）
 - [OpenXR](https://www.khronos.org/openxr/)、Steam 和 Proton、PipeWire
+- [Steam Audio](https://github.com/ValveSoftware/steam-audio)（Apache-2.0）：VRChat 用它的默认 HRTF 做双耳渲染；`tools/hrtf-render` 调用官方 SDK 4.8.1 的库把这个 HRTF 渲染成 `assets/hrtf/` 里的 HRIR 表，用来判断声音的方向
+  - SDK 的第三方声明里列有 [CIPIC HRTF Database](https://www.ece.ucdavis.edu/cipic/spatial-sound/hrtf-data/)（Copyright (c) 2001 The Regents of the University of California）；默认 HRTF 是否来自它不清楚，稳妥起见一并致谢，声明见 [assets/hrtf/README.md](assets/hrtf/README.md)
 
 ### AstrBot 生态与推理服务
 

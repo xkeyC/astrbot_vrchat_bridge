@@ -14,12 +14,19 @@
 //!   before), the surveys go onto it, and a blocked leg marks it; without
 //!   it (or before the visit is placed on it), on the survey's own map.
 //!
+//! - [`pano::survey_pano`]: the same survey from one frame of the avatar's
+//!   panorama (the whole sphere with metric depth: no head scan, no
+//!   stereo), the people given by the caller.
+//!
 //! Coordinates are the tracking space's (the head turns, the playspace
 //! never does, so its axes stay fixed to the world; walking moves the world
 //! past the head). Distances inside are stereo units; `Survey::metres`
 //! turns them into world metres.
 
+pub mod pano;
 pub mod render;
+
+pub use pano::{survey_pano, PanoInput, PanoLook};
 
 use std::path::PathBuf;
 use std::thread::sleep;
@@ -108,6 +115,8 @@ pub struct Survey {
     pub metres: f32,
     pub room: Vec<String>,
     pub timings: Timings,
+    /// Made from a pano frame (no shots, no stereo pairs then).
+    pub pano: Option<PanoLook>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -210,7 +219,7 @@ pub fn survey(rig: &mut Rig, opts: &SurveyOptions, blocked: &[[f32; 2]]) -> Resu
     let cparams = CandidateParams { clearance: CLEARANCE_M / metres, min_distance: 0.8 / metres, min_gap: 0.8 / metres, ..Default::default() };
     let candidates = candidates(&map, eye, yaw, &people, &cparams);
     timings.map = t.elapsed();
-    Ok(Survey { shots, pairs, eye, yaw, floor, map, players, objects, candidates, metres, room, timings })
+    Ok(Survey { shots, pairs, eye, yaw, floor, map, players, objects, candidates, metres, room, timings, pano: None })
 }
 
 impl Survey {
@@ -278,6 +287,9 @@ impl Default for GotoOptions {
 pub fn observations(s: &Survey) -> Vec<Observation> {
     let at = Instant::now();
     let people: Vec<[f32; 3]> = s.players.iter().map(|p| p.feet).collect();
+    if let Some(look) = &s.pano {
+        return vec![Observation::from_tracking(&look.points, s.eye, s.floor.height, s.metres, &people, at)];
+    }
     s.pairs
         .iter()
         .map(|(stereo, disp)| {
@@ -306,6 +318,15 @@ pub fn beacon_fix(map: &vrc_map::Shared, frame: &vrc_vr::tap::EyeFrame, eyes_m: 
     true
 }
 
+/// The position beacon of a pano frame (read with it: the head, world)
+/// onto the lasting map, the feet `eyes_m` under the eyes.
+pub fn pano_fix(map: &vrc_map::Shared, look: &PanoLook, eyes_m: f32, at: Instant) {
+    let head = look.frame.head;
+    let p = vrc_pano::to_map(head.position);
+    let tracking_yaw = look.tracking.yaw(head.yaw);
+    map.lock().unwrap_or_else(std::sync::PoisonError::into_inner).fix(at, [p[0], p[1] - eyes_m, p[2]], head.yaw, tracking_yaw);
+}
+
 /// [`beacon_fix`] with the eyes' height over the feet from the frame itself:
 /// `standing_m` (world metres) when the headset stands at `standing_y`
 /// (tracking space), the eyes as high as the frame has them now (sitting,
@@ -322,7 +343,12 @@ pub fn beacon_fix_as_is(map: &vrc_map::Shared, frame: &vrc_vr::tap::EyeFrame, st
 pub fn observe(map: &vrc_map::Shared, s: &Survey) {
     let eyes_m = (s.eye[1] - s.floor.height) * s.metres;
     let now = Instant::now();
-    s.shots.iter().any(|shot| beacon_fix(map, &shot.frame, eyes_m, now));
+    match &s.pano {
+        Some(look) => pano_fix(map, look, eyes_m, now),
+        None => {
+            s.shots.iter().any(|shot| beacon_fix(map, &shot.frame, eyes_m, now));
+        }
+    }
     for o in observations(s) {
         map.lock().unwrap_or_else(std::sync::PoisonError::into_inner).observe(&o);
     }
@@ -403,9 +429,13 @@ pub struct LegReport {
     pub on_map: bool,
 }
 
+/// How a walk looks again after each leg: a head scan ([`survey`]), or a
+/// pano frame (the bridge's).
+pub type Look<'a> = dyn FnMut(&mut Rig, &SurveyOptions, &[[f32; 2]]) -> Result<Survey> + 'a;
+
 /// Walks to `target` (x, z in the tracking space as of `first`, the survey
-/// it was picked from).
-pub fn goto(rig: &mut Rig, first: Survey, target: [f32; 2], opts: &GotoOptions) -> Result<GotoReport> {
+/// it was picked from), looking again after each leg by `look`.
+pub fn goto(rig: &mut Rig, first: Survey, target: [f32; 2], opts: &GotoOptions, look: &mut Look) -> Result<GotoReport> {
     let osc = rig.osc.as_ref().context("walking needs VRChat's OSC")?;
     let osc = Osc::with_ports_from(osc)?;
     let started = Instant::now();
@@ -492,7 +522,7 @@ pub fn goto(rig: &mut Rig, first: Survey, target: [f32; 2], opts: &GotoOptions) 
             let remaining = (left - leg.walked).max(0.0);
             return Ok(GotoReport { arrived: false, remaining, legs, took: started.elapsed(), reason: Some("stopped".into()) });
         }
-        s = survey(rig, &survey_opts, &blocked)?;
+        s = look(rig, &survey_opts, &blocked)?;
         if let Some(map) = &opts.map {
             observe(map, &s);
         }

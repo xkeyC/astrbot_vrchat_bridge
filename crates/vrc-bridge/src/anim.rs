@@ -12,7 +12,8 @@
 //! (`/v1/vr/trackers`, trying out full body: a body standing under the
 //! head), and stands aside while the hands are set by hand (`/v1/vr/hand`);
 //! every few seconds it checks whether VRChat lost them, to calibrate again
-//! (`crate::calibrate::Watch`).
+//! (`crate::calibrate::Watch`), and whether the user camera closed though
+//! it should stay open (`crate::usercam::Watch`).
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -367,6 +368,10 @@ pub struct Anim {
     voice: Mutex<VecDeque<(Instant, f32)>>,
     /// What the last tick saw (speed, talking, holding still), for `/v1/anim`.
     pub live: Mutex<Value>,
+    /// The head as last sent to the headset, the animation's on the
+    /// owner's, and when (what the game's listener hears from: the speaker
+    /// tracker turns head-relative directions with it).
+    pub head: Mutex<Option<(Instant, vrc_vr::Pose)>>,
     pub trackers: Mutex<TrackerSettings>,
     /// `trackers.json` next to `anim.json`: the trackers stay as set across
     /// restarts (VRChat keeps its calibration while the game runs).
@@ -414,6 +419,7 @@ impl Anim {
             trackers_path,
             voice: Mutex::new(VecDeque::new()),
             live: Mutex::new(Value::Null),
+            head: Mutex::new(None),
             trackers: Mutex::new(trackers),
             trackers_on_since: Mutex::new(None),
             head_rotation_due: AtomicBool::new(true),
@@ -583,6 +589,7 @@ impl Anim {
         let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1);
         let mut animator = Animator::new(self.params(), seed);
         let mut watch = crate::calibrate::Watch::new();
+        let mut usercam = crate::usercam::Watch::new();
         let mut link: Option<HmdLink> = None;
         let mut osc: Option<Osc> = None;
         let mut speed = 0.0f32;
@@ -651,6 +658,7 @@ impl Anim {
             }
             if tick.is_multiple_of(CALIBRATION_EVERY) {
                 watch.check(&bridge);
+                usercam.check(&bridge);
             }
             let link = link.as_ref().unwrap();
             // A motion program plays on everything.
@@ -666,6 +674,7 @@ impl Anim {
                 (placed, o)
             });
             if let Some((placed, o)) = played {
+                *self.head.lk() = Some((now, placed.head));
                 self.send_placed_trackers(&bridge, &placed);
                 off_sent = false;
                 if let Err(e) = link.set_overlay(Some(o)) {
@@ -730,6 +739,7 @@ impl Anim {
             // Where the headset is: the animation's head on the owner's,
             // unless it is off (or holding still: then the owner's alone).
             let hmd = if enabled && !manual && !owner.still { overlay.head.apply(owner.state.head) } else { owner.state.head };
+            *self.head.lk() = Some((now, hmd));
             self.send_trackers(&bridge, &owner.state, hmd, legs);
             let sent = if enabled && !manual {
                 off_sent = false;
