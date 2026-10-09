@@ -12,6 +12,7 @@
 | [motion.md](motion.md) | 动作系统：片段库、步态、姿势、跟随里的身体和头 |
 | [agent-vr-use.md](agent-vr-use.md) | 代理怎样操作 VRChat 的 VR 菜单（像素到手柄射线、自动校准、全景的调试接口、用户相机和绕着 bot 转的镜头） |
 | [avatar-position-beacon.md](avatar-position-beacon.md) | 化身位置角标：着色器把世界坐标画进 bot 自己眼睛的角落，bridge 读出来 |
+| [avatar-panorama.md](avatar-panorama.md) | 化身全景：6 台本地相机，左眼彩色立方体全景、右眼逐像素对齐的 E1C 深度 |
 | [speaker.md](speaker.md) | 谁在说话：双耳声音的方向 + 名牌发光；转向说话的人；校准步骤 |
 
 ## 链路
@@ -40,7 +41,7 @@ monado-service
 - 双目深度（`vrc-stereo`，纯 Rust 实现的 SGM）：半分辨率 157 ms，69% 的像素有深度，拟合出的地面倾斜 0.04°。尺度和镜子这两个问题见 [decisions.md](decisions.md) 的 D13。
 - 只转头的快速扫描：6 个方向在 60 fps 下用时 283 ms，可以拼出全景图和 360° 高度图（D14）。
 
-2026-10-09：化身的全景（6 台相机，E1C 深度）默认开（`--pano auto`），环视、跟随、目击、说话人视觉、截图都从全景读；名字来自用户相机的镜头（默认静止朝前）和 VRChat 画在眼睛上的名牌，深度给距离（D36）。
+2026-10-09：化身的全景（6 台相机，E1C 深度）默认开（`--pano auto`），环视、跟随、目击、说话人视觉、截图都从全景读；名字来自用户相机的镜头（默认静止朝前）和 VRChat 画在眼睛上的名牌，深度给距离（D36）。跟随：只按位置接着认有期限、由镜头确认（D40）；跟丢 1 s 后镜头快拍 6 个固定方向，读到名字就切过去（D41）；闲时每分钟快拍一圈，更新身边的人（D39）。说话人标签（含把握）每句都交给大模型（D32 起）。
 
 还没做（见 [decisions.md](decisions.md) 末尾"待定"）：把高度图接入规划器、尺度校准、镜子识别、手柄交互；服务器上 Monado 仍是临时单元（`install_vr.sh` 会把它和 bridge 装成开机自启的用户单元；插件已部署，见 [deploy-log.md](deploy-log.md)）。
 
