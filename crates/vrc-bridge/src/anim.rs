@@ -3,7 +3,8 @@
 //! the follower) keeps the head and the body's facing; this adds the hands'
 //! and the head's motion on top, and stands aside while a scan holds still.
 //!
-//! Inputs: the avatar's speed (OSCQuery `VelocityZ`), the loudness of the
+//! Inputs: the avatar's speed over the ground (OSCQuery `VelocityZ` and
+//! `VelocityX`: a step aside walks too, `ground_speed`), the loudness of the
 //! bot's own voice as it plays (`heard_bot`), and whether anything else is
 //! driving the head (glances only when not). Parameters are tunable at run
 //! time (`/v1/anim`) and kept in `anim.json` next to the token.
@@ -632,8 +633,9 @@ impl Anim {
                 if osc.is_none() {
                     osc = bridge.osc_query().ok();
                 }
-                match osc.as_ref().map(|o| o.query("/avatar/parameters/VelocityZ")) {
-                    Some(Ok(v)) => speed = v as f32,
+                let velocity = osc.as_ref().map(|o| (o.query("/avatar/parameters/VelocityZ"), o.query("/avatar/parameters/VelocityX")));
+                match velocity {
+                    Some((Ok(z), x)) => speed = ground_speed(z as f32, x.map_or(0.0, |x| x as f32)),
                     _ => {
                         osc = None;
                         speed = 0.0;
@@ -757,6 +759,19 @@ impl Anim {
     }
 }
 
+/// The gait's speed from the avatar's velocity (its own axes: `z` ahead,
+/// `x` right): over the ground, backwards when it goes back. A step aside
+/// walks the legs too (it slid with `VelocityZ` alone: the last metre onto a
+/// named place goes aside, `VrCore::settle`).
+fn ground_speed(z: f32, x: f32) -> f32 {
+    let over = z.hypot(x);
+    if z < 0.0 && -z >= x.abs() {
+        -over
+    } else {
+        over
+    }
+}
+
 #[cfg(test)]
 mod feet_tests {
     use super::*;
@@ -774,6 +789,14 @@ mod feet_tests {
         let r = vrc_vr::Pose::looking(hips, 0.0, [0.0; 3]).rotate([1.0, 0.0, 0.0]);
         let d = [feet[1].position[0] - feet[0].position[0], feet[1].position[2] - feet[0].position[2]];
         d[0] * r[0] + d[1] * r[2]
+    }
+
+    #[test]
+    fn a_step_aside_walks_the_legs() {
+        assert_eq!(ground_speed(1.0, 0.0), 1.0);
+        assert!((ground_speed(0.0, 0.5) - 0.5).abs() < 1e-6, "aside: walking");
+        assert!((ground_speed(0.0, -0.5) - 0.5).abs() < 1e-6);
+        assert!((ground_speed(-1.0, 0.2) + 1.0198).abs() < 1e-3, "back: backwards");
     }
 
     #[test]

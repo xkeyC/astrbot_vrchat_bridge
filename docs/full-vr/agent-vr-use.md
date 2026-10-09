@@ -191,7 +191,7 @@ HOST=user@server D=0.65 OUT=/tmp/x sh tools/agent-vr/aim.sh U V click    # 悬�
 
 ## 6. 当前画质设置（2026-10-06）
 
-- 每只眼 **1920×1920**（Monado `config_v0.json` 的 `w_pixels` 3840、`h_pixels` 1920，原来是 1280，备份为 `.pre-res-*`）。双目匹配按约 640 宽进行（`vrc_stereo::match_scale`），换分辨率不影响避障。
+- 每只眼 **1920×1920**（Monado `config_v0.json` 的 `w_pixels` 3840、`h_pixels` 1920，原来是 1280，备份为 `.pre-res-*`）。（2026-10-09 起深度来自化身全景，眼睛分辨率只影响画在眼睛上的名牌能不能读清。）
 - 桌面窗口 640×360（注册表 `Screenmanager Resolution*`，备份为 `user.reg.bak-*`）。
 - 游戏内图形设置：镜子渲染分辨率 100%（原 25%），抗锯齿 X4（原 X2），细节层次 高（原 低），阴影 低。追踪器显示外观 方向轴。
 - GPU 占用约 34%，显存约 4.6 GB（原来约 10%、3.6 GB）。
@@ -202,8 +202,8 @@ HOST=user@server D=0.65 OUT=/tmp/x sh tools/agent-vr/aim.sh U V click    # 悬�
 
 有全景时各功能的样子：
 
-- **环视**（`/v1/vr/survey`、`goto`）：回复 `source: "pano"`，不转头；玩家带 `distance_m`、`bearing_deg`；另有 `named_bearings`（读到名字、名牌下面没找到人：只有方位）。没读到名字的人形不列出，镜头也不去看（"也许有人"已关，见 D36）。
-- **跟随**：`GET /v1/follow` 的 `seen_by`：`named`（这次眼睛上的名牌读到了名字）、`lens`（镜头读到了名字，D40）、`kept`（按位置接着认）、`stereo`（没有全景时）。跟丢时先用镜头找、身体不动（D37、D41）：镜头快拍一圈（`search_stage: "lens_ring"`，6 个固定视角，第一个对着最后读到名字的地方、没有就最后定位的地方，其余左右交替往外 ±60°、±120°、180°，每拍到一张就切下一个，约 1 s；读到他的名字镜头立刻切过去，日志 "usercam lens: the sweep read whom it looked for: the lens to them"），再不行身体转向最后读到名字的方向、再转向最后的位置（`body_turn`，日志 "follow: lost them (panorama)"），第二次找起再转 4 个方向（`scan`）。全景时 1 s 没看到（站着、走着都一样）就算跟丢、腿站住、开始快拍。
+- **环视**（`/v1/vr/survey`、`goto`）：一帧全景，不转头（D42 起没有别的方式；没有全景时报错）；玩家带 `distance_m`、`bearing_deg`；另有 `named_bearings`（读到名字、名牌下面没找到人：只有方位）。没读到名字的人形不列出，镜头也不去看（"也许有人"已关，见 D36）。
+- **跟随**：`GET /v1/follow` 的 `seen_by`：`named`（这次眼睛上的名牌读到了名字）、`lens`（镜头读到了名字，D40）、`kept`（按位置接着认）。没有全景时（化身没带、普通视角租给菜单）跟随原地等待，日志 "follow: no panorama: waiting for it"（D42）。跟丢时先用镜头找、身体不动（D37、D41）：镜头快拍一圈（`search_stage: "lens_ring"`，6 个固定视角，第一个对着最后读到名字的地方、没有就最后定位的地方，其余左右交替往外 ±60°、±120°、180°，每拍到一张就切下一个，约 1 s；读到他的名字镜头立刻切过去，日志 "usercam lens: the sweep read whom it looked for: the lens to them"），再不行身体转向最后读到名字的方向、再转向最后的位置（`body_turn`，日志 "follow: lost them (panorama)"），第二次找起再转 4 个方向（`scan`）。全景时 1 s 没看到（站着、走着都一样）就算跟丢、腿站住、开始快拍。
 - **按位置接着认的期限和确认**（D40）：只在最后一次读到名字 `kept_s`（默认 7 s）以内按位置接着认；1 s 没读到名字（D41，原来 2.5 s），镜头看一眼被认的那个（停 1.5 s，至少隔 3 s，日志 "follow: kept by position, no name a while: the lens looks"）：读到他的名字算确认，读到别人的名字、或读了 3 次都没有名字，就丢掉、立刻找（日志 "follow: the one kept by position is not them: lost"）。镜头（任何时候、任何方向）读到他的名字，跟随马上用那个位置（深度里的人，或方位加上次的距离，`seen_by: "lens"`，日志 "follow: the lens read their name: there"）。`GET /v1/follow` 的 `confirm`：`unnamed_s`（多久没读到名字）、`asking`（正在看的方向）、`looks`、`confirmed`、`drops`、`last`（`named` / `other name` / `no name` / `expired` / `unanswered`）、`last_ago_s`；`head_pitch_deg`（看他的俯仰：按名牌高度，平滑，±30°）；`settings.kept_s`。改：`POST /v1/follow {"settings": {"kept_s": 6}}`（3–30，不存盘，跟随照常）。
 - **跟随时的镜头**（D40）：站着（或刚停下）时朝前的镜头朝目标（`GET /v1/vr/usercam` 的 `orbit.following`、`orbit.aim`），目标偏 30° 重瞄（`counts.target_poses`），20 s 没放过就重放（`follow_stale_s`，`counts.stale_poses`）；走路时照旧是行进镜头。
 - **跟随绕障**（D37）：`GET /v1/follow` 的 `avoid`：
@@ -235,7 +235,7 @@ HOST=user@server D=0.65 OUT=/tmp/x sh tools/agent-vr/aim.sh U V click    # 悬�
 1. **默认开**：重启 bridge、进世界，30 s 内 `GET /v1/vr/pano` 的 `effective` 为 true、`observed.mode` 为 `pano`、`last_code.depth_code` 为 2、`frame.check` 的 99% 分位在 6 和 10 以内。换一个化身（没有全景装置）：3 s 后 `fallback` 为 true，`/v1/vr/survey` 回复 `source: "head scan"`。
 2. **环视**：请一位好友站在 bot 前方 2–3 m，再到右侧、身后各一次，每次 `POST /v1/vr/survey`：`players` 里有他、`distance_m` 和实际差 0.3 m 以内、`bearing_deg` 对；编号全景图以朝向居中；俯视图里地面、墙对。好友站在 bot 身后、镜头和眼睛都没读到他的名字时，他不出现在 `players`（只在房间名单里）。
 3. **跟随**：`POST /v1/follow {"name": "<好友>"}`，好友慢走、转弯、绕过家具，看 `GET /v1/follow` 的 `seen_by` 在 `named`、`kept` 之间、`distance_m` 合理；好友躲到墙后：bot 转向他最后读到名字的方向，镜头也转过去。两个人交叉走过时，看会不会跟错人（`seen_by` 为 `kept` 时）。
-4. **说话的人**：好友在 bot 前方说话，`GET /v1/speakers` 里他的 `placed_by` 是 `stereo`（全景定位的也记为位置）、光环在眼睛上的名牌上量到（`glow_onset`）；在身后说话，镜头转过去（第 8 节）。
+4. **说话的人**：好友在 bot 前方说话，`GET /v1/speakers` 里他的 `placed_by` 是 `depth`（全景深度定位）、光环在眼睛上的名牌上量到（`glow_onset`）；在身后说话，镜头转过去（第 8 节）。
 5. **截图和菜单**：`GET /v1/screenshot` 是前方 100° 的视图；`tools/agent-vr/` 的菜单脚本（截图加 `normal=1`）照常能点；`POST /v1/vr/calibrate` 照常。
 6. **目击**：好友在房间里、不跟随时等 10 s，`GET /v1/sightings` 有他、`/v1/sightings/image` 是朝他那边的视图。
 7. **跟随绕障和找人**（D37，10 分钟以内）：

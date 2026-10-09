@@ -1,9 +1,8 @@
 //! A survey from one pano frame (the avatar's six cameras: the whole
-//! sphere, in colour and metric depth, in every frame; decision D36):
-//! no head scan, no stereo. The height map and the candidates come from
-//! the depth's points, in the tracking space as the head scan's do, so
-//! everything after (candidates, `goto`, the lasting map, the pictures) is
-//! the same.
+//! sphere, in colour and metric depth, in every frame; decision D36). The
+//! height map and the candidates come from the depth's points, in the
+//! tracking space, and everything after (candidates, `goto`, the lasting
+//! map, the pictures) works from them.
 //!
 //! Who is who is the caller's (the bridge reads the names: the user
 //! camera's lens, the plates over the eyes; and places them in the depth,
@@ -17,11 +16,10 @@ use anyhow::Result;
 use vrc_pano::{Body, Cloud, PanoFrame, Tracking};
 use vrc_players::{DetectClient, ObjectSighting, Sighting};
 use vrc_scene::{candidates, CandidateParams, HeightMap, Person};
-use vrc_stereo::Floor;
 use vrc_vr::remote::FLOOR_Y;
 use vrc_vr::tap::EyeFrame;
 
-use crate::{world_params, Survey, SurveyOptions, Timings, CLEARANCE_M};
+use crate::{world_params, Floor, Survey, SurveyOptions, Timings, CLEARANCE_M};
 
 /// What a pano survey is made from.
 pub struct PanoInput {
@@ -36,6 +34,9 @@ pub struct PanoInput {
     pub bearings: Vec<(String, f32)>,
     /// The room's players (VRChat's log).
     pub room: Vec<String>,
+    /// When the frame was taken (the pose then places the look on the
+    /// lasting map, not the time it was worked out).
+    pub taken: Instant,
 }
 
 /// What a pano survey keeps of its frame.
@@ -46,6 +47,8 @@ pub struct PanoLook {
     pub points: Vec<[f32; 3]>,
     /// Names with a bearing alone: (name, tracking yaw).
     pub bearings: Vec<(String, f32)>,
+    /// When the frame was taken.
+    pub taken: Instant,
 }
 
 /// Points of every this-th pixel (both ways) go into the height map (the
@@ -108,10 +111,9 @@ pub fn survey_pano(input: PanoInput, opts: &SurveyOptions, blocked: &[[f32; 2]],
         frame: input.frame,
         tracking,
         points,
+        taken: input.taken,
     };
     Ok(Survey {
-        shots: Vec::new(),
-        pairs: Vec::new(),
         eye,
         yaw,
         floor,
@@ -122,7 +124,7 @@ pub fn survey_pano(input: PanoInput, opts: &SurveyOptions, blocked: &[[f32; 2]],
         metres,
         room: input.room,
         timings,
-        pano: Some(look),
+        pano: look,
     })
 }
 
@@ -139,7 +141,7 @@ fn place_objects(detect: &DetectClient, frame: &PanoFrame, tracking: &Tracking) 
                 break;
             }
         };
-        for d in found {
+        for d in found.into_iter().filter(|d| d.kept()) {
             let [x, y, w, h] = d.bbox;
             let (i0, i1) = ((x + MID_X.0 * w) as u32, ((x + MID_X.1 * w) as u32).min(v.width));
             let (j0, j1) = ((y + MID_Y.0 * h) as u32, ((y + MID_Y.1 * h) as u32).min(v.height));
@@ -215,6 +217,7 @@ mod tests {
             named: vec![("Ann".into(), body)],
             bearings: vec![("Bob".into(), (s.head_yaw + 90.0).rem_euclid(360.0))],
             room: vec!["Ann".into(), "Bob".into()],
+            taken: Instant::now(),
         };
         (s, input, ahead)
     }
@@ -240,7 +243,7 @@ mod tests {
         assert_eq!(c.name.as_deref(), Some("Ann"));
         assert!(close(c.distance * v.metres, 2.5, 0.2) && c.bearing.abs() < 5.0, "{c:?}");
         // Bob read along a bearing alone: 90 degrees right.
-        let look = v.pano.as_ref().unwrap();
+        let look = &v.pano;
         assert!(close(look.bearings[0].1, 90.0, 0.01), "{:?}", look.bearings);
         // The height map: floor ahead, the room's +z wall (4.5 m off along
         // world yaw 0; the map reaches 8 tracking units, 5 m here) an
@@ -256,6 +259,6 @@ mod tests {
         assert!(floor > 1000 && obstacle > 100, "unknown {unknown}, floor {floor}, obstacle {obstacle}");
         // The panorama: the whole sphere; the lasting map takes one look.
         assert!(v.panorama(512).coverage > 0.99);
-        assert_eq!(crate::observations(&v).len(), 1);
+        assert!(!crate::observation(&v).points.is_empty());
     }
 }

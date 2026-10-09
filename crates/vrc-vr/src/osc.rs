@@ -3,7 +3,7 @@
 //! its log).
 //!
 //! The bot needs few of them: `/avatar/eyeheight` (world metres, readable
-//! and writable) to turn stereo distances into world ones, the avatar's own
+//! and writable) to turn tracking distances into world ones, the avatar's own
 //! velocity (`VelocityX/Y/Z`, `Grounded`) for odometry, and the movement
 //! inputs.
 

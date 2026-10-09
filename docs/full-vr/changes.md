@@ -6,14 +6,12 @@
 |---|---|
 | 根目录 | 新增 Rust workspace（`Cargo.toml`），`.gitignore` 加 `/target/` |
 | `crates/vrc-vr` | 新增。`pose`：位姿、视场角、由视场角求内参（fx fy cx cy）、按偏航/俯仰构造朝向。`remote`：Monado remote 驱动的 376 字节协议编解码，以及 TCP 客户端 `RemoteHmd`。`tap`：读取抓帧共享内存（seqlock、文件尺寸变化时重新映射、RGBA/BGRA 转 RGB）。6 个单元测试。 |
-| `crates/vr-probe` | 新增。命令行工具：`info` / `grab` / `look` / `sweep`（转头后等到按新姿态渲染的帧再存图）/ `depth`（双目深度：左眼和深度并排的 PNG、点云 PLY、几个位置的距离、地面拟合） |
-| `crates/vrc-stereo` | 新增。纯 Rust 实现的 SGM：7x7 census、8 方向聚合、亚像素、唯一性检查、左右一致性检查（rayon 并行）。`Stereo` 从抓帧构造（可缩小分辨率），输出深度和可追踪空间里的点云；`fit_floor` 用高度直方图找地面再做平面拟合。3 个单元测试，包括一个合成的双平面场景。 |
+| `crates/vr-probe` | 新增。命令行工具：`info` / `grab` / `look` / `sweep`（转头后等到按新姿态渲染的帧再存图）/ `walk` / `hands` |
 | `crates/vrc-vr` 的 `scan` 模块 | 新增。按给定的一组偏航/俯仰依次转头，每个方向等到按该姿态渲染出的第一帧，结束后回到原来的姿态；`EyeTap::peek` 只读帧头，`Pose::unrotate` |
 | `crates/vrc-scene` | 新增。`Panorama::stitch`：用每帧的位姿把多张左眼图拼成等距柱状全景。`HeightMap`：2.5 维栅格，以拟合出的地面为基准，把每个格子分为地面、障碍、高台、未知，并能画成俯视图。 |
-| `vr-probe scan` | 新增。头部扫描后输出全景图和高度图；`--boost N` 扫描期间临时提高帧率，扫完恢复原帧率；`--hold-ms` 改用流水线扫描 |
 | `crates/vrc-vr` 的 `fps` 模块、`scan_pipelined` | 新增。`FpsControl` 读写 Monado 的帧率控制文件；`scan_pipelined` 不等每个方向的画面回来就转到下一个方向，再按位姿从环形缓冲区里认领画面，漏掉的方向最后逐个补拍 |
-| `crates/vrc-players` | 新增。名牌 OCR 客户端（infra 的 `/v1/ocr/lines`）、房间玩家名单（VRChat 日志）、名字匹配（和桌面 bridge 同一规则）、名牌的双目定位；自动跟随和 LLM 工具共用 |
-| `crates/vrc-nav` | 新增。`survey`（环视、双目、高度图、玩家、候选点、换算成世界米、编号全景图和地图）、`goto`（分段走、每段后重新环视和规划、被挡住时标记障碍） |
+| `crates/vrc-players` | 新增。名牌 OCR 客户端（infra 的 `/v1/ocr/lines`）、房间玩家名单（VRChat 日志）、名字匹配（和桌面 bridge 同一规则）；自动跟随和 LLM 工具共用 |
+| `crates/vrc-nav` | 新增。`survey_pano`（一帧全景的环视：高度图、玩家、物品、候选点、换算成世界米、编号全景图和地图）、`goto`（分段走、每段后重新环视和规划、被挡住时标记障碍） |
 | `crates/vrc-bridge` | 新增。Python bridge 的 Rust 移植，见 decisions D20 |
 | `crates/vrc-vr` 的 `osc`、`walk` | 新增。OSC 发送（任意参数）和 OSCQuery 读取（眼高、速度）；按角色自身速度计量的一段行走，推着却走不动时判为被挡住 |
 | `ops/vr/vrc-bridge.service` | 新增。Rust bridge 的用户单元 |
@@ -28,7 +26,7 @@
 | `crates/vrc-bridge` 的 `anim` | 动画线程（45 Hz）、bot 语音响度、`/v1/anim` 调参接口；`/v1/vr/height`、`/v1/vr/reset` |
 | `astrbot_plugin/` | 新工具 `vrchat_height`、`vrchat_vr_reset`（语音和文字） |
 | `tools/mocap/` | 从 CMU 动作捕捉数据统计头和双腕运动的脚本，以及按相位平均的曲线（D25） |
-| `crates/vrc-bridge` 的 `follow` | 绕障、跳过矮障碍、卡住时脱困；跟随的双目匹配限 6 线程（D25） |
+| `crates/vrc-bridge` 的 `follow` | 绕障、跳过矮障碍、卡住时脱困（D25） |
 | `crates/vrc-vr` 的 `trackers` | OSC 追踪器（髋、双脚）和头部对齐，Unity 坐标（fbt-research.md） |
 | `crates/vrc-bridge` 的 `calibrate` | 全身自动校准：OCR 找按钮、悬停提示二次确认、`TrackingType` 验证；跟随中也会自动校准（agent-vr-use.md 第 5 节） |
 | `crates/vrc-vr` 的 `motion`、`crates/vrc-bridge` 的 `motion` | 动作片段格式和片段库、动作程序（编排、淡入淡出、坐和躺的姿势及退出）；`/v1/motion`、`/v1/motion/stop`、`/v1/motion/reload`（motion.md、D30） |
@@ -42,14 +40,14 @@
 | `astrbot_plugin/` | `vrchat_emote` 换成 `vrchat_motion`、`vrchat_posture`；走路工具加 `pace`（walk / run）；`vrchat_look_around` 改回 `vrchat_view`（默认环顾四周，`around: false` 只看前方；提示词要求每次移动前先看一圈），`vrchat_walk_to` 走完默认只返回前方画面，`vrchat_step` 转身或走了之后也返回前方画面；转身和方向改成文字参数，返回的方位写成左右；提示词补上探索、上楼梯、坐座位和“不说只做”的规则 |
 | `crates/vrc-map` | 持久地图（D31）：体素柱和多层表面、经验层（走过、被挡、跳失败的标记）、物体和命名地点、只估平移的配准、多层 A*、按世界存盘、再次进房时的定位、位置角标的世界坐标系 |
 | `crates/vrc-vr` 的 `beacon` | 读化身位置角标（avatar-position-beacon.md） |
-| `crates/vrc-players` 的 `objects` | infra 的 YOLO 检测（`/v1/detect/objects`）和用双目定位；OCR 和检测共用 HTTP 请求代码（`ocr::post`） |
+| `crates/vrc-players` 的 `objects` | infra 的 YOLO 检测（`/v1/detect/objects`），按全景深度定位（`vrc_nav::pano`）；OCR 和检测共用 HTTP 请求代码（`ocr::post`） |
 | `crates/vrc-nav` | `goto` 在持久地图上规划（`GotoOptions::map`、`target_up`），环视写进地图，被挡的一段在地图上记标记 |
 | `crates/vrc-bridge` 的 `mapping` | 里程线程（OSCQuery 速度）、建图线程、按世界存取（配置目录下 `maps/`）；`/v1/map`、`/v1/map.png`、`/v1/map/save`、`/v1/map/forget`、`/v1/map/place`、`/v1/vr/beacon`、`/v1/vr/detect`；`/v1/vr/goto` 可传 `place`（地图上的命名地点） |
 | 根目录 `Cargo.toml` | workspace 加入 `crates/vrc-audio`、`tools/hrtf-render` |
 | `crates/vrc-audio` | 新增（D32）。STFT、语音检测、分段（客户端样本时钟）、按 HRTF 模板投票的方向估计（全圈直方图，前后镜像留给调用方）、按两耳时差对齐的单声道混音、HRIR 表格式 `VRCHRTF1`；球形头模型和 Steam Audio 默认 HRTF 两种模板。18 个单元测试（合成双耳信号） |
 | `tools/hrtf-render` | 新增（D32）。运行时加载 Steam Audio SDK 的 `phonon`，渲染默认 HRTF 的 HRIR 表；`assets/hrtf/steam-default-48k.bin`（4.8.1，bilinear）由它生成 |
 | `crates/vrc-bridge` 的 `bridge` | 采集改为 float32 双声道，发给客户端的是对齐后的单声道；客户端样本时钟（只数进了队列的样本）；说话人分析在自己的线程上（块带着时钟位置和读到的时刻经有界队列交过去），`speaker` 事件走同一个队列（满时 final 事件重试）；`bot_voice_until`；`idle_later_for` |
-| `crates/vrc-bridge` 的 `speaker` | 新增（D32、speaker.md）：每段话的方向投票（按头朝向转到固定坐标系）、视觉线程（自己的抓帧，名牌定位和发光；说话时 OCR 每 1 s 最多一次，能投影时不做双目）、融合、bot 回声按帧剔除（过半才整段不归属）、`/v1/vr/attend`（`name`、`since_ms` 决定先选哪段；确认失败不算错）、`/v1/speakers`、`/v1/speakers/record`（录制自己的写文件线程，`{"stop": true}`） |
+| `crates/vrc-bridge` 的 `speaker` | 新增（D32、speaker.md）：每段话的方向投票（按头朝向转到固定坐标系）、视觉线程（自己的抓帧，名牌定位和发光；说话时 OCR 每 1 s 最多一次，只读全景帧）、融合、bot 回声按帧剔除（过半才整段不归属）、`/v1/vr/attend`（`name`、`since_ms` 决定先选哪段；确认失败不算错）、`/v1/speakers`、`/v1/speakers/record`（录制自己的写文件线程，`{"stop": true}`） |
 | `crates/vrc-vr` 的 `tap` | `read_unasked`（不续期 `.want` 地读最新帧）、`tapping`（有没有人在让 Monado 抓帧） |
 | `assets/hrtf/` | Steam Audio 默认 HRTF 的表，附 `README.md`（NOTICE：来历、修改、版权、CIPIC 声明）和 `LICENSE-Apache-2.0` |
 | `crates/vrc-bridge` 的 `anim` | 记下每次实际发给头显的头位姿（`Anim::head`），给说话人追踪算方向用 |
@@ -77,7 +75,7 @@
 | `crates/vrc-pano` 的 `people`（实测后） | 人按"前景"认：左右各 0.45 m（绕眼睛转，跨面）、同高和低 0.15 m 处的深度都明显更远（0.15 m 或距离的 5%）；墙、地面、家具侧面都不是。实测帧里用户站在一块板前 0.26 m（2.88 m 对 3.14 m），E1C 在 3 m 处一级 6.6 cm，中间的级把两者连起来，单看深度分不开。"也许有人"还要求前景横向至少 0.18 m 宽（斜看的柜子端头只有一条）。2026-10-09 的 E1C 实测帧剪成 4 块小图（`tests/data/e1c_*.png`，约 140 KB）：条码、校验、名牌整块被遮、地面在眼睛下 1.18 m、用户 2.9 m；bridge 里用真实的眼睛位姿把眼睛上的名牌换成射线，找到下面的用户 |
 | `crates/vrc-bridge` 的 `follow` | 全景时（D36）：一次取景就是最新一帧全景（`look_pano`，不转头、不做双目）；目标是读到名字的人，否则是离上次位置最近的像人的东西（门限 0.6 m 加每秒 1.5 m，4 s 内，不是别人名字的）；眼睛上的名牌每 0.8 s（有人说话时 0.4 s）OCR 一次；看路（走廊、地图绕行、沿墙、跳）抽成 `steer`，全景时每个方向都在视野里、不扫视；跟丢时先转向最后读到名字的方向、再转向最后的位置，每次让镜头也看那边（`find_pano`、`lost_ways`），不再一圈圈找。状态加 `seen_by`（stereo / named / kept）。3 个新测试（含两帧合成全景：先读名字，再按位置接着认） |
 | `crates/vrc-bridge` 的 `sightings`、`speaker` | 全景时（D36）：好友目击用镜头和眼睛上的名牌读名字、全景深度定位，存的画面是全景里朝他那边的透视视图（只有方位的也朝那边）；说话人追踪的视觉线程在全景帧上不做双目，改用 `panolook` 读名牌、定位（`read_plates_pano`），两次 OCR 之间仍按位置把名牌投影到眼睛里量光环（眼睛上的名牌就画在正常视角的位置） |
-| `crates/vrc-bridge` 的 `main`（看到什么） | 全景时 `GET /v1/screenshot` 是全景里朝头的方向的透视视图（100°、正方形，`pitch` 抬低视线，头不动）；`normal=1` 借普通视角租约拍眼睛；`/v1/vr/detect`、`/v1/vr/corridor`（调试用，要双目）也借租约 |
+| `crates/vrc-bridge` 的 `main`（看到什么） | 全景时 `GET /v1/screenshot` 是全景里朝头的方向的透视视图（100°、正方形，`pitch` 抬低视线，头不动）；`normal=1` 借普通视角租约拍眼睛 |
 | `crates/vrc-bridge` 的 `pano`、`main` | `--pano` 默认 `auto`（D36）：在世界里才开（`run` 读游戏状态，`set_in_world`），化身 3 s 内没出 0x5B 就回退、进下一个世界时马上再问；`hold_normal`：`/v1/vr/hand`、菜单按钮、`screenshot?normal=1` 让普通视角保持 20 s；状态加 `in_world`、`held_normal_ms`。2 个新测试 |
 | `crates/vrc-pano` 的 `render` | `perspective`：从全景里取一个透视视图（任意偏航、俯仰、视场），界面的颜色用别的面补；1 个测试。`vr::view_jpeg` |
 | `astrbot_plugin/` | 环视的文字加"认出名字但不知道距离"和"也许有人" |
@@ -89,6 +87,9 @@
 | `crates/vrc-bridge` 的 `people`、`panolook`、`orbit`、`main`、`bridge`（D39） | 身边的人的缓存：每次看全景按名牌射线和深度放有名字的人、8 s 内按位置接着认没读到名字的（交给说话人追踪），150 s 删；闲着时每 `orbit.idle_sweep_s`（60）镜头转一圈读四周的名牌（一推、有人开口立刻停），之后看一帧全景放进缓存；`GET /v1/vr/people`；`LookOptions.source`；`Bridge::follow_paused`。2 个测试 |
 | `crates/vrc-bridge` 的 `follow`、`orbit`、`people`、`main`（D40） | 按位置接着认有期限：最后读到名字 `kept_s`（默认 7 s，`POST /v1/follow {"settings": {"kept_s": 7}}`，3–30）以后不再认，2.5 s 没读到名字就让镜头 `look_at` 被认的那个（至少隔 3 s），读到他的名字算确认，读到别人的名字或读了 3 次都没有名字（8 m 以内）就丢掉、立刻算跟丢（`Confirm`、`Track::drop_kept`）；跟丢先让镜头看最后读到名字的地方（`lens_look`），全景时站着 2 s 没看到就算跟丢；镜头读到目标的名字（任何镜头）而这一帧深度里没找到人、或者人在别处：按深度里的人、读名时的落脚点、或方位加上次的距离直接采用（`Track::place`、`lens_place`，`seen_by: "lens"`）；俯仰按名牌高度（深度或镜头射线）平滑、限幅（`smooth_pitch_step`）。镜头：跟随时站着的镜头朝目标（`Orbit::set_following`、`aim_at`），偏 30° 重瞄、20 s 没放过就重放（`follow_stale_s`）；刚停下（都松开了）也可以放镜头（`may_front`）；`settle_sure_ms`（600 ms）以后不再要求画面和上一帧相像；`end_sweep(why)`（`stopped`）；`reads_since`。身边的人：15 s 没读到名字不再按位置接着认。`GET /v1/follow` 加 `confirm`、`head_pitch_deg`、`settings`；`GET /v1/vr/usercam` 的 `orbit` 加 `following`、`aim`、`counts.target_poses`、`counts.stale_poses`。9 个新测试 |
 | `crates/vrc-bridge` 的 `orbit`、`follow`、`people`（D41） | 镜头找人改成固定视角快拍：`Orbit::sweep(why, from, seek)` 依次放 `snap.views`（6）个视角（`Lens::Snap`），读名线程拿到第一张显示这个视角的画面（离 `Pose` ≥ 100 ms 且和放 `Pose` 前那帧不同，或 350 ms）就放下一个，OCR 在单独线程里读（最多 3 个同时）；找人时读到他的名字立刻结束、镜头 `look_at` 过去（`snap_hit`）；跟随时第一个视角对着最后看到他的方向，其余左右交替往外。跟丢 1 s（全景站着、走着都一样；原来 1.5 / 2 s），找法 `lens_ring` → `body_turn` → `scan`；确认 1 s（原来 2.5 s）。不动的镜头换了 `Pose` 后第一张稳了的画面不等 OCR 节拍；`grab_fps` 默认 15；`name_toward` 30 ms 看一次。设置 `orbit.snap`；状态 `orbit.sweeping` 的 `seek`、`from`、`view`，`orbit.reading`，`counts.snap_poses`。6 个新测试 |
+| `crates/vrc-stereo` 删除；`vrc-nav`、`vrc-players`、`vrc-scene`、`vrc-bridge`、`vr-probe`、插件（D42） | 删掉双目和转头扫描：`vrc_nav::survey`、`vrc_players::sightings` / `objects::place`、`vrc_scene::mirror` / `Panorama::stitch`、跟随的 `look` / `search` / `glance`、说话人的普通视角 OCR + 双目、"最后看到"的普通视角 OCR、`POST /v1/vr/detect`、`vr-probe depth/scan/goto`、`cudarc`。环视、跟随、认人只用全景，没有全景时报错或原地等；跟丢一律 1 s；`/v1/vr/corridor` 改用全景深度；全景物体定位补上 `Detection::kept` 过滤；插件去掉 `around`。服务器 `bridge_deploy.sh` 按 `.deployed-files` 删掉不再部署的文件 |
+| `crates/vrc-map` 的 `nav`、`examples/map_info`；`vrc-nav`、`vrc-bridge` 的 `panolook`、`follow`（D43） | 轨迹一段超过 0.6 m（位置跳变：重生、传送、角标读错、修正）不再删掉玻璃标记；全景的一眼带取帧时刻（`taken`），跟随和环视按它给角标定位、放地图和物体；`map_info` 列出地图文件的内容。1 个新测试 |
+| `crates/vrc-bridge` 的 `vr`、`anim`（D44） | 走到命名地点的最后一段：离得远、偏得多时先转向再走（不再侧移平移过去）；步态速度用地面速度（`VelocityZ`、`VelocityX`），侧移也迈腿。1 个新测试 |
 | `docs/full-vr/` | 本文档集 |
 
 ## 其他项目

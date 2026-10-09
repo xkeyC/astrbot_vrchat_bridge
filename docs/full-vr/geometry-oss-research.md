@@ -13,28 +13,6 @@
 - 给云端 LLM 的候选点由几何生成：前沿点、可达点、物体簇。借鉴 VLFM、VLMnav 和 SoM 的标号方式，不必依赖开放词汇检测器。
 - **用速度当碰撞传感器**：摇杆推了但实测速度约为 0，就把对应格子标成阻挡。这一条能同时处理透明墙和隐形碰撞体。
 
-## 1. 立体匹配
-
-| 项目 | 作用 | 语言/许可 | 成熟度 | 成本 | 用法 | 优先级 |
-|---|---|---|---|---|---|---|
-| libSGM https://github.com/fixstars/libSGM | CUDA SGM，census，4/8 路径，带亚像素 | C++/CUDA，Apache-2.0 | 成熟，但 GitHub 上没有正式 release | RTX 3080 上 1024×440、128 视差约 1.5 ms（README 数据）。3060 上 1280²/128 视差 [估] 约 10–15 ms | 写一层薄的 C 包装，用 bindgen/cxx 接入，替换现有约 150 ms 的 CPU SGM | **P0** |
-| OpenCV `cuda::StereoSGM` / CPU SGBM | 同类算法，可交叉验证；WLS 滤波可做后处理 | C++，Apache-2.0 | 成熟 | 与 libSGM 相近 [未核] | 通过 `opencv` crate 调用，只作对照 | P2 |
-| NVIDIA VPI Stereo https://docs.nvidia.com/vpi/algo_stereo_disparity.html | SGM（CUDA 后端），自带置信度图 | 闭源 SDK | 成熟 | CUDA 后端显存占用较高 | 只参考它的置信度输出设计 | Ref |
-| Fast-FoundationStereo https://github.com/NVlabs/Fast-FoundationStereo | 零样本学习式立体，CVPR 2026 | PyTorch + TensorRT/ONNX 导出。代码许可未单独核实；权重为 NVIDIA Open Model Agreement（允许商用） | 2026-02 发布，活跃 | RTX 3090 上 640×480 用 TRT 为 14–23 ms，峰值显存约 650 MB（README 数据）。3060 [估] 约 35–60 ms | 导出 TRT engine，以 ort/TensorRT 在 Rust 里调用。只在全景扫描或 SGM 低置信区域时以 2–5 Hz 运行 | **P0/P1** |
-| Lite Any Stereo（LAS，以及 2026 年的 V2）https://arxiv.org/abs/2511.16555 | 前馈式零样本立体，计算量不到 FoundationStereo 的 1% | 未找到代码仓库链接 [未核] | 论文 CVPR 2026 | RTX 4090 上 KITTI 分辨率约 19 ms | 等代码和权重放出后再评估 | P2 |
-| Stereo Anywhere https://stereoanywhere.github.io/ | 立体加单目先验，论文里唯一能正确处理镜子和透明栏杆的方法 | PyTorch，许可 [未核] | CVPR 2025 | 依赖 Depth Anything，较重 [估] | 离线研究镜子和透明物体时参考 | Ref |
-| OpenStereo / LightStereo https://github.com/XiandaGuo/OpenStereo | 12 种以上模型的统一代码库，已集成 TRT | **仅限学术用途** | 活跃 | LightStereo 约 17 ms | 只用来做算法对比 | Ref |
-| HITNet ONNX https://github.com/ibaiGorordo/ONNX-Split-HITNET-Stereo-Depth-Estimation | 实时网络，不构建代价体 | ONNX | 老旧 | 低 | 已被 FFS 超越 | Ref |
-| sgm-rs https://lib.rs/crates/sgm-rs | Rust 版 SGM | Rust | 2021 年以后无更新 | — | 不如我们现有实现 | — |
-
-我没有找到成熟的 wgpu 立体匹配 crate。如果坚持纯 Rust，可以把现有 census SGM 用 wgpu/WGSL 重写（逐路径扫描并行化），但工作量明显大于接入 libSGM。
-
-**置信度与困难区域**（都比较容易实现，可直接移植）：
-- 左右一致性检查、唯一性比（best/second best）、代价曲率、局部纹理方差门限。
-- 低置信像素不写入地图，而不是写成"障碍"。
-- 同一格子在多帧、多朝向下观测一致才提升置信度。
-- 平涂区域：优先用 FFS 的结果填补，否则依赖地图的时间累积。
-
 ## 2. 建图
 
 | 项目 | 作用 | 语言/许可 | 成熟度 | 用法 | 优先级 |

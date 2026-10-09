@@ -26,7 +26,14 @@ const SETTLE_TRIES: usize = 3;
 const SETTLE_CLOSE_M: f32 = 0.12;
 const SETTLE_FAR_M: f32 = 1.2;
 const SETTLE_AXIS: f32 = 0.25;
-/// Looks list what the lasting map knows this near, at most this many.
+/// Settling more than this far, or this far off the way it faces, the bot
+/// turns to the spot and walks there (else a step aside or back: it slid,
+/// the legs walking only ahead); it faces the place's heading after.
+const SETTLE_TURN_M: f32 = 0.3;
+const SETTLE_TURN_DEG: f32 = 30.0;
+/// Looks list what the lasting map knows this near: every place named
+/// (few, and asked for by name: Home's "沙发" fell off the list behind
+/// sixteen things nearer), and the things nearest, at most this many.
 const KNOWN_WITHIN_M: f32 = 30.0;
 const KNOWN_MAX: usize = 12;
 
@@ -364,10 +371,9 @@ impl VrCore {
 
     // -- surveys and walks --------------------------------------------------------
 
-    /// Looks: all around (`around`), else only ahead (and down at the feet);
-    /// by `look` (`panolook::surveyor`: the panorama when there is one).
-    pub fn survey(&mut self, whitelist: &[String], players: bool, around: bool, look: &mut Look) -> Result<Value> {
-        let opts = SurveyOptions { players, ahead: !around, ..Default::default() };
+    /// Looks all around by `look` (`panolook::surveyor`: a pano frame).
+    pub fn survey(&mut self, whitelist: &[String], players: bool, look: &mut Look) -> Result<Value> {
+        let opts = SurveyOptions { players, ..Default::default() };
         let s = look(self.rig(whitelist)?, &opts, &[])?;
         if let Some(map) = &self.map {
             vrc_nav::observe(map, &s);
@@ -381,8 +387,8 @@ impl VrCore {
     }
 
     /// Walks to a place of the last look around or a bearing; `since`: the
-    /// stops when it was asked for ([`walk::stops`]). Then looks ahead (all
-    /// around with `around`).
+    /// stops when it was asked for ([`walk::stops`]). Then looks again (a
+    /// pano frame: all round).
     pub fn goto(&mut self, whitelist: &[String], input: &Value, since: u64, look: &mut Look) -> Result<Value> {
         // A place number of a look around the caller did not see (another
         // caller looked since) would lead elsewhere.
@@ -437,8 +443,7 @@ impl VrCore {
             (Some(map), Some((goal, heading))) if report.reason.as_deref() != Some("stopped") => Some(self.settle(map, goal, heading, since)?),
             _ => None,
         };
-        let around = input["around"].as_bool().unwrap_or(false);
-        let after = look(self.rig(whitelist)?, &SurveyOptions { ahead: !around, ..Default::default() }, &[])?;
+        let after = look(self.rig(whitelist)?, &SurveyOptions::default(), &[])?;
         if let Some(map) = &self.map {
             vrc_nav::observe(map, &after);
         }
@@ -535,57 +540,6 @@ impl VrCore {
         frame
     }
 
-    /// What the detector finds in the latest frame, placed (on the lasting
-    /// map too: map frame, when there is one). With `save`, the frame (left
-    /// eye, JPEG) and the answer go into that directory as
-    /// `<unix ms>.jpg` / `.json`: material to judge the detector by.
-    pub fn detect(&mut self, save: Option<std::path::PathBuf>) -> Result<Value> {
-        let frame = self.frame()?;
-        let rig = self.rig(&[])?;
-        let detect = rig.detect.clone().context("no detection service (it comes with the OCR's)")?;
-        let metres = match rig.osc.as_ref().map(|o| o.eye_height()) {
-            Some(Ok(h)) if h > 0.0 => h as f32 / (self.head_height - vrc_vr::remote::FLOOR_Y),
-            _ => 1.0,
-        };
-        let stereo = vrc_stereo::Stereo::from_frame(&frame, vrc_stereo::match_scale(frame.width)).context("not an 8-bit frame")?;
-        let disp = stereo.disparity(&vrc_stereo::SgmParams::default());
-        let rgb = frame.eye_rgb8(0)?;
-        let t = std::time::Instant::now();
-        let found = detect.detect_rgb(&rgb, frame.width, frame.height)?;
-        let took = t.elapsed();
-        let placed = vrc_players::objects::place(&frame, &stereo, &disp, &found);
-        let eye = [
-            (frame.views[0].pose.position[0] + frame.views[1].pose.position[0]) / 2.0,
-            (frame.views[0].pose.position[1] + frame.views[1].pose.position[1]) / 2.0,
-            (frame.views[0].pose.position[2] + frame.views[1].pose.position[2]) / 2.0,
-        ];
-        let now = std::time::Instant::now();
-        let on_map = |o: &vrc_players::ObjectSighting| {
-            let map = self.map.as_ref()?;
-            let n = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let rel = [(o.at[0] - eye[0]) * metres, (o.at[1] - vrc_vr::remote::FLOOR_Y) * metres, (o.at[2] - eye[2]) * metres];
-            Some(n.place(rel, now).map(|v| (v as f64 * 100.0).round() / 100.0))
-        };
-        let v = json!({
-            "took_ms": took.as_millis() as u64,
-            "model": detect.model,
-            "found": found.iter().map(|d| json!({"label": d.label, "confidence": (d.confidence as f64 * 100.0).round() / 100.0, "bbox": d.bbox.map(|v| v.round())})).collect::<Vec<_>>(),
-            "placed": placed.iter().map(|o| json!({
-                "label": o.label,
-                "distance_m": r2(((o.at[0] - eye[0]).hypot(o.at[2] - eye[2])) * metres),
-                "size_m": o.size.map(|v| r2(v * metres)),
-                "map": on_map(o),
-            })).collect::<Vec<_>>(),
-        });
-        if let Some(dir) = save {
-            std::fs::create_dir_all(&dir)?;
-            let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
-            std::fs::write(dir.join(format!("{stamp}.jpg")), eye_jpeg(&frame, 0)?)?;
-            std::fs::write(dir.join(format!("{stamp}.json")), serde_json::to_vec_pretty(&v)?)?;
-        }
-        Ok(v)
-    }
-
     /// What the position beacon says in the latest frame (both eyes), with
     /// the head's pose then (tracking space) to compare.
     pub fn beacon(&mut self) -> Result<Value> {
@@ -634,6 +588,9 @@ impl VrCore {
             if k == SETTLE_TRIES || d <= SETTLE_CLOSE_M || d > SETTLE_FAR_M || walk::stopped_since(since) {
                 break;
             }
+            if d > SETTLE_TURN_M && scan::angle_diff(way, self.yaw).abs() > SETTLE_TURN_DEG {
+                self.face(way, 0.0)?;
+            }
             let facing = self.yaw;
             let rig = self.rig(&[])?;
             let osc = Osc::with_ports_from(rig.osc.as_ref().context("walking needs VRChat's OSC")?)?;
@@ -660,10 +617,8 @@ impl VrCore {
             return json!([]);
         }
         let p = n.pose;
-        n.landmarks()
+        known_landmarks(n.landmarks(), p)
             .into_iter()
-            .filter(|l| (l.2[0] - p[0]).hypot(l.2[2] - p[2]) <= KNOWN_WITHIN_M)
-            .take(KNOWN_MAX)
             .map(|(name, kind, at)| {
                 let (dx, dz) = (at[0] - p[0], at[2] - p[2]);
                 let heading = n.session_heading(dx.atan2(-dz).to_degrees());
@@ -683,6 +638,24 @@ impl VrCore {
         let rig = self.rig(&[])?;
         rig.tap.read()?.context("no frame yet (is the game in VR mode?)")
     }
+}
+
+/// What a look lists of the lasting map's `landmarks` (nearest first) for
+/// the bot at `p`: within KNOWN_WITHIN_M, every place named and the
+/// KNOWN_MAX things nearest, nearest first.
+fn known_landmarks(landmarks: Vec<(String, &'static str, [f32; 3])>, p: [f32; 3]) -> Vec<(String, &'static str, [f32; 3])> {
+    let mut things = 0;
+    landmarks
+        .into_iter()
+        .filter(|l| (l.2[0] - p[0]).hypot(l.2[2] - p[2]) <= KNOWN_WITHIN_M)
+        .filter(|l| {
+            if l.1 == "place" {
+                return true;
+            }
+            things += 1;
+            things <= KNOWN_MAX
+        })
+        .collect()
 }
 
 /// A view out of a pano frame as JPEG: along world yaw `yaw` (the
@@ -749,7 +722,6 @@ pub fn survey_json(serial: u64, s: &Survey) -> Value {
     };
     let mut v = json!({
         "survey": serial,
-        "source": if s.pano.is_some() { "pano" } else { "head scan" },
         "candidates": s.candidates_json(),
         "players": s.players.iter().map(|p| {
             let (distance, bearing) = way(p.feet);
@@ -773,17 +745,14 @@ pub fn survey_json(serial: u64, s: &Survey) -> Value {
         }).collect::<Vec<_>>(),
         "metres_per_unit": s.metres,
         "timings_ms": {
-            "scan": ms(s.timings.scan), "stereo": ms(s.timings.stereo),
             "ocr": ms(s.timings.ocr), "detect": ms(s.timings.detect), "map": ms(s.timings.map),
         },
     });
-    if let Some(look) = &s.pano {
-        // Names read with nobody found under the plate: a direction alone.
-        v["named_bearings"] = json!(look.bearings.iter().map(|(n, y)| json!({
-            "name": n,
-            "bearing_deg": vrc_vr::scan::angle_diff(*y, s.yaw).round(),
-        })).collect::<Vec<_>>());
-    }
+    // Names read with nobody found under the plate: a direction alone.
+    v["named_bearings"] = json!(s.pano.bearings.iter().map(|(n, y)| json!({
+        "name": n,
+        "bearing_deg": vrc_vr::scan::angle_diff(*y, s.yaw).round(),
+    })).collect::<Vec<_>>());
     v
 }
 
@@ -825,4 +794,23 @@ pub fn map_png(s: &Survey) -> Result<Vec<u8>> {
         enc.write_header()?.write_image_data(&rgb)?;
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A place named stays on a look's list however many things are
+    /// nearer (Home: "沙发" was the seventeenth landmark, the list twelve).
+    #[test]
+    fn a_named_place_is_listed_behind_many_things() {
+        let p = [0.0, 0.0, 0.0];
+        let mut marks: Vec<(String, &'static str, [f32; 3])> = (0..20).map(|i| (format!("tv {i}"), "thing", [0.1 * i as f32, 0.0, 0.0])).collect();
+        marks.push(("沙发".into(), "place", [3.2, 0.0, 0.0]));
+        marks.push(("far".into(), "place", [40.0, 0.0, 0.0]));
+        let known = known_landmarks(marks, p);
+        assert_eq!(known.iter().filter(|l| l.1 == "thing").count(), KNOWN_MAX);
+        assert!(known.iter().any(|l| l.0 == "沙发"));
+        assert!(!known.iter().any(|l| l.0 == "far"), "out of range");
+    }
 }

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/vrc-audio", "crates/vrc-vr", "crates/vrc-stereo", "crates/vrc-scene", "crates/vrc-map", "crates/vrc-players", "crates/vrc-nav", "crates/vrc-pano", "crates/vrc-bridge", "crates/vr-probe", "tools/hrtf-render"]
+members = ["crates/vrc-audio", "crates/vrc-vr", "crates/vrc-scene", "crates/vrc-map", "crates/vrc-players", "crates/vrc-nav", "crates/vrc-pano", "crates/vrc-bridge", "crates/vr-probe", "tools/hrtf-render"]
 
 [workspace.package]
 edition = "2021"
@@ -30,13 +30,10 @@ vrc-nav = { path = "crates/vrc-nav" }
 vrc-pano = { path = "crates/vrc-pano" }
 vrc-players = { path = "crates/vrc-players" }
 vrc-scene = { path = "crates/vrc-scene" }
-vrc-stereo = { path = "crates/vrc-stereo" }
 vrc-vr = { path = "crates/vrc-vr" }
 
-# SGM loops are hot even in tests and probes run on the server: optimise them.
-[profile.dev.package.vrc-stereo]
-opt-level = 3
-
+# Depth and map loops are hot even in tests and probes run on the server:
+# optimise them.
 [profile.dev.package.vrc-scene]
 opt-level = 3
 

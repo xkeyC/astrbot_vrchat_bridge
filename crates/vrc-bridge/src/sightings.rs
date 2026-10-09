@@ -99,24 +99,11 @@ impl Sightings {
             }
             let (me, b) = (self.clone(), bridge.clone());
             let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                if b.pano.usable() {
-                    return me.watch_pano(&b, &here, &world);
+                // The panorama only (decision D42): without it, nothing seen.
+                if !b.pano.usable() {
+                    return Ok(());
                 }
-                let Some(mut vr) = b.vr.try_lk() else { return Ok(()) }; // busy moving: next round
-                let frame = vr.frame()?;
-                let rig = vr.rig(&whitelist)?;
-                let Some(ocr) = rig.ocr.as_ref() else { return Ok(()) };
-                let lines = ocr.lines_rgb(&frame.eye_rgb8(0)?, frame.width as u16, frame.height as u16)?;
-                let mut jpeg = None;
-                for name in &here {
-                    if lines.iter().any(|l| match_score(&l.text, name) >= MATCH_RATIO) {
-                        if jpeg.is_none() {
-                            jpeg = Some(crate::vr::eye_jpeg(&frame, 640)?);
-                        }
-                        me.saw(name, &world, jpeg.clone().unwrap());
-                    }
-                }
-                Ok(())
+                me.watch_pano(&b, &here, &world)
             })
             .await;
             if let Ok(Err(e)) = result {

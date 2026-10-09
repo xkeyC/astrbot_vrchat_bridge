@@ -1,12 +1,9 @@
 [package]
 name = "vrc-scene"
 version = "0.1.0"
-description = "What the bot knows of its surroundings: panoramas from head scans, a 2.5D height map from stereo points"
+description = "What the bot knows of its surroundings: a 2.5D height map from the panorama's depth points, candidates to walk to, the pictures"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
-rayon.workspace = true
-vrc-stereo.workspace = true
-vrc-vr.workspace = true

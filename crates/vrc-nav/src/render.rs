@@ -5,7 +5,6 @@
 
 use vrc_scene::draw::Canvas;
 use vrc_scene::{Kind, Panorama};
-use vrc_vr::tap::EyeFrame;
 
 use crate::Survey;
 
@@ -19,16 +18,11 @@ pub fn colour(k: Kind) -> [u8; 3] {
 }
 
 impl Survey {
-    /// The equirectangular panorama of the scan's ring, `width` x `width /
-    /// 2`, longitude 0 the tracking space's -Z (the look down at the feet is
-    /// left out: it shows mostly the bot's own body).
+    /// The equirectangular panorama of the pano frame, `width` x `width /
+    /// 2`, its middle the tracking space's -Z.
     pub fn panorama(&self, width: usize) -> Panorama {
-        if let Some(look) = &self.pano {
-            // The same convention: the middle is the tracking space's -Z.
-            return look.frame.equirect(width, look.tracking.world_yaw(0.0)).pano;
-        }
-        let frames: Vec<&EyeFrame> = self.shots.iter().filter(|s| s.pitch > -60.0).map(|s| &s.frame).collect();
-        Panorama::stitch(&frames, width)
+        let look = &self.pano;
+        look.frame.equirect(width, look.tracking.world_yaw(0.0)).pano
     }
 
     /// The panorama turned to the heading (ahead in the middle, behind at

@@ -13,7 +13,6 @@ vrc-map.workspace = true
 vrc-pano.workspace = true
 vrc-players.workspace = true
 vrc-scene.workspace = true
-vrc-stereo.workspace = true
 vrc-vr.workspace = true
 
 [dev-dependencies]

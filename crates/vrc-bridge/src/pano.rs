@@ -9,8 +9,9 @@
 //! - `--pano auto` (the default, decision D36): on while the game is in a
 //!   world; an avatar that shows no code within AUTO_ANSWER of being asked
 //!   (another avatar, no rig, still loading) is let be (`fallback`: the
-//!   eyes' usual view, and everything that reads them goes the old way)
-//!   and asked again after RETRY, and at once on joining a world.
+//!   eyes' usual view, and nothing sees depth: looks, the follower and
+//!   the speaker tracker's vision wait) and asked again after RETRY, and at
+//!   once on joining a world.
 //! - `--pano on`: on from the start, and kept on: VRChat resets the
 //!   parameter (unsaved) with a new world or avatar, so it is sent again
 //!   every RESEND while wanted.
@@ -18,8 +19,9 @@
 //!   /v1/vr/pano`).
 //!
 //! What reads the eyes (looks, the follower, sightings, the speaker
-//! tracker's vision, screenshots) takes the panorama when there is one
-//! (`usable`), the usual view otherwise.
+//! tracker's vision) needs the panorama (`usable`): it is the only way the
+//! bot sees depth (decision D42; the head scan with stereo is gone). A
+//! screenshot without it shows the usual view.
 //!
 //! A lease of the usual view (`normal_view`: the VR menu, calibration,
 //! opening the user camera, a screenshot asked `normal=1`) turns the rig

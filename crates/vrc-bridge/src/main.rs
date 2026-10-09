@@ -298,7 +298,6 @@ async fn main() -> Result<()> {
         .route("/v1/vr/pano", get(vr_pano_status).post(vr_pano_set))
         .route("/v1/vr/pano.jpg", get(vr_pano_jpg))
         .route("/v1/vr/pano/points", get(vr_pano_points))
-        .route("/v1/vr/detect", post(vr_detect))
         .route("/v1/map", get(map_status))
         .route("/v1/map.png", get(map_png))
         .route("/v1/map/save", post(map_save))
@@ -707,15 +706,11 @@ async fn game_stop(State(_b): State<App>) -> Reply {
 async fn vr_survey(State(b): State<App>, Body(body): Body) -> Reply {
     let_go_of_motion(&b).await;
     let players = body["players"].as_bool().unwrap_or(true);
-    // All around (the default here), or only ahead.
-    let around = body["around"].as_bool().unwrap_or(true);
-    // The scan turns the head, and a follow walks where the head looks.
+    // (A look is one pano frame, all round: `around` is no longer asked.)
     b.take_over();
     let whitelist = b.social.whitelist_names();
     let result = on_headset(&b, move |vr, b| {
-        let v = vr.survey(&whitelist, players, around, &mut panolook::surveyor(b))?;
-        survey_to_speakers(vr, b);
-        Ok(v)
+        vr.survey(&whitelist, players, &mut panolook::surveyor(b))
     })
     .await;
     b.idle_later();
@@ -731,19 +726,6 @@ async fn vr_survey(State(b): State<App>, Body(body): Body) -> Reply {
     Ok(Json(v))
 }
 
-/// The players a survey placed, for the speaker tracker (with the frame
-/// each was read from: their plates' glow).
-fn survey_to_speakers(vr: &vr::VrCore, b: &App) {
-    let Some(s) = vr.survey.as_ref() else { return };
-    if s.pano.is_some() {
-        return; // told as it looked (`panolook::Look::to_speakers`)
-    }
-    for p in &s.players {
-        let frame = s.shots.iter().find(|shot| shot.frame.capture_ns == p.seen_ns).map(|shot| &shot.frame);
-        b.speaker.saw(std::slice::from_ref(p), frame);
-    }
-}
-
 async fn vr_goto(State(b): State<App>, Body(body): Body) -> Reply {
     let_go_of_motion(&b).await;
     b.require_game()?;
@@ -751,9 +733,7 @@ async fn vr_goto(State(b): State<App>, Body(body): Body) -> Reply {
     let whitelist = b.social.whitelist_names();
     let since = vrc_vr::walk::stops();
     let result = on_headset(&b, move |vr, b| {
-        let v = vr.goto(&whitelist, &body, since, &mut panolook::surveyor(b))?;
-        survey_to_speakers(vr, b);
-        Ok(v)
+        vr.goto(&whitelist, &body, since, &mut panolook::surveyor(b))
     })
     .await;
     b.idle_later();
@@ -814,22 +794,6 @@ async fn vr_attend(State(b): State<App>, Body(body): Body) -> Reply {
 }
 
 // -- the lasting map -----------------------------------------------------------------
-
-/// Things in the latest frame of the eyes; `{"save": true}` keeps the
-/// frame and the answer (`detect/` next to the token) to judge the detector by.
-async fn vr_detect(State(b): State<App>, Body(body): Body) -> Reply {
-    let save = body["save"].as_bool().unwrap_or(false).then(|| {
-        game::expand(&b.args.token_file).parent().map(|p| p.join("detect")).unwrap_or_else(|| "detect".into())
-    });
-    // The detector and the stereo want the usual view (a tuning route).
-    Ok(Json(
-        on_headset(&b, move |vr, b| {
-            let _lease = b.pano.normal_view(Duration::from_secs(2))?;
-            vr.detect(save)
-        })
-        .await?,
-    ))
-}
 
 /// The position beacon in the latest frame of the eyes.
 async fn vr_beacon(State(b): State<App>) -> Reply {
@@ -1060,19 +1024,16 @@ async fn vr_reset(State(b): State<App>) -> Reply {
     Ok(Json(json!({"ok": true, "facing_deg": yaw.round(), "head_height": cm(b.anim.params().head_height), "recentered": recentered})))
 }
 
-/// The corridor ahead as the follower sees it (tuning): `yaw` to look along
-/// another way than the head's.
+/// The corridor ahead as the follower sees it (tuning): `yaw` (tracking)
+/// to look along another way than the head's. From the latest pano frame.
 async fn vr_corridor(State(b): State<App>, Query(q): Query<std::collections::HashMap<String, String>>) -> Reply {
     let yaw: Option<f32> = q.get("yaw").and_then(|v| v.parse().ok()).filter(|y: &f32| y.is_finite());
-    let height = b.osc_query().and_then(|o| o.eye_height()).unwrap_or(0.0) as f32;
-    let metres = if height > 0.0 { height / (b.anim.params().head_height - vrc_vr::remote::FLOOR_Y) } else { 1.0 };
-    // The stereo wants the usual view (a tuning route).
-    let frame = on_headset(&b, |vr, b| {
-        let _lease = b.pano.normal_view(Duration::from_secs(2))?;
-        vr.frame()
+    let v = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+        let (points, eye, metres, floor, head_yaw) = panolook::depth_now(&b)?;
+        Ok(follow::corridor_report(&points, eye, yaw.unwrap_or(head_yaw), metres, floor))
     })
-    .await?;
-    Ok(Json(tokio::task::spawn_blocking(move || follow::corridor_report(&frame, yaw, metres)).await??))
+    .await??;
+    Ok(Json(v))
 }
 
 async fn vr_pano(State(b): State<App>) -> std::result::Result<Response, Fail> {

@@ -37,6 +37,12 @@ const SNAP: f32 = 0.2;
 const SNAP_M: f32 = 0.35;
 /// The feet's trail is marked every this far.
 const TRAIL_M: f32 = 0.1;
+/// A step of the trail longer than this is no walk but a jump of the pose
+/// (a respawn or teleport, a misread beacon, a fix putting the odometry
+/// right): it clears no mark (glass marks went, the bot never through
+/// them) and marks nothing walked between. Walking (4 m/s at most, the
+/// odometry at 25 Hz, the beacon every few tenths) steps far less.
+const JUMP_M: f32 = 0.6;
 /// Placing a visit: looks kept to try (those with walls enough), the
 /// share of their wall points that must fall on the map's walls, the turns
 /// tried round a spawn's way (and all round, this far apart).
@@ -48,7 +54,7 @@ const PLACE_ALL_ROUND_DEG: f32 = 5.0;
 /// A spawn within this of a known one is that one.
 const SAME_SPAWN_M: f32 = 1.5;
 /// A look is fitted only after the feet moved this far since the last one
-/// (standing, the odometry is right: a fit would only follow stereo's error,
+/// (standing, the odometry is right: a fit would only follow the depth's error,
 /// as first measured: 0.84 m of "corrections" in a look round on the spot),
 /// and by at most FIT_BASE plus FIT_SHARE of that way across (FIT_UP_SHARE
 /// up).
@@ -456,7 +462,7 @@ impl Nav {
         match self.trail {
             Some(t) if (t[0] - p[0]).hypot(t[2] - p[2]) < TRAIL_M => {}
             last => {
-                if let Some(t) = last {
+                if let Some(t) = last.filter(|t| (t[0] - p[0]).hypot(t[2] - p[2]) <= JUMP_M) {
                     self.map.walked_through(t, p);
                 }
                 self.map.walked(p, true, now);
@@ -776,6 +782,28 @@ mod tests {
         assert!(nav.map.crosses_shut([0.7, 0.0, 0.0], [0.7, 0.0, -2.0], 100));
         assert!(nav.map.crosses_shut([0.0, 0.0, -2.0], [0.0, 0.0, 0.0], 100), "glass both ways");
         assert!(nav.map.crosses_shut([1.0, 0.0, 0.3], [-0.5, 0.0, -1.2], 100), "and at a slant");
+    }
+
+    /// The pose jumping across a pane (a respawn, a misread beacon, a fix
+    /// putting the odometry right) is no walk through it: its marks stay.
+    /// Walking through it clears them.
+    #[test]
+    fn a_jump_of_the_pose_across_glass_keeps_its_marks() {
+        let mut nav = Nav { beacon_only: false, ..Nav::new("w", WorldMap::default()) };
+        let t0 = Instant::now();
+        nav.advance(t0, [0.0; 3], true, 100);
+        nav.stopped(0.0, 0.4, MarkKind::Blocked, 100);
+        let marks = nav.map.marks.len();
+        assert!(marks > 0);
+        // Two metres through the glass at once.
+        nav.set(t0 + Duration::from_millis(100), [0.0, 0.0, -2.0], true, 100);
+        assert_eq!(nav.map.marks.len(), marks, "a jump is no walk");
+        // Back again, step by step: walked through.
+        for i in 1..=20 {
+            nav.advance(t0 + Duration::from_millis(100 + 40 * i), [0.0, 0.0, 0.1], true, 100);
+        }
+        assert!(nav.pose[2].abs() < 1e-3, "{:?}", nav.pose);
+        assert!(nav.map.marks.len() < marks, "walked through: cleared");
     }
 
     #[test]

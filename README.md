@@ -19,8 +19,8 @@ VRChat 以 **VR 模式** 运行在一个虚拟头显上（Monado + xrizer，没�
 bot 看四周、认人、判断谁在说话，靠三样东西配合。设计和取舍见 [decisions.md](docs/full-vr/decisions.md) D32–D41。
 
 - **常驻全景**（化身上的 6 台本地相机，[avatar-panorama.md](docs/full-vr/avatar-panorama.md)）：
-  - 左眼画面是彩色立方体全景：水平 4 个面各 960×720，上、下两个面各 480×480；右眼是逐像素对齐的深度（E1C 编码，每个像素自带校验）。bridge 拿一帧就得到整个球面的颜色和米制距离，不用转头、不用双目。
-  - 默认开（`--pano auto`）：进了世界才开；化身没带全景时自动回到普通视角，原来的转头扫描和双目照旧可用。只有打开 VR 菜单、全身校准、打开用户相机时短暂借用普通视角。
+  - 左眼画面是彩色立方体全景：水平 4 个面各 960×720，上、下两个面各 480×480；右眼是逐像素对齐的深度（E1C 编码，每个像素自带校验）。bridge 拿一帧就得到整个球面的颜色和米制距离，不用转头。这是 bot 唯一的深度来源：原来的转头扫描加双目匹配已经删掉（D42）。
+  - 默认开（`--pano auto`）：进了世界才开。只有打开 VR 菜单、全身校准、打开用户相机时短暂借用普通视角；这期间、以及化身没带全景时，环视会报错，跟随原地等待，说话人只靠声音方向。
   - VRChat 会把名牌和界面叠画在眼睛画面上：前方约 100° 里的名牌可以直接从眼睛读，叠上去的像素在全景的颜色和深度里被遮掉。
   - 深度里找人：在名牌射线下方、或者形状像人的东西里找，每个人按他自己脚下的地面判断（站在台子下面的人也找得到）。不用 YOLO 认人，它对化身不可靠。
   - 环视、跟随、"最后看到"、截图、说话人的视觉部分，都从这一帧全景读。
@@ -54,12 +54,12 @@ bot 看四周、认人、判断谁在说话，靠三样东西配合。设计和�
 每个世界一张地图，bot 一边走一边建，存在磁盘上，下次进同一个世界接着用（`crates/vrc-map`，设计和实测见 [decisions.md](docs/full-vr/decisions.md) D31）。
 
 - **化身位置角标**：化身上的一个着色器，把相机的世界坐标和朝向编码成黑白方块，画在 bot 自己眼睛画面的角落里，只有 bot 自己看得到。bridge 从画面里读出坐标，地图就建在世界自己的坐标系里，不会漂移。没有角标就不建地图。协议和化身端的做法见 [avatar-position-beacon.md](docs/full-vr/avatar-position-beacon.md)。
-- **几何**：双目深度（CUDA 上的 SGM，没有显卡时用 CPU）写进 10 cm 的体素柱，每柱按 5 cm 分层，近处看到的权重高，视线穿过的地方会被清掉（走开的人）。每柱里的占用段给出"能站的面"：地面、台阶、桌面、二楼和它下面的一楼，所以楼梯和多层空间都能表示。
+- **几何**：全景的深度写进 10 cm 的体素柱，每柱按 5 cm 分层，近处看到的权重高，视线穿过的地方会被清掉（走开的人）。每柱里的占用段给出"能站的面"：地面、台阶、桌面、二楼和它下面的一楼，所以楼梯和多层空间都能表示。
 - **经验**比画面更可信：
   - 走过的路记下来，规划时优先走（"走通过就知道怎么走"）；
   - 推着摇杆却走不动的地方（玻璃、看不见的墙）记成"不通"，沿玻璃延伸到门框或柱子为止；之后从那里走通了，标记会撤掉；
   - 没有碰撞的东西（比如有些沙发）只要走过，就算能走。
-- **物品**：用 YOLO 检测环视画面和跟随画面里的家具（沙发、椅子、桌子、电视、盆栽……），用双目定出位置，多次看到的合并。实测同一物品几次定位的离散在 0.05–0.21 m。
+- **物品**：环视时用 YOLO 检测全景水平 4 个面里的家具（沙发、椅子、桌子、电视、盆栽……），按框里的深度定出位置，多次看到的合并。
 - **命名地点**：可以把当前位置和朝向记成一个名字（比如"舞台"），下次按名字走回来。
 
 ### 自动导航
@@ -69,7 +69,7 @@ bot 看四周、认人、判断谁在说话，靠三样东西配合。设计和�
 - **跟随**也用地图：
   - 走向目标的直线如果穿过标记过的玻璃，就按地图绕过去；
   - 两次取景之间，前方有标记时只转身不前进；
-  - 有全景时：目标是读到名字的人；只按位置接着认的话，最多认 7 秒，期间镜头会去确认，不对就丢掉；跟丢后先用镜头快拍找，再转身体（见上一节）。没有全景时，从最后看到人的方向开始，朝他离开的一侧每转 60° 看一眼，第 2、5、8 圈抬头看。
+  - 目标是读到名字的人；只按位置接着认的话，最多认 7 秒，期间镜头会去确认，不对就丢掉；1 秒没看到就算跟丢，先用镜头快拍找，再转身体（见上一节）。
 - **认人**：OCR 读名牌（用户相机的镜头、眼睛画面上的名牌），只认房间里的玩家；墙上写的名字不算名牌（眼睛画面上的名牌要落在 VRChat 的界面层上，墙上的字没有）。
 
 ## 组成
@@ -83,15 +83,14 @@ bot 看四周、认人、判断谁在说话，靠三样东西配合。设计和�
   - 房间状态（跟读 VRChat 日志）、看门狗（显存上限）、启动和停止游戏；
   - 聊天框、表情、跳、小步移动；
   - VRChat Web API：只保存 cookie；接受白名单好友的邀请，跨房间跟随；
-  - 环视：有全景时就用一帧全景（深度生成高度图，名字来自镜头和眼睛上的名牌）；没有全景时只转头，约 0.2 秒扫一圈，再算双目深度。之后用 YOLO 认物品，返回编号的地点和玩家、地图上已知的地点和物品，以及全景图和俯视地图；
+  - 环视：一帧全景（深度生成高度图，名字来自镜头和眼睛上的名牌，YOLO 认物品），返回编号的地点和玩家、地图上已知的地点和物品，以及全景图和俯视地图；
   - 全景解码、用户相机的镜头、身边的人、谁在说话（`/v1/vr/pano`、`/v1/vr/usercam`、`/v1/vr/people`、`/v1/speakers`）；
   - 走到某个编号的地点或地图上的已知点：沿规划的路径分段走，每段后重新看；
   - 在房间里跟随一位玩家，以及白名单好友"最后一次看到"的画面；
   - 全身动作：OSC 追踪器、动作片段和姿势、步态和脚步、自动全身校准（`/v1/motion`、`/v1/vr/trackers`、`/v1/vr/calibrate`）；
-  - 持久地图：里程、读角标、建图、按世界存盘（`/v1/map`、`/v1/map.png`、`/v1/map/place`、`/v1/vr/beacon`、`/v1/vr/detect`）。
-- **头显、视觉和导航**（`crates/vrc-vr`、`vrc-stereo`、`vrc-scene`、`vrc-players`、`vrc-map`、`vrc-nav`）：
+  - 持久地图：里程、读角标、建图、按世界存盘（`/v1/map`、`/v1/map.png`、`/v1/map/place`、`/v1/vr/beacon`）。
+- **头显、视觉和导航**（`crates/vrc-vr`、`vrc-pano`、`vrc-scene`、`vrc-players`、`vrc-map`、`vrc-nav`）：
   - 虚拟头显的控制协议和抓帧读取，OSC 追踪器，化身位置角标的读码；
-  - 双目匹配（SGM，CUDA 内核运行时编译，没有显卡时用 CPU 版，结果逐位相同）；
   - 单次环视的多层 2.5 维高度图和候选点；
   - 名牌识别与定位，物品检测与定位；
   - 化身全景的解码和深度里的人（`vrc-pano`），双耳声音的方向和语音分段（`vrc-audio`）；
@@ -107,8 +106,8 @@ bot 看四周、认人、判断谁在说话，靠三样东西配合。设计和�
 
 | 工具 | 作用 |
 |---|---|
-| `vrchat_view` | 原地环视一圈（默认），返回带编号的全景图和俯视地图，每个地点、玩家的距离、方位，以及地图上记得的附近地点和物品（"On your map"）；`around: false` 只看正前方。每次移动前先用它看一圈 |
-| `vrchat_walk_to` | 走到上一次 `vrchat_view` 里的某个编号；或用 `to` 按名字走到地图上的地点或物品（再远也行，到命名地点会对准并转回原朝向）；或按方位走一段距离。走完返回正前方画面（可选 `around`） |
+| `vrchat_view` | 看一眼四周（一帧全景），返回带编号的全景图和俯视地图，每个地点、玩家的距离、方位，以及地图上记得的附近地点和物品（"On your map"）。每次移动前先用它看一眼 |
+| `vrchat_walk_to` | 走到上一次 `vrchat_view` 里的某个编号；或用 `to` 按名字走到地图上的地点或物品（再远也行，到命名地点会对准并转回原朝向）；或按方位走一段距离。走完返回新的全景图 |
 | `vrchat_remember_place` | 把当前位置和朝向记成一个名字，之后用 `vrchat_walk_to` 的 `to` 走回来；要先正常站立 |
 | `vrchat_step` | 小而精确的动作：左转、右转或掉头，朝前、后（原地后退）、左右（横移）走几米，跳；转身或走了之后返回正前方画面 |
 | `vrchat_follow_player` / `vrchat_follow_adjust` | 在房间里跟随某人；靠近、离远、原地别动、继续跟 |
@@ -127,7 +126,7 @@ bot 看四周、认人、判断谁在说话，靠三样东西配合。设计和�
   - 本地语音（`local_infra` 后端）用它的语音级联；每句话前面的说话人（含把握）也由它按插件给的标签加上。
 - **bot 的化身**：
   - 要建持久地图，化身上需要加位置角标（一个着色器和一个四边形，见 [avatar-position-beacon.md](docs/full-vr/avatar-position-beacon.md)）。没有角标时其他功能照常可用，只是不建地图。
-  - 要用全景，化身上需要加全景相机（6 台本地相机、深度编码和 HUD 着色器，Unity 编辑器脚本一键装，见 [avatar-panorama.md](docs/full-vr/avatar-panorama.md)）。没有全景时退回转头扫描和双目。
+  - 要用全景，化身上需要加全景相机（6 台本地相机、深度编码和 HUD 着色器，Unity 编辑器脚本一键装，见 [avatar-panorama.md](docs/full-vr/avatar-panorama.md)）。**必需**：环视、跟随、认人、说话人的视觉部分都靠它，没有全景时这些都不可用。
   - 全身动作要求化身支持全身追踪。
 - **游戏机器**：Linux 加 NVIDIA 显卡，并具备：
   - 通过 Steam（Proton）运行的 VRChat；
@@ -214,8 +213,6 @@ VRChat 的服务条款对自动化或机器人账号有限制，请自行评估�
 
 ### 算法与思路参考
 
-- Hirschmüller H. *Stereo Processing by Semiglobal Matching and Mutual Information*（TPAMI 2008）：双目匹配（SGM）
-- Zabih R., Woodfill J. *Non-parametric Local Transforms for Computing Visual Correspondence*（ECCV 1994）：census 代价
 - [KISS-ICP](https://github.com/PRBonn/kiss-icp)：只估平移的配准、以里程作先验的思路
 - [elevation_mapping_cupy](https://github.com/leggedrobotics/elevation_mapping_cupy)：按距离加权融合、用视线清除走开的物体
 - [OctoMap](https://octomap.github.io)：体素的命中和穿过计数
@@ -225,5 +222,5 @@ VRChat 的服务条款对自动化或机器人账号有限制，请自行评估�
 
 ### 软件库
 
-- Rust：[tokio](https://tokio.rs)、[axum](https://github.com/tokio-rs/axum)、[reqwest](https://github.com/seanmonstar/reqwest)、[tokio-tungstenite](https://github.com/snapview/tokio-tungstenite)、[rayon](https://github.com/rayon-rs/rayon)、[cudarc](https://github.com/coreylowman/cudarc)、[serde](https://serde.rs)、[clap](https://github.com/clap-rs/clap)、[tracing](https://github.com/tokio-rs/tracing)、[anyhow](https://github.com/dtolnay/anyhow)、[jpeg-encoder](https://github.com/vstroebel/jpeg-encoder)、[png](https://github.com/image-rs/image-png)、[memmap2](https://github.com/RazrFalcon/memmap2-rs)、[rpassword](https://github.com/conradkleinespel/rpassword)
+- Rust：[tokio](https://tokio.rs)、[axum](https://github.com/tokio-rs/axum)、[reqwest](https://github.com/seanmonstar/reqwest)、[tokio-tungstenite](https://github.com/snapview/tokio-tungstenite)、[rayon](https://github.com/rayon-rs/rayon)、[serde](https://serde.rs)、[clap](https://github.com/clap-rs/clap)、[tracing](https://github.com/tokio-rs/tracing)、[anyhow](https://github.com/dtolnay/anyhow)、[jpeg-encoder](https://github.com/vstroebel/jpeg-encoder)、[png](https://github.com/image-rs/image-png)、[memmap2](https://github.com/RazrFalcon/memmap2-rs)、[rpassword](https://github.com/conradkleinespel/rpassword)
 - Python（`tools/` 里的离线脚本）：[NumPy](https://numpy.org)、[SciPy](https://scipy.org)、[Matplotlib](https://matplotlib.org)

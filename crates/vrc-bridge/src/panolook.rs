@@ -82,6 +82,9 @@ pub struct Person {
 
 /// One look at the panorama.
 pub struct Look {
+    /// When the frame was taken (read off the tap): the pose then is the
+    /// look's (the follower walks on while it is worked out).
+    pub taken: Instant,
     pub frame: Arc<PanoFrame>,
     pub eyes: Arc<EyeFrame>,
     pub cloud: Cloud,
@@ -211,6 +214,7 @@ pub fn name_people(cloud: &Cloud, bodies: &[Body], rays: &[PlateRay], p: &People
 
 /// One look: the latest pano frame, its people, their names (`o`).
 pub fn look(b: &Bridge, room: &[String], ocr: Option<&OcrClient>, o: &LookOptions) -> Result<Look> {
+    let taken = Instant::now();
     let (frame, eyes) = b.pano.frame_and_eyes()?;
     let at = Instant::now();
     let cloud = Cloud::new(&frame, CLOUD_STEP);
@@ -231,7 +235,7 @@ pub fn look(b: &Bridge, room: &[String], ocr: Option<&OcrClient>, o: &LookOption
     for q in people.iter_mut().filter(|q| q.name.is_none()) {
         q.how = None;
     }
-    let look = Look { frame, eyes, cloud, tracking, people, bearings };
+    let look = Look { taken, frame, eyes, cloud, tracking, people, bearings };
     look.to_people(b, o.source, at);
     Ok(look)
 }
@@ -300,8 +304,21 @@ impl Look {
             named: self.people.iter().filter_map(|q| Some((q.name.clone()?, q.body))).collect(),
             bearings: self.bearings.clone(),
             room,
+            taken: self.taken,
         }
     }
+}
+
+/// The latest pano frame's depth as the follower sees it: the points
+/// (tracking space), the head, world metres per unit, the floor's height
+/// and the head's tracking yaw (the corridor's tuning route).
+pub fn depth_now(b: &Bridge) -> Result<(Vec<[f32; 3]>, [f32; 3], f32, f32, f32)> {
+    let (frame, eyes) = b.pano.frame_and_eyes()?;
+    let cloud = Cloud::new(&frame, CLOUD_STEP);
+    let tr = Tracking::new(&frame, &eyes, cloud.floor, FLOOR_Y);
+    let floor = cloud.floor.map_or(FLOOR_Y, |f| tr.point([tr.head_world[0], f, tr.head_world[2]])[1]);
+    let points = cloud.points.iter().map(|&p| tr.point(p)).collect();
+    Ok((points, tr.head_track, tr.metres, floor, eyes.views[0].pose.yaw_pitch().0))
 }
 
 /// The room's other players' names.
@@ -309,24 +326,19 @@ pub fn room(b: &Bridge) -> Vec<String> {
     b.game.lk().others().into_iter().map(|(_, n)| n).collect()
 }
 
-/// How surveys look: the panorama when there is one (names read when
-/// `players`), else the head scan.
+/// How surveys look: a pano frame (names read when `players`). The
+/// panorama is the only way the bot sees depth (decision D42): without it
+/// (the avatar has none, or the usual view is leased) a survey fails.
 pub fn surveyor(b: &Arc<Bridge>) -> impl FnMut(&mut Rig, &SurveyOptions, &[[f32; 2]]) -> Result<Survey> + '_ {
     move |rig: &mut Rig, opts: &SurveyOptions, blocked: &[[f32; 2]]| {
-        if b.pano.usable() {
-            let room = room(b);
-            let o = LookOptions { names: opts.players, overlay: opts.players, ..Default::default() };
-            match look(b, &room, rig.ocr.as_ref(), &o) {
-                Ok(l) => {
-                    if opts.players {
-                        l.to_speakers(b, &rig.whitelist);
-                    }
-                    return vrc_nav::survey_pano(l.input(room), opts, blocked, &rig.whitelist, rig.detect.as_ref());
-                }
-                Err(e) => tracing::info!("survey: no pano frame ({e:#}): the head scan"),
-            }
+        anyhow::ensure!(b.pano.usable(), "no panorama: the avatar's pano cameras are needed to look around (`GET /v1/vr/pano`)");
+        let room = room(b);
+        let o = LookOptions { names: opts.players, overlay: opts.players, ..Default::default() };
+        let l = look(b, &room, rig.ocr.as_ref(), &o)?;
+        if opts.players {
+            l.to_speakers(b, &rig.whitelist);
         }
-        vrc_nav::survey(rig, opts, blocked)
+        vrc_nav::survey_pano(l.input(room), opts, blocked, &rig.whitelist, rig.detect.as_ref())
     }
 }
 

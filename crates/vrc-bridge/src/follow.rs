@@ -1,32 +1,34 @@
-//! Following a player in the room (VR): their name tag says who and where.
+//! Following a player in the room (VR): their name says who, the
+//! panorama's depth where.
 //!
-//! Two loops. The eyes (this thread): take the newest frame (looking ahead,
-//! a little down), read the name tags (OCR) and place them by stereo
-//! (`vrc-players`, the same logic as the model's look around); each sighting
-//! of the target is a fix of where they stand. The legs (a thread of their
-//! own, 25 times a second): integrate the avatar's own velocity (OSCQuery)
-//! into an odometry, so a fix half a second old still says how far the
-//! target is *now*; turn towards them (walking follows the head, the body
-//! follows) and set the thumbstick from the distance left to the standing
-//! distance, braking smoothly as it shrinks: a round of the eyes takes
-//! 0.3-0.8 s, and at full stick the avatar runs 4 m/s.
+//! Two loops. The eyes (this thread, `look_pano`, decision D36): each look
+//! is the latest pano frame, all round at once (the avatar's six cameras,
+//! colour and metric depth; the only way the bot sees, decision D42): the
+//! people in its depth, the target among them named (a name read on
+//! someone: the user camera's lens, the plates over the eyes) or kept by
+//! position (the person-shaped one nearest where they were, within a gate
+//! that grows as they may walk; never someone named otherwise); each is a
+//! fix of where they stand. The legs (a thread of their own, 25 times a
+//! second): integrate the avatar's own velocity (OSCQuery) into an
+//! odometry, so a fix half a second old still says how far the target is
+//! *now*; turn towards them (walking follows the head, the body follows)
+//! and set the thumbstick from the distance left to the standing distance,
+//! braking smoothly as it shrinks: at full stick the avatar runs 4 m/s.
+//! Without a pano frame (the avatar has none, the usual view leased for a
+//! menu) nothing is looked at: the target goes unseen and the legs stand.
 //!
-//! In the way (each view's points, along the way to the target, measured
-//! from the ground just before it): whatever does not reach the eyes is
-//! jumped first, with a run-up (user's rule). What reaches them, or what a
-//! jump did not get past, is walked round by following it (a "bug"
-//! algorithm, user's rule): keep it on one side (the side away from the
-//! target's way round), each view taking the free heading nearest that
+//! In the way (each look's points, along the way to the target, measured
+//! from the ground just before it, `steer`): whatever does not reach the
+//! eyes is jumped first, with a run-up (user's rule). What reaches them,
+//! or what a jump did not get past, is walked round by following it (a
+//! "bug" algorithm, user's rule): keep it on one side (the side away from
+//! the target's way round), each look taking the free heading nearest that
 //! side, round corners, until the straight way to the target is open (no
 //! wall up to the eyes; user's rule: keep checking while going round): out
-//! of an enclosure or into one alike. Every GLANCE_EVERY the head turns to
-//! the target's way for a view of it, as the walk along the wall faces
-//! elsewhere. While following a wall the target may be out of sight: the
-//! bot keeps going for where they were. Pushing without moving (stuck) jumps once,
+//! of an enclosure or into one alike. Every way is in view: no glances.
+//! While following a wall the target may be out of sight: the bot keeps
+//! going for where they were. Pushing without moving (stuck) jumps once,
 //! then backs off and turns aside.
-//!
-//! Glances turn only the head: the stick is split into ahead and aside
-//! (VRChat walks relative to the head), so the walk keeps its way.
 //!
 //! Heights go by the avatar's eyes (its OSCQuery eye height), not by fixed
 //! numbers: a wall reaches over them; whatever is lower is jumped first.
@@ -34,28 +36,15 @@
 //! nearer than 1.1 m a low thing counts only across the way (a ledge, a
 //! sofa), not at one side (a prop).
 //!
-//! Lost, the bot stands and the eyes look around one view at a time,
-//! a full turn the way they were last going (or, standing, the side they
-//! were last seen on), starting where they were last seen; the first view
-//! that finds them ends the search and the legs go that way. A turn
-//! that finds nobody walks a while toward where they were, then turns
-//! again.
-//! Following ends only when told to stop or when they leave the room.
-//!
-//! **With the panorama** (decision D36, `look_pano`): a look is the latest
-//! pano frame, all round at once (no head turned, no stereo): the people in
-//! its depth, the target among them named (a name read on someone: the
-//! user camera's lens, the plates over the eyes) or kept by position (the
-//! person-shaped one nearest where they were, within a gate that grows as
-//! they may walk; never someone named otherwise). The way to them is
-//! judged as before (`steer`), every way being in view (no glances). Lost
-//! (unseen LOST_AFTER, a second): the lens's quick sweep first, six views
-//! from where they were last seen out either way by turns, the bot
-//! standing (decision D41); their name read in one: the lens turns there
-//! and the depth places them. Only then the bot turns straight to where
-//! their name was last read, then to where they were last placed, the
-//! lens asked each way, instead of turning round view by view
-//! (`lost_ways`).
+//! Lost (unseen LOST_AFTER, a second, walking or standing): the bot stands
+//! and the lens's quick sweep goes first, six views from where they were
+//! last seen out either way by turns (decision D41); their name read in
+//! one: the lens turns there and the depth places them. Only then the bot
+//! turns straight to where their name was last read, then to where they
+//! were last placed, the lens asked each way (`lost_ways`); from the second
+//! search on, round in views. A search that finds nobody walks a while
+//! toward where they were, then searches again. Following ends only when
+//! told to stop or when they leave the room.
 //!
 //! **Kept by position, briefly** (decision D40, `Track::place`, `Confirm`):
 //! only while a name said it was them `kept_s` ago at most; from
@@ -72,11 +61,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use vrc_players::names::match_score;
-use vrc_stereo::{SgmParams, Stereo};
 use vrc_vr::osc::Osc;
 use vrc_vr::remote::FLOOR_Y;
-use vrc_vr::scan::{self, angle_diff};
-use vrc_vr::tap::EyeFrame;
+use vrc_vr::scan::angle_diff;
 
 use crate::bridge::Bridge;
 use crate::orbit::{Lens, NameSighting};
@@ -99,33 +86,21 @@ const BACK_UNTIL: f32 = 0.15;
 /// Something within this (world metres) straight ahead, nearer than the
 /// target, stops the walk.
 const OBSTACLE_M: f32 = 0.6;
-/// The search (user: turn the way the player was last going, nothing more
-/// clever): from where they were last seen, round one way a view every
-/// SEARCH_STEP_DEG (each turn SEARCH_STEP_S, the head tilting into it), a
-/// full turn a round. The way: the side their last movement went, across
-/// the bot's line of sight to them (moving within SEARCH_MOVED_FOR of being
-/// lost); standing, the side of the bot's facing they were on.
+/// The bot turning to look for someone (`turn_to`): SEARCH_STEP_S for
+/// every SEARCH_STEP_DEG. Which way they went (logged when lost): the side
+/// their last movement went, across the bot's line of sight to them
+/// (moving within SEARCH_MOVED_FOR of being lost); standing, the side of
+/// the bot's facing they were on.
 const SEARCH_STEP_DEG: f32 = 60.0;
 const SEARCH_STEP_S: f32 = 0.35;
-const SEARCH_TILT: f32 = 8.0;
-const SEARCH_SETTLE: Duration = Duration::from_millis(80);
 const SEARCH_MOVED_FOR: Duration = Duration::from_secs(5);
-/// Every third round, from the second on (2, 5, 8...), looks up this high
-/// (someone up on something), the others at PITCH. The head goes level
-/// again over SEARCH_LEVEL_S.
-const SEARCH_UP_PITCH: f32 = 20.0;
-const SEARCH_LEVEL_S: f32 = 0.3;
-/// Feet under a tag: within this of under it, at least this many points.
-const FEET_RADIUS_M: f32 = 0.25;
-const FEET_POINTS: usize = 15;
 /// Up or down from the bot by more than a step: it goes up to them (as near
 /// as this), the stairs are no stopping place.
 const OTHER_FLOOR_STAND_M: f32 = 0.8;
-/// Not seen for this long: stand and search (with the panorama standing
-/// too; the user, 2026-10-09: lost over a second, the lens starts
-/// looking where they were last seen, decision D41).
+/// Not seen for this long, walking or standing: stand and search (the
+/// user, 2026-10-09: lost over a second, the lens starts looking where they
+/// were last seen, decision D41).
 const LOST_AFTER: Duration = Duration::from_millis(1000);
-const LOST_STANDING: Duration = Duration::from_secs(4);
 /// Out of the room for this long: gone.
 const GONE_AFTER: Duration = Duration::from_secs(20);
 const PITCH: f32 = -10.0;
@@ -185,7 +160,7 @@ const ODOMETRY_KEPT: Duration = Duration::from_secs(4);
 /// Obstacles: standing more than STEP_M over the ground before them (lower
 /// ones are walked up), with BIN_POINTS points in a 10 cm bin and
 /// OBSTACLE_POINTS in it and the next two, spanning MIN_SPAN_M of height
-/// (NEAR_POINTS nearer than 1.1 m): stray points of stereo come alone, a
+/// (NEAR_POINTS nearer than 1.1 m): stray depth points come alone, a
 /// wall met at a slant spreads thin over several bins (25 points a bin
 /// missed such walls); reaching
 /// the eyes (within EYE_MARGIN_M: the line of sight, whatever the avatar's
@@ -220,7 +195,6 @@ const STUCK_FOR: Duration = Duration::from_millis(600);
 const ESCAPE_FOR: Duration = Duration::from_millis(500);
 /// Views judge only ways within this of where they look (degrees).
 const VIEW_HALF_DEG: f32 = 40.0;
-const STEREO_THREADS: usize = 6;
 /// Following a wall: headings tried this far apart (degrees), each side of
 /// where it looks; a heading is free when nothing stands within FREE_M
 /// along it. The wall is left once, along the way to the target, nothing up
@@ -231,10 +205,7 @@ const WALL_STEP_DEG: f32 = 15.0;
 const WALL_STEPS: i32 = 3;
 const FREE_M: f32 = 1.2;
 const WALL_SPEED: f32 = 1.4;
-const GLANCE_EVERY: Duration = Duration::from_millis(1500);
 const SAME_SIDE_FOR: Duration = Duration::from_secs(8);
-/// Following, a look runs the detector this often (the lasting map's things).
-const DETECT_EVERY: Duration = Duration::from_secs(3);
 /// A way round by the lasting map: legs this long at most, each held this
 /// long (the next look plans again).
 const MAP_LEG_M: f32 = 2.0;
@@ -280,8 +251,7 @@ const RELOCATE_HOLD: Duration = Duration::from_secs(3);
 /// Lost (the panorama): the lens's quick sweep begins where a name of
 /// theirs read this recent put them (else where they were last placed);
 /// only then the bot turns. With the panorama the whole sphere is in
-/// every look: standing, unseen LOST_AFTER is lost too (the stereo's
-/// LOST_STANDING allowed for tags missed by a forward view).
+/// every look: standing, unseen LOST_AFTER is lost too.
 const LENS_LOOK_FRESH: Duration = Duration::from_secs(5);
 /// Kept by position with no name read on them (decision D40): from
 /// CONFIRM_AFTER the lens looks at the one kept (at most every
@@ -442,8 +412,8 @@ struct State {
     route_m: f32,
     /// Where the target stands over the bot's floor (world metres).
     target_up: f32,
-    /// How the last fix was made: "stereo" (a tag read and placed), "named"
-    /// (the panorama: a name read on them), "kept" (by position).
+    /// How the last fix was made: "named" (a name read on them), "lens"
+    /// (the lens read their name, placed by its ray), "kept" (by position).
     seen_by: &'static str,
     /// The going round's watch, as the last look left it.
     avoid: Avoid,
@@ -746,8 +716,6 @@ struct Track {
     /// Views in a row that should have shown the target (in view, near)
     /// and did not read them.
     misses: u32,
-    /// When a look last ran the detector.
-    detected: Option<Instant>,
     /// When a look last chose a way round by the lasting map.
     routed: Option<Instant>,
     /// That way's length (world metres) from where the bot then was
@@ -1032,7 +1000,7 @@ impl Track {
                 let v = [(pos[0] - prev.pos[0]) / dt, (pos[1] - prev.pos[1]) / dt];
                 let v = [0.5 * prev.vel[0] + 0.5 * v[0], 0.5 * prev.vel[1] + 0.5 * v[1]];
                 let speed = v[0].hypot(v[1]);
-                // Standing still, give or take the noise of stereo.
+                // Standing still, give or take the noise of the depth.
                 if speed < 0.3 {
                     [0.0, 0.0]
                 } else if speed > 3.0 {
@@ -1296,11 +1264,11 @@ impl Follower {
         let _done = Done { me: self.clone(), bridge: bridge.clone(), stop: stop.clone(), legs: Some(legs) };
         let mut last_here = Instant::now();
         let mut searching = false;
-        // Search rounds since they were lost (see SEARCH_UP_PITCH).
+        // Search rounds since they were lost (`search_stages`).
         let mut rounds = 0u32;
         let mut next_search = Instant::now();
-        let mut last_glance = Instant::now();
-        let mut osc: Option<Osc> = None;
+        // Since when no panorama was usable.
+        let mut no_pano: Option<Instant> = None;
         while !stop.load(Ordering::SeqCst) {
             let (running, here, room) = {
                 let g = bridge.game.lk();
@@ -1318,23 +1286,20 @@ impl Follower {
                 }
                 break;
             }
-            if osc.is_none() {
-                osc = bridge.osc_query().ok();
-            }
-            let metres = match osc.as_ref().map(|o| o.eye_height()) {
-                Some(Ok(h)) if h > 0.0 => h as f32 / (bridge.anim.params().head_height - FLOOR_Y),
-                _ => {
-                    osc = None;
-                    1.0
-                }
-            };
-            // Standing (at their side), a name tag missed a few views is not
-            // them gone: LOST_STANDING.
             let standing = self.inner.lk().moving.abs() < 0.05;
-            // Following a wall, the target may be out of sight a while.
-            // The panorama: all round in one frame (no glances, no turning
-            // round to search).
-            let pano = bridge.pano.usable();
+            // The panorama: all round in one frame, the only way the bot
+            // sees (decision D42). Without it (the avatar has none, the
+            // usual view leased for a menu) nothing is looked at: the
+            // target goes unseen and the legs stand.
+            if !bridge.pano.usable() {
+                if no_pano.is_none() {
+                    no_pano = Some(Instant::now());
+                    tracing::info!("follow: no panorama: waiting for it");
+                }
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+            no_pano = None;
             // (Going round a wall long out of sight of them ends by the
             // episode's watch, `Avoid`: lost, the search.)
             // The one kept by position dropped (not them, decision D40):
@@ -1343,28 +1308,10 @@ impl Follower {
                 let t = track.lk();
                 let unseen = t.target.map_or(Duration::MAX, |f| f.at.elapsed());
                 let seeking = t.seek.is_some_and(|until| Instant::now() < until);
-                let after = lost_after(standing, pano);
-                (t.dropped.is_some() || (!t.rounding() && !seeking && unseen > after), unseen)
+                (t.dropped.is_some() || (!t.rounding() && !seeking && unseen > LOST_AFTER), unseen)
             };
-            // Along a wall, now and then a view the target's way.
-            let glance = {
-                let t = track.lk();
-                match (t.rounding() && !pano, t.target_now()) {
-                    (true, Some(goal)) if last_glance.elapsed() > GLANCE_EVERY => {
-                        let to = bearing(t.pos, goal);
-                        (angle_diff(to, t.facing).abs() > VIEW_HALF_DEG).then_some(to)
-                    }
-                    _ => None,
-                }
-            };
-            let result = if let Some(to) = glance {
-                last_glance = Instant::now();
-                let pitch = track.lk().tag_pitch().unwrap_or(PITCH);
-                self.look(&bridge, &track, &target, &room, metres, Some((to, pitch)), &stop).map(|_| ())
-            } else if !lost && pano {
+            let result = if !lost {
                 self.look_pano(&bridge, &track, &target, &room, false, &stop).map(|_| ())
-            } else if !lost {
-                self.look(&bridge, &track, &target, &room, metres, None, &stop).map(|_| ())
             } else if Instant::now() >= next_search {
                 if !searching {
                     searching = true;
@@ -1386,7 +1333,7 @@ impl Follower {
                         bridge.send_event(json!({"type": "follow", "state": "searching", "target": target}));
                     }
                 }
-                let found = if pano { self.find_pano(&bridge, &track, &target, &room, &mut rounds, &stop) } else { self.search(&bridge, &track, &target, &room, metres, &mut rounds, &stop) };
+                let found = self.find_pano(&bridge, &track, &target, &room, &mut rounds, &stop);
                 if !matches!(found, Ok(true)) {
                     // Nobody all round: walk toward where they were a while.
                     let mut t = track.lk();
@@ -1412,14 +1359,14 @@ impl Follower {
             // else, going round, the lens their way now and then.
             let ask = track.lk().relocate.take();
             if let Some(why) = ask {
-                if let Err(e) = self.relocate(&bridge, &track, &target, &room, metres, pano, why, &stop) {
+                if let Err(e) = self.relocate(&bridge, &track, &target, &room, why, &stop) {
                     tracing::warn!("follow: re-locating failed: {e:#}");
                 }
                 let mut t = track.lk();
                 if t.avoid.rest_until.is_none() {
                     t.hold_until = None;
                 }
-            } else if pano && !lost {
+            } else if !lost {
                 // Kept by position, no name a while: the lens looks at the
                 // one kept (D40); else, going round, the lens their way.
                 if !self.confirm_kept(&bridge, &track, &target, &stop) {
@@ -1441,187 +1388,6 @@ impl Follower {
                 }
             }
         }
-    }
-
-    /// The search: one view at a time, from where the target was last seen
-    /// outwards; true as soon as a view finds them.
-    #[allow(clippy::too_many_arguments)]
-    fn search(&self, bridge: &Arc<Bridge>, track: &Arc<Mutex<Track>>, target: &str, room: &[String], metres: f32, rounds: &mut u32, stop: &AtomicBool) -> anyhow::Result<bool> {
-        let (from, way, first_s) = {
-            let t = track.lk();
-            let from = t.target_now().map_or(t.facing, |p| bearing(t.pos, p));
-            // The first turn, to where they were, at the pace of the rest.
-            let first_s = (angle_diff(from, t.facing).abs() / SEARCH_STEP_DEG * SEARCH_STEP_S).max(SEARCH_STEP_S * 0.5);
-            (from, t.search_way(from), first_s)
-        };
-        bridge.anim.owner_hands.store(true, Ordering::SeqCst);
-        // (turn to, pitch, how long, head tilt, head raised, look there):
-        // where they were, then round their way a view at a time, a full
-        // turn. Some rounds look up.
-        *rounds += 1;
-        let pitch = if *rounds % 3 == 2 { SEARCH_UP_PITCH } else { PITCH };
-        let views = (360.0 / SEARCH_STEP_DEG).round() as i32;
-        let mut plan = vec![(from, pitch, first_s, 0.0, 0.0, true)];
-        for k in 1..views {
-            plan.push((wrap(from + way * SEARCH_STEP_DEG * k as f32), pitch, SEARCH_STEP_S, way * SEARCH_TILT, 0.0, true));
-        }
-        let result = (|| {
-            for (yaw, pitch, secs, tilt, nod, looks) in plan {
-                if stop.load(Ordering::SeqCst) {
-                    return Ok(false);
-                }
-                {
-                    let whitelist = bridge.social.whitelist_names();
-                    let mut vr = bridge.vr.lk();
-                    vr.rig(&whitelist)?.hmd.hold_still(true)?;
-                    let turned = vr.turn_gently(yaw, pitch, secs, tilt, nod);
-                    if turned.is_ok() && looks {
-                        std::thread::sleep(SEARCH_SETTLE);
-                    }
-                    vr.rig(&whitelist)?.hmd.hold_still(false)?;
-                    turned?;
-                    track.lk().facing = yaw;
-                }
-                if !looks {
-                    continue;
-                }
-                if self.look(bridge, track, target, room, metres, Some((yaw, pitch)), stop)? {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
-        })();
-        // The head level again (gently, after a round looking up), the hands
-        // back at the sides, wherever it ended.
-        {
-            let mut vr = bridge.vr.lk();
-            let yaw = vr.yaw;
-            if (vr.pitch - PITCH).abs() > 1.0 {
-                let _ = vr.rig(&[]).and_then(|r| r.hmd.hold_still(true));
-                let _ = vr.turn_gently(yaw, PITCH, SEARCH_LEVEL_S, 0.0, 0.0);
-                let _ = vr.rig(&[]).and_then(|r| r.hmd.hold_still(false));
-            }
-            let _ = vr.face(yaw, PITCH);
-        }
-        bridge.anim.owner_hands.store(false, Ordering::SeqCst);
-        result
-    }
-
-    /// One look: the newest frame (or, with `aim`, the first one looking
-    /// that way, the whole bot turned there), its name tags placed; whether
-    /// the target was among them.
-    #[allow(clippy::too_many_arguments)]
-    fn look(&self, bridge: &Arc<Bridge>, track: &Arc<Mutex<Track>>, target: &str, room: &[String], metres: f32, aim: Option<(f32, f32)>, stop: &AtomicBool) -> anyhow::Result<bool> {
-        // Along a wall a look elsewhere is a glance: the head alone.
-        let glance = aim.is_some() && track.lk().rounding();
-        let whitelist = bridge.social.whitelist_names();
-        let (frame, ocr, detect) = {
-            let mut vr = bridge.vr.lk();
-            let frame = match aim {
-                Some((yaw, pitch)) => {
-                    // Exactly that way: the animation's sway would miss it.
-                    vr.rig(&whitelist)?.hmd.hold_still(true)?;
-                    // (After a gentle turn the bot already faces that way:
-                    // the hands stay a little back of rest.)
-                    let there = vrc_vr::scan::angle_diff(yaw, vr.yaw).abs() < 1.0 && (vr.pitch - pitch).abs() < 1.0;
-                    let turned = if glance {
-                        vr.aim(yaw, pitch)
-                    } else if there {
-                        Ok(())
-                    } else {
-                        vr.face(yaw, pitch)
-                    };
-                    let frame = turned.and_then(|()| scan::rendered_at(&mut vr.rig(&whitelist)?.tap, yaw, pitch, Duration::from_secs(1)));
-                    // The head back the way the walk goes: walking follows
-                    // the head, and the next view judges from it.
-                    let back = if glance {
-                        let t = track.lk();
-                        vr.aim(t.facing, t.tag_pitch().unwrap_or(PITCH))
-                    } else {
-                        Ok(())
-                    };
-                    vr.rig(&whitelist)?.hmd.hold_still(false)?;
-                    back?;
-                    if !glance {
-                        track.lk().facing = yaw;
-                    }
-                    frame?
-                }
-                None => vr.rig(&whitelist)?.tap.read()?.ok_or_else(|| anyhow::anyhow!("no frame yet"))?,
-            };
-            let rig = vr.rig(&whitelist)?;
-            let ocr = rig.ocr.clone().ok_or_else(|| anyhow::anyhow!("following needs OCR"))?;
-            (frame, ocr, rig.detect.clone())
-        };
-        // The frame is at most a frame old: as good as now for the odometry.
-        let at = Instant::now();
-        let stereo = Stereo::from_frame(&frame, vrc_stereo::match_scale(frame.width)).ok_or_else(|| anyhow::anyhow!("not an 8-bit frame"))?;
-        let disp = stereo_pool().install(|| stereo.disparity(&SgmParams::default()));
-        let eye = eye_of(&frame);
-        let (yaw, _) = frame.views[0].pose.yaw_pitch();
-        // The floor, in stereo units (the tracking space's).
-        let floor = FLOOR_Y;
-        let lines = ocr.lines_rgb(&frame.eye_rgb8(0)?, frame.width as u16, frame.height as u16)?;
-        let mut names: Vec<String> = room.to_vec();
-        if !names.iter().any(|n| n == target) {
-            names.push(target.to_string());
-        }
-        let seen = vrc_players::sightings(&frame, &stereo, &disp, &lines, &names, &whitelist, floor);
-        // Where everyone's plate is, and whether it glows: who is speaking.
-        bridge.speaker.saw(&seen, Some(&frame));
-        // Whitelisted friends in sight: sightings, for "when did you last see".
-        for s in &seen {
-            if s.whitelist_rank.is_some() {
-                if let Ok(jpeg) = crate::vr::eye_jpeg(&frame, 640) {
-                    bridge.sightings.saw(&s.name, &bridge.game.lk().world_name, jpeg);
-                }
-            }
-        }
-        let points: Vec<[f32; 3]> = stereo.points(&disp, 2).into_iter().map(|(p, _)| p).collect();
-        // The lasting map too (its own thread: dropped when it is busy),
-        // where the bot is first (the avatar's beacon, if it has one).
-        vrc_nav::beacon_fix(&bridge.mapping.nav, &frame, (eye[1] - floor) * metres, at);
-        let people: Vec<[f32; 3]> = seen.iter().map(|s| s.feet).collect();
-        bridge.mapping.observe(vrc_nav::vrc_map::Observation::from_tracking(&points, eye, floor, metres, &people, at));
-        // And now and then, the things in view.
-        let due = track.lk().detected.is_none_or(|t| t.elapsed() >= DETECT_EVERY);
-        if let (true, Some(detect)) = (due, detect) {
-            track.lk().detected = Some(Instant::now());
-            match frame.eye_rgb8(0).and_then(|rgb| detect.detect_rgb(&rgb, frame.width, frame.height)) {
-                Ok(found) => {
-                    let placed = vrc_players::objects::place(&frame, &stereo, &disp, &found);
-                    let rels: Vec<_> = placed
-                        .iter()
-                        .map(|o| (o, [(o.at[0] - eye[0]) * metres, (o.at[1] - floor) * metres, (o.at[2] - eye[2]) * metres]))
-                        .collect();
-                    vrc_nav::objects_onto(&bridge.mapping.nav, &rels, metres, at);
-                }
-                Err(e) => tracing::warn!("follow: detection failed: {e:#}"),
-            }
-        }
-        let hit = seen.iter().filter(|s| match_score(&s.name, target) >= 0.6).max_by(|a, b| a.score.total_cmp(&b.score));
-        let feet_up = hit.and_then(|h| feet_height(&points, h.tag, metres, floor));
-        let mut t = track.lk();
-        let then = t.pos_at(at);
-        let found = if let Some(hit) = hit {
-            let rel = [(hit.feet[0] - eye[0]) * metres, (hit.feet[2] - eye[2]) * metres];
-            // Up (or down) stairs: where their feet are; not seen, as before.
-            let up = feet_up.or(t.target.map(|f| f.up)).unwrap_or(0.0);
-            t.add_fix(at, [then[0] + rel[0], then[1] + rel[1]], up, (hit.tag[1] - eye[1]) * metres);
-            t.misses = 0;
-            t.seek = None;
-            if let Some(mut s) = self.inner_for(stop) {
-                s.last_seen = Some(at);
-                s.distance = rel[0].hypot(rel[1]);
-                s.target_up = t.target.map_or(0.0, |f| f.up);
-                s.seen_by = "stereo";
-            }
-            true
-        } else {
-            false
-        };
-        let view = View { at, then, found, yaw, glance, tags: seen.len(), eye, floor, metres, points, all_round: false };
-        self.steer(bridge, &mut t, &view, stop)
     }
 
     /// The way to the target as one view shows it (`steer_way`), and the
@@ -1907,7 +1673,10 @@ impl Follower {
         let ocr = if overlay { ocr_client(bridge) } else { None };
         let o = LookOptions { names: true, overlay: ocr.is_some(), lens_within: NAME_FRESH, ..Default::default() };
         let l = panolook::look(bridge, &names, ocr.as_ref(), &o)?;
-        let at = Instant::now();
+        // Where things were when the frame was taken (decode and OCR take
+        // a few hundred ms, walking on): the beacon's fix, the look on the
+        // lasting map and the target placed by the odometry then.
+        let at = l.taken;
         let tr = l.tracking;
         let (eye, metres) = (tr.head_track, tr.metres);
         let floor = l.cloud.floor.map_or(FLOOR_Y, |f| tr.point([tr.head_world[0], f, tr.head_world[2]])[1]);
@@ -2089,19 +1858,12 @@ impl Follower {
     /// each; without, a look their way. Whether a look found them. The
     /// next look plans the way afresh for where they are (the map, the
     /// wall the other way round).
-    #[allow(clippy::too_many_arguments)]
-    fn relocate(&self, bridge: &Arc<Bridge>, track: &Arc<Mutex<Track>>, target: &str, room: &[String], metres: f32, pano: bool, why: &'static str, stop: &AtomicBool) -> anyhow::Result<bool> {
+    fn relocate(&self, bridge: &Arc<Bridge>, track: &Arc<Mutex<Track>>, target: &str, room: &[String], why: &'static str, stop: &AtomicBool) -> anyhow::Result<bool> {
         tracing::info!(why, "follow: re-locating them");
         let last = {
             let t = track.lk();
-            t.target_now().map(|p| (bearing(t.pos, p), t.tag_pitch().unwrap_or(PITCH)))
+            t.target_now().map(|p| bearing(t.pos, p))
         };
-        if !pano {
-            return match last {
-                Some(aim) => self.look(bridge, track, target, room, metres, Some(aim), stop),
-                None => Ok(false),
-            };
-        }
         let named_now = |track: &Arc<Mutex<Track>>| track.lk().named_at.is_some_and(|n| n.elapsed() < NAME_FRESH);
         let found = self.look_pano(bridge, track, target, room, true, stop)?;
         if found && named_now(track) {
@@ -2113,7 +1875,7 @@ impl Follower {
             .into_iter()
             .rev()
             .find(|n| match_score(&n.name, target) >= 0.6);
-        let ways = lost_ways(named.map(|n| n.tracking_yaw), last.map(|l| l.0));
+        let ways = lost_ways(named.map(|n| n.tracking_yaw), last);
         for (yaw, way) in ways {
             if stop.load(Ordering::SeqCst) {
                 break;
@@ -2527,15 +2289,6 @@ fn search_stages(rounds: u32) -> Vec<&'static str> {
     stages
 }
 
-/// How long unseen is lost: the panorama sees all round (a second,
-/// decision D41); the stereo's forward view, standing, allowed for tags
-/// missed.
-fn lost_after(standing: bool, pano: bool) -> Duration {
-    match (standing, pano) {
-        (true, false) => LOST_STANDING,
-        _ => LOST_AFTER,
-    }
-}
 
 /// The lens's quick sweep (`Orbit::sweep`), the bot standing, from `from`
 /// (a world yaw: where they were) out either way: the target's name if
@@ -2731,27 +2484,17 @@ fn lost_ways(named: Option<f32>, last: Option<f32>) -> Vec<(f32, &'static str)> 
     ways
 }
 
-/// Following looks again and again: its stereo gets a few cores, not all
-/// (all of them made a follow cost about six cores' time, beside the game).
-fn stereo_pool() -> &'static rayon::ThreadPool {
-    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
-    POOL.get_or_init(|| rayon::ThreadPoolBuilder::new().num_threads(STEREO_THREADS).build().expect("a thread pool"))
-}
-
 /// What the corridor along `yaw` holds, for tuning (`/v1/vr/corridor`):
 /// per 10 cm from 0.3 m out, the points' count and lowest and highest
 /// height over the floor (world metres), and what `corridor` makes of it.
-pub fn corridor_report(frame: &EyeFrame, yaw: Option<f32>, metres: f32) -> anyhow::Result<Value> {
-    let stereo = Stereo::from_frame(frame, vrc_stereo::match_scale(frame.width)).ok_or_else(|| anyhow::anyhow!("not an 8-bit frame"))?;
-    let disp = stereo_pool().install(|| stereo.disparity(&SgmParams::default()));
-    let points: Vec<[f32; 3]> = stereo.points(&disp, 2).into_iter().map(|(p, _)| p).collect();
-    let eye = eye_of(frame);
-    let yaw = yaw.unwrap_or_else(|| frame.views[0].pose.yaw_pitch().0);
+/// From the pano depth's `points` (tracking space), the head at `eye`, the
+/// floor at `floor`.
+pub fn corridor_report(points: &[[f32; 3]], eye: [f32; 3], yaw: f32, metres: f32, floor: f32) -> Value {
     let (s, c) = yaw.to_radians().sin_cos();
     let mut bins: Vec<(usize, f32, f32)> = vec![(0, f32::INFINITY, f32::NEG_INFINITY); 40];
-    for p in &points {
+    for p in points {
         let (dx, dz) = (p[0] - eye[0], p[2] - eye[2]);
-        let (ahead, side, up) = ((dx * s - dz * c) * metres, (dx * c + dz * s) * metres, (p[1] - FLOOR_Y) * metres);
+        let (ahead, side, up) = ((dx * s - dz * c) * metres, (dx * c + dz * s) * metres, (p[1] - floor) * metres);
         if ahead > 0.3 && side.abs() < 0.25 {
             let i = ((ahead - 0.3) / 0.1) as usize;
             if let Some(b) = bins.get_mut(i) {
@@ -2760,37 +2503,13 @@ pub fn corridor_report(frame: &EyeFrame, yaw: Option<f32>, metres: f32) -> anyho
         }
     }
     let r = |v: f32| (v as f64 * 100.0).round() / 100.0;
-    Ok(json!({
+    json!({
         "yaw": yaw.round(),
-        "eye_m": r((eye[1] - FLOOR_Y) * metres),
+        "eye_m": r((eye[1] - floor) * metres),
         "points": points.len(),
-        "blocker": corridor(&points, eye, yaw, metres, FLOOR_Y, FROM_ANYWAY).map(|b| json!({"distance": r(b.distance), "top": r(b.top), "tall": b.tall})),
+        "blocker": corridor(points, eye, yaw, metres, floor, FROM_ANYWAY).map(|b| json!({"distance": r(b.distance), "top": r(b.top), "tall": b.tall})),
         "bins": bins.iter().enumerate().filter(|(_, b)| b.0 > 0).map(|(i, b)| json!([r(0.3 + 0.1 * i as f32), b.0, r(b.1), r(b.2)])).collect::<Vec<_>>(),
-    }))
-}
-
-/// Where the feet are under a name tag at `tag` (tracking space): the
-/// lowest of the points within FEET_RADIUS_M round under it (their feet,
-/// the floor they stand on, a stair's edge before them), over the bot's
-/// floor (world metres); `None` with too few there.
-fn feet_height(points: &[[f32; 3]], tag: [f32; 3], metres: f32, floor: f32) -> Option<f32> {
-    let mut under: Vec<f32> = points
-        .iter()
-        .filter(|p| ((p[0] - tag[0]) * metres).hypot((p[2] - tag[2]) * metres) < FEET_RADIUS_M && (tag[1] - p[1]) * metres > 0.3)
-        .map(|p| (p[1] - floor) * metres)
-        .collect();
-    if under.len() < FEET_POINTS {
-        return None;
-    }
-    // Low, but not a stray point below the floor.
-    under.sort_by(f32::total_cmp);
-    Some(under[under.len() / 20])
-}
-
-/// The middle of the eyes of `frame` (tracking space, stereo units).
-fn eye_of(frame: &EyeFrame) -> [f32; 3] {
-    let (a, b) = (frame.views[0].pose.position, frame.views[1].pose.position);
-    [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0, (a[2] + b[2]) / 2.0]
+    })
 }
 
 /// The yaw (degrees, + right of -z) from `from` to `to`.
@@ -3274,23 +2993,19 @@ mod tests {
         assert_eq!(search_stages(2), vec!["lens_ring", "body_turn", "scan"]);
     }
 
-    /// Decision D41 (the user, 2026-10-09): with the panorama, unseen over
-    /// a second is lost, standing or walking, and the search's first view
-    /// goes out at once; kept by position with no name, the lens looks
-    /// after a second too.
+    /// Decision D41 (the user, 2026-10-09): unseen over a second is lost,
+    /// standing or walking, and the search's first view goes out at once;
+    /// kept by position with no name, the lens looks after a second too.
     #[test]
-    fn with_the_panorama_a_second_unseen_starts_the_lens() {
-        for standing in [true, false] {
-            assert!(lost_after(standing, true) <= Duration::from_millis(1000), "{standing}");
-        }
-        assert_eq!(lost_after(true, false), LOST_STANDING);
+    fn a_second_unseen_starts_the_lens() {
+        assert!(LOST_AFTER <= Duration::from_millis(1000));
         assert!(CONFIRM_AFTER <= Duration::from_millis(1000));
         // Asked for as lost: the sweep's first Pose on the orbit's next
         // tick (`Orbit::sweep`, `State::snap_next`), within SWEEP_ASK_FOR
         // of the legs letting go; lost to the first Pose: at most 1.1 s
         // with the orbit's 30 Hz tick.
         let tick = Duration::from_secs_f32(1.0 / crate::orbit::OrbitSettings::default().rate_hz);
-        assert!(lost_after(false, true) + tick <= Duration::from_millis(1100));
+        assert!(LOST_AFTER + tick <= Duration::from_millis(1100));
     }
 
     /// A synthetic panorama: the scene's people (feet x, z, height) as

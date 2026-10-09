@@ -2,10 +2,12 @@
 //! AstrBot plugin turns them into the model's tools; the Codex agent in
 //! AstrBot decides):
 //!
-//! - [`survey`]: look all around by turning the head, and know what is
-//!   there: a panorama, a height map from stereo, the room's players by
-//!   their name tags (whitelisted friends marked), and numbered candidates
-//!   (places and players) to pick from.
+//! - [`pano::survey_pano`]: know what is around from one frame of the
+//!   avatar's panorama (the whole sphere with metric depth, decision D36):
+//!   a height map from the depth, the people the caller named (whitelisted
+//!   friends marked), things found, and numbered candidates (places and
+//!   players) to pick from. The panorama is the only way the bot sees
+//!   depth: the head scan with stereo is gone (decision D42).
 //! - [`goto`]: walk to a point of a survey: short legs along a planned
 //!   path, each measured by the avatar's own speed, a fresh survey and plan
 //!   after each, a blocked leg remembered as an obstacle. With the lasting
@@ -14,13 +16,9 @@
 //!   before), the surveys go onto it, and a blocked leg marks it; without
 //!   it (or before the visit is placed on it), on the survey's own map.
 //!
-//! - [`pano::survey_pano`]: the same survey from one frame of the avatar's
-//!   panorama (the whole sphere with metric depth: no head scan, no
-//!   stereo), the people given by the caller.
-//!
 //! Coordinates are the tracking space's (the head turns, the playspace
 //! never does, so its axes stay fixed to the world; walking moves the world
-//! past the head). Distances inside are stereo units; `Survey::metres`
+//! past the head). Distances inside are tracking units; `Survey::metres`
 //! turns them into world metres.
 
 pub mod pano;
@@ -29,17 +27,14 @@ pub mod render;
 pub use pano::{survey_pano, PanoInput, PanoLook};
 
 use std::path::PathBuf;
-use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use vrc_players::{DetectClient, ObjectSighting, OcrClient, Sighting};
 use vrc_scene::candidates::{paths, stopped, walkable};
-use vrc_scene::{candidates, Candidate, CandidateParams, HeightMap, MapParams, Person};
-use vrc_stereo::{fit_floor, Disparity, Floor, SgmParams, Stereo};
+use vrc_scene::{Candidate, HeightMap, MapParams};
 use vrc_vr::osc::Osc;
 use vrc_vr::remote::RemoteHmd;
-use vrc_vr::scan::{self, Shot};
 use vrc_vr::tap::EyeTap;
 use vrc_vr::walk::{self, WalkParams};
 
@@ -62,9 +57,6 @@ pub struct Rig {
     pub log_dir: PathBuf,
 }
 
-/// How long the avatar's arms take to follow the hands (VRChat's IK).
-const ARMS_SETTLE: Duration = Duration::from_millis(150);
-
 /// Room kept from obstacles, world metres (half a body's width and a bit).
 pub const CLEARANCE_M: f32 = 0.25;
 
@@ -76,32 +68,30 @@ pub fn world_params() -> MapParams {
 
 #[derive(Clone, Debug)]
 pub struct SurveyOptions {
-    /// Views in the ring.
-    pub count: usize,
-    /// Only the one view ahead (and the look down), not the ring.
-    pub ahead: bool,
-    pub pitch: f32,
-    /// Also look down at the feet.
-    pub down: bool,
     /// Read name tags (needs the rig's OCR).
     pub players: bool,
     /// Find things in the views (sofas, chairs...: the lasting map's objects).
     pub objects: bool,
-    /// Match the stereo at 1/scale of the eye size (0: about
-    /// `vrc_stereo::MATCH_WIDTH` wide, whatever the eye size).
-    pub stereo_scale: usize,
 }
 
 impl Default for SurveyOptions {
     fn default() -> Self {
-        SurveyOptions { count: 5, ahead: false, pitch: -10.0, down: true, players: true, objects: true, stereo_scale: 0 }
+        SurveyOptions { players: true, objects: true }
     }
+}
+
+/// The floor under the bot.
+#[derive(Clone, Copy, Debug)]
+pub struct Floor {
+    /// Height (y) of the floor right under the eye.
+    pub height: f32,
+    /// Its slope, degrees from level.
+    pub tilt_deg: f32,
+    pub inliers: usize,
 }
 
 /// What a survey found.
 pub struct Survey {
-    pub shots: Vec<Shot>,
-    pub pairs: Vec<(Stereo, Disparity)>,
     /// The eyes' centre (head position) and heading.
     pub eye: [f32; 3],
     pub yaw: f32,
@@ -111,115 +101,19 @@ pub struct Survey {
     /// Things found in the views (tracking space).
     pub objects: Vec<ObjectSighting>,
     pub candidates: Vec<Candidate>,
-    /// World metres per stereo unit (1.0 when VRChat did not say).
+    /// World metres per tracking unit.
     pub metres: f32,
     pub room: Vec<String>,
     pub timings: Timings,
-    /// Made from a pano frame (no shots, no stereo pairs then).
-    pub pano: Option<PanoLook>,
+    /// The pano frame it was made from.
+    pub pano: PanoLook,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct Timings {
-    pub scan: Duration,
-    pub stereo: Duration,
     pub ocr: Duration,
     pub detect: Duration,
     pub map: Duration,
-}
-
-/// Looks all around and works out what is there. `blocked` are points
-/// (tracking space) known to be in the way though not seen (a walk was
-/// stopped there).
-pub fn survey(rig: &mut Rig, opts: &SurveyOptions, blocked: &[[f32; 2]]) -> Result<Survey> {
-    let head = rig.hmd.state.head;
-    let (yaw, _) = head.yaw_pitch();
-    let mut views = if opts.ahead { vec![(yaw, opts.pitch)] } else { scan::ring(opts.count, opts.pitch) };
-    if opts.down {
-        views.push((yaw, -80.0));
-    }
-    // Arms down at the sides, out of the views.
-    rig.hmd.state.hands_at_rest(head.position, yaw);
-    rig.hmd.send()?;
-    sleep(ARMS_SETTLE);
-    let t = Instant::now();
-    let shots = scan::scan(&mut rig.hmd, &mut rig.tap, &views, Duration::from_secs(2))?;
-    let mut timings = Timings { scan: t.elapsed(), ..Default::default() };
-
-    let t = Instant::now();
-    let mut points = Vec::new();
-    let mut pairs = Vec::new();
-    for s in &shots {
-        let scale = if opts.stereo_scale == 0 { vrc_stereo::match_scale(s.frame.width) } else { opts.stereo_scale };
-        let stereo = Stereo::from_frame(&s.frame, scale).context("not an 8-bit frame")?;
-        let disp = stereo.disparity(&SgmParams::default());
-        points.extend(stereo.points(&disp, 1).into_iter().map(|(p, _)| p));
-        pairs.push((stereo, disp));
-    }
-    timings.stereo = t.elapsed();
-    let eye = head.position;
-    let floor = fit_floor(&points, eye, 0.5).context("no floor in sight")?;
-
-    let t = Instant::now();
-    let mut room = Vec::new();
-    let mut players = Vec::new();
-    if opts.players {
-        if let Some(ocr) = &rig.ocr {
-            room = vrc_players::room::players(&rig.log_dir).unwrap_or_default();
-            if !room.is_empty() {
-                let mut all = Vec::new();
-                for (s, (stereo, disp)) in shots.iter().zip(&pairs) {
-                    let rgb = s.frame.eye_rgb8(0)?;
-                    let lines = ocr.lines_rgb(&rgb, s.frame.width as u16, s.frame.height as u16)?;
-                    all.extend(vrc_players::sightings(&s.frame, stereo, disp, &lines, &room, &rig.whitelist, floor.height));
-                }
-                players = vrc_players::merge(all);
-            }
-        }
-    }
-    timings.ocr = t.elapsed();
-
-    let t = Instant::now();
-    let mut objects = Vec::new();
-    if opts.objects {
-        if let Some(detect) = &rig.detect {
-            // Not the look down at the feet: the bot's own body.
-            for (s, (stereo, disp)) in shots.iter().zip(&pairs).filter(|(s, _)| s.pitch > -45.0) {
-                let rgb = s.frame.eye_rgb8(0)?;
-                match detect.detect_rgb(&rgb, s.frame.width, s.frame.height) {
-                    Ok(found) => objects.extend(vrc_players::objects::place(&s.frame, stereo, disp, &found)),
-                    Err(e) => {
-                        eprintln!("detection failed: {e:#}");
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    timings.detect = t.elapsed();
-
-    // World metres per stereo unit; a floor found nonsense (at or over
-    // the eyes) or an eye height not read leaves it 1.
-    let metres = match rig.osc.as_ref().map(|o| o.eye_height()) {
-        Some(Ok(h)) if h > 0.0 && eye[1] - floor.height > 0.1 => h as f32 / (eye[1] - floor.height),
-        _ => 1.0,
-    }
-    .clamp(0.1, 10.0);
-
-    let t = Instant::now();
-    let mut map = HeightMap::new(world_params().in_units(metres), [eye[0], eye[2]], floor.height);
-    map.add(&points, eye);
-    for &[x, z] in blocked {
-        map.mark_blocked(x, z, 0.15 / metres);
-    }
-    let people: Vec<Person> = players
-        .iter()
-        .map(|s| Person { name: s.name.clone(), whitelist_rank: s.whitelist_rank, feet: s.feet })
-        .collect();
-    let cparams = CandidateParams { clearance: CLEARANCE_M / metres, min_distance: 0.8 / metres, min_gap: 0.8 / metres, ..Default::default() };
-    let candidates = candidates(&map, eye, yaw, &people, &cparams);
-    timings.map = t.elapsed();
-    Ok(Survey { shots, pairs, eye, yaw, floor, map, players, objects, candidates, metres, room, timings, pano: None })
 }
 
 impl Survey {
@@ -283,20 +177,11 @@ impl Default for GotoOptions {
     }
 }
 
-/// A survey's looks as the lasting map takes them.
-pub fn observations(s: &Survey) -> Vec<Observation> {
-    let at = Instant::now();
+/// A survey's look as the lasting map takes it (placed by the pose when
+/// its frame was taken).
+pub fn observation(s: &Survey) -> Observation {
     let people: Vec<[f32; 3]> = s.players.iter().map(|p| p.feet).collect();
-    if let Some(look) = &s.pano {
-        return vec![Observation::from_tracking(&look.points, s.eye, s.floor.height, s.metres, &people, at)];
-    }
-    s.pairs
-        .iter()
-        .map(|(stereo, disp)| {
-            let points: Vec<[f32; 3]> = stereo.points(disp, 2).into_iter().map(|(p, _)| p).collect();
-            Observation::from_tracking(&points, s.eye, s.floor.height, s.metres, &people, at)
-        })
-        .collect()
+    Observation::from_tracking(&s.pano.points, s.eye, s.floor.height, s.metres, &people, s.pano.taken)
 }
 
 /// The position beacon of `frame` (the avatar's shader, in the eyes'
@@ -342,27 +227,21 @@ pub fn beacon_fix_as_is(map: &vrc_map::Shared, frame: &vrc_vr::tap::EyeFrame, st
 /// beacon in its views, if the avatar has one).
 pub fn observe(map: &vrc_map::Shared, s: &Survey) {
     let eyes_m = (s.eye[1] - s.floor.height) * s.metres;
-    let now = Instant::now();
-    match &s.pano {
-        Some(look) => pano_fix(map, look, eyes_m, now),
-        None => {
-            s.shots.iter().any(|shot| beacon_fix(map, &shot.frame, eyes_m, now));
-        }
-    }
-    for o in observations(s) {
-        map.lock().unwrap_or_else(std::sync::PoisonError::into_inner).observe(&o);
-    }
+    // Placed by the pose when the frame was taken.
+    let taken = s.pano.taken;
+    pano_fix(map, &s.pano, eyes_m, taken);
+    map.lock().unwrap_or_else(std::sync::PoisonError::into_inner).observe(&observation(s));
     let rels: Vec<_> = s
         .objects
         .iter()
         .map(|o| (o, [(o.at[0] - s.eye[0]) * s.metres, (o.at[1] - s.floor.height) * s.metres, (o.at[2] - s.eye[2]) * s.metres]))
         .collect();
-    objects_onto(map, &rels, s.metres, now);
+    objects_onto(map, &rels, s.metres, taken);
 }
 
 /// Things seen go onto the lasting map: each with where it is from the feet
 /// (world metres) as the look was taken `at`; farther than
-/// [`vrc_map::MAX_RANGE`] stereo places them too loosely (a television 8 m
+/// [`vrc_map::MAX_RANGE`] the depth places them too loosely (a television 8 m
 /// off scattered over 1.5 m).
 pub fn objects_onto(map: &vrc_map::Shared, seen: &[(&ObjectSighting, [f32; 3])], metres: f32, at: Instant) {
     let mut n = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -429,8 +308,8 @@ pub struct LegReport {
     pub on_map: bool,
 }
 
-/// How a walk looks again after each leg: a head scan ([`survey`]), or a
-/// pano frame (the bridge's).
+/// How a walk looks again after each leg: a pano frame (the bridge's,
+/// [`survey_pano`]).
 pub type Look<'a> = dyn FnMut(&mut Rig, &SurveyOptions, &[[f32; 2]]) -> Result<Survey> + 'a;
 
 /// Walks to `target` (x, z in the tracking space as of `first`, the survey
@@ -537,7 +416,7 @@ pub fn goto(rig: &mut Rig, first: Survey, target: [f32; 2], opts: &GotoOptions, 
     })
 }
 
-/// Heading (degrees) and distance (stereo units) of the next leg toward
+/// Heading (degrees) and distance (tracking units) of the next leg toward
 /// `target`: the farthest point of the planned path, within `max_leg`, that
 /// a straight walk reaches over walkable cells. Toward the nearest
 /// reachable cell when the target itself is not reachable.
@@ -647,7 +526,7 @@ impl Rig {
 mod tests {
     use super::*;
 
-    /// Flat floor all round, 3 m each way (stereo units = metres).
+    /// Flat floor all round, 3 m each way (tracking units = metres).
     fn floor() -> (HeightMap, [f32; 3]) {
         let eye = [0.0, 1.6, 0.0];
         let mut m = HeightMap::new(MapParams { radius: 4.0, ..world_params() }, [0.0, 0.0], 0.0);

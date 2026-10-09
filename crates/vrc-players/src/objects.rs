@@ -1,16 +1,14 @@
 //! Things in a frame (a sofa, a chair, a plant...), from local-multimodal-
 //! infra's direct detection endpoint (`POST /v1/detect/objects?model=<id>`
 //! with the image as the body, answering `{"objects": [{"label",
-//! "confidence", "bbox": {"x", "y", "width", "height"}}]}`), placed in the
-//! tracking space by the stereo disparity inside their boxes.
+//! "confidence", "bbox": {"x", "y", "width", "height"}}]}`). The caller
+//! places them (`vrc_nav::pano`: the panorama's depth inside their boxes).
 //!
 //! The detector is YOLO11n on COCO's 80 kinds for now: players are found by
-//! their name tags ([`crate::locate`]), not as "person".
+//! their name tags, not as "person".
 
 use anyhow::{Context, Result};
 use jpeg_encoder::{ColorType, Encoder};
-use vrc_stereo::{Disparity, Stereo};
-use vrc_vr::tap::EyeFrame;
 
 use crate::ocr::{post, OcrClient};
 
@@ -27,11 +25,6 @@ pub const KEPT: &[&str] = &[
 pub const MIN_SCORE: f32 = 0.25;
 /// Images go at most this wide (the detector itself looks at 640).
 const SEND_WIDTH: u32 = 960;
-/// Points of a box placed by: its middle (a sofa's box holds the floor at
-/// its sides and the wall over its back).
-const MID_X: (f32, f32) = (0.25, 0.75);
-const MID_Y: (f32, f32) = (0.2, 0.85);
-const MIN_POINTS: usize = 20;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Detection {
@@ -39,6 +32,13 @@ pub struct Detection {
     pub confidence: f32,
     /// Frame pixels: left, top, width, height.
     pub bbox: [f32; 4],
+}
+
+impl Detection {
+    /// Worth a place on the map: a kind KEPT, at least MIN_SCORE sure.
+    pub fn kept(&self) -> bool {
+        self.confidence >= MIN_SCORE && KEPT.contains(&self.label.as_str())
+    }
 }
 
 /// A detection placed.
@@ -121,61 +121,6 @@ fn parse(body: &str) -> Result<Vec<Detection>> {
         .collect())
 }
 
-/// The kept, sure enough detections of `frame`'s left eye, placed by the
-/// disparities in the middle of their boxes: the nearest crowd of points
-/// there (what is in front, not what shows past its edges), its middle at
-/// the lowest of them.
-pub fn place(frame: &EyeFrame, stereo: &Stereo, disp: &Disparity, found: &[Detection]) -> Vec<ObjectSighting> {
-    let scale = frame.width as f32 / disp.width as f32;
-    let [fx, fy, _, _] = stereo.intrinsics;
-    let fb = fx * stereo.baseline;
-    let mut out = Vec::new();
-    for d in found {
-        if d.confidence < MIN_SCORE || !KEPT.contains(&d.label.as_str()) {
-            continue;
-        }
-        let [x, y, w, h] = d.bbox;
-        let (x0, x1) = (((x + MID_X.0 * w) / scale) as usize, ((x + MID_X.1 * w) / scale) as usize);
-        let (y0, y1) = (((y + MID_Y.0 * h) / scale) as usize, ((y + MID_Y.1 * h) / scale) as usize);
-        let mut pts: Vec<([f32; 3], f32)> = Vec::new();
-        for yy in y0..y1.min(disp.height) {
-            for xx in x0..x1.min(disp.width) {
-                let dd = disp.at(xx, yy);
-                if dd.is_finite() && dd > 0.25 {
-                    let p = stereo.point(xx as f32 + 0.5, yy as f32 + 0.5, dd);
-                    pts.push((p, fb / dd));
-                }
-            }
-        }
-        if pts.len() < MIN_POINTS {
-            continue;
-        }
-        let mut depths: Vec<f32> = pts.iter().map(|p| p.1).collect();
-        depths.sort_by(f32::total_cmp);
-        // The front crowd: from the nearest tenth to a little past the median.
-        let near = depths[depths.len() / 10];
-        let mid = depths[depths.len() / 2];
-        let far = mid + (mid - near).max(0.15 * mid).max(0.2);
-        let crowd: Vec<&([f32; 3], f32)> = pts.iter().filter(|p| p.1 >= near && p.1 <= far).collect();
-        if crowd.len() < MIN_POINTS / 2 {
-            continue;
-        }
-        let n = crowd.len() as f32;
-        let (cx, cz) = (crowd.iter().map(|p| p.0[0]).sum::<f32>() / n, crowd.iter().map(|p| p.0[2]).sum::<f32>() / n);
-        let mut ys: Vec<f32> = crowd.iter().map(|p| p.0[1]).collect();
-        ys.sort_by(f32::total_cmp);
-        let foot = ys[ys.len() / 20];
-        out.push(ObjectSighting {
-            label: d.label.clone(),
-            score: d.confidence,
-            at: [cx, foot, cz],
-            size: [w / scale / fx * mid, h / scale / fy * mid],
-            bbox: d.bbox,
-        });
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,6 +131,9 @@ mod tests {
         let d = parse(body).unwrap();
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].bbox, [10.0, 20.0, 300.0, 150.0]);
+        assert!(d[0].kept());
+        assert!(!Detection { label: "person".into(), ..d[0].clone() }.kept());
+        assert!(!Detection { confidence: 0.1, ..d[0].clone() }.kept());
         let o = OcrClient::new("http://10.88.0.1:17890/v1/ocr/lines", "m").unwrap();
         let c = DetectClient::from_ocr(&o, DETECT_MODEL);
         assert_eq!((c.host.as_str(), c.port, c.path.as_str()), ("10.88.0.1", 17890, "/v1/detect/objects"));
