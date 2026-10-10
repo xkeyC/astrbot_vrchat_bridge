@@ -12,9 +12,8 @@
 //!   yaw), so a segment's votes add up even while the head turns, and the
 //!   front/back mirror smears while the true direction stays put.
 //! - **Vision** (a thread of its own, its own eye tap): players' nameplates
-//!   are placed in 3D (OCR, and the panorama's depth under their rays, as
-//!   the follower does; the follower's and the surveys' sightings come in
-//!   too), and each plate's outline is
+//!   are placed in 3D (OCR and stereo, as the follower does; the follower's
+//!   and the surveys' sightings come in too), and each plate's outline is
 //!   measured against the plate's own quiet look: the ring VRChat lights
 //!   round a speaking player's plate (`glow_stats`). The user camera's
 //!   orbit (`orbit`) adds plates read all round the bot: a bearing alone
@@ -46,6 +45,7 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use vrc_audio::{mirror_deg, wrap_deg, Block, Front, FrontParams, HrirTable, Hrtf, MixTarget, MonoMix, Ring, SegEvent, SphericalHead};
 use vrc_players::{OcrClient, Sighting};
+use vrc_vr::remote::FLOOR_Y;
 use vrc_vr::tap::{format, EyeFrame, EyeTap};
 use vrc_vr::Pose;
 
@@ -81,7 +81,8 @@ const PROJECT_FOR: Duration = Duration::from_secs(2);
 const LOOK_HOT: Duration = Duration::from_millis(250);
 const LOOK_QUIET: Duration = Duration::from_secs(10);
 /// OCR while someone speaks: at most this often, and not when the follower
-/// read the plates this recently.
+/// read the plates this recently. Stereo (SGM) after it only when a plate
+/// read is not placed recently enough to be projected.
 const OCR_HOT: Duration = Duration::from_secs(1);
 const OCR_FRESH: Duration = Duration::from_millis(600);
 /// Speech ended this recently still counts as hot (the glow lags).
@@ -110,7 +111,7 @@ const STUCK_LIT: Duration = Duration::from_secs(30);
 /// the candidates: this far from the head (tracking metres; only its
 /// bearing counts).
 const BEARING_ONLY_M: f32 = 2.5;
-/// A plate placed by the depth keeps its place when a bearing-only read agrees
+/// A plate placed by stereo keeps its place when a bearing-only read agrees
 /// within this (degrees).
 const BEARING_AGREES_DEG: f32 = 20.0;
 /// A placed player's plate text when no frame said how big (tracking
@@ -736,7 +737,7 @@ impl Speakers {
 
     /// A player's plate read with a bearing alone (the user camera's orbit:
     /// no distance), `yaw` in the tracking space's frame, at `at`; with the
-    /// plate's ring as that view saw it. A plate placed by the depth whose
+    /// plate's ring as that view saw it. A plate placed by stereo whose
     /// bearing agrees keeps its place (and counts as seen now); else the
     /// player is put BEARING_ONLY_M away that way.
     pub fn saw_bearing(&self, name: &str, yaw: f32, at: Instant, glow: Option<GlowStats>) {
@@ -817,13 +818,11 @@ impl Speakers {
                 Ok(Some(f)) => f,
                 _ => continue,
             };
-            // The plates are read off a pano frame only (the ones over the
-            // eyes and the lens's, placed in its depth; decision D42): the
-            // usual view (leased for a menu) has no depth to place them by.
             let due = !hot || read.is_none_or(|t| now.duration_since(t) >= OCR_HOT);
-            if let (Some(ocr), true, false, true) = (&ocr, due, fresh, vrc_pano::classify(&frame).is_pano()) {
+            if let (Some(ocr), true, false) = (&ocr, due, fresh) {
                 read = Some(now);
-                match self.read_plates_pano(&b, ocr) {
+                let read = self.read_plates(&b, ocr, &frame, &room, echo);
+                match read {
                     Ok(()) => continue,
                     Err(e) => tracing::debug!("speakers: reading plates failed: {e:#}"),
                 }
@@ -844,14 +843,35 @@ impl Speakers {
         }
     }
 
-    /// Reads the nameplates with the panorama on: the ones VRChat draws over
-    /// the eyes (measured there, `saw` with the frame) and the lens's of
-    /// the last second, placed in the panorama's depth (`panolook`).
-    fn read_plates_pano(&self, b: &Bridge, ocr: &OcrClient) -> Result<()> {
-        let room = crate::panolook::room(b);
-        let o = crate::panolook::LookOptions { lens_within: Duration::from_secs(1), ..Default::default() };
-        let l = crate::panolook::look(b, &room, Some(ocr), &o)?;
-        l.to_speakers(b, &b.social.whitelist_names());
+    /// Reads the nameplates in `frame` and measures their glow. They are
+    /// placed by stereo (the follower's way, and the costly part) only when
+    /// one read is not placed recently enough to be projected; else the
+    /// places stay as they are and the glow is measured where OCR read them.
+    fn read_plates(&self, b: &Bridge, ocr: &OcrClient, frame: &EyeFrame, room: &[(String, String)], echo: bool) -> Result<()> {
+        let rgb = frame.eye_rgb8(0)?;
+        let lines = ocr.lines_rgb(&rgb, frame.width as u16, frame.height as u16)?;
+        let names: Vec<String> = room.iter().map(|(_, n)| n.clone()).collect();
+        let read: Vec<(usize, [f32; 4])> = lines.iter().filter_map(|l| vrc_players::names::best_match(&l.text, &names).map(|(i, _)| (i, l.bbox))).collect();
+        if read.is_empty() {
+            return Ok(());
+        }
+        let now = Instant::now();
+        let mut st = self.state.lk();
+        if read.iter().all(|(i, _)| st.players.get(&names[*i]).is_some_and(|s| !s.bearing_only && now.saturating_duration_since(s.at) < PROJECT_FOR)) {
+            st.read_at = Some(now);
+            let view = View::eye(frame).context("a frame without its pixels")?;
+            for (i, bbox) in read {
+                if let Some(g) = glow_stats(&view, bbox) {
+                    self.plate_seen(&mut st, &names[i], g, LookFrom::Eye, now, echo, Some((view, bbox)), "read");
+                }
+            }
+            return Ok(());
+        }
+        drop(st);
+        let stereo = vrc_stereo::Stereo::from_frame(frame, vrc_stereo::match_scale(frame.width)).context("not an 8-bit frame")?;
+        let disp = stereo.disparity(&vrc_stereo::SgmParams::default());
+        let seen = vrc_players::sightings(frame, &stereo, &disp, &lines, &names, &b.social.whitelist_names(), FLOOR_Y);
+        self.saw(&seen, Some(frame));
         Ok(())
     }
 
@@ -869,7 +889,7 @@ impl Speakers {
     ///   going on, else the latest that ended within `since`.
     ///
     /// Then its player's bearing now if it was pinned on one; else someone
-    /// placed (by a look, the lens, the idle sweep) on the voice's side,
+    /// placed (by a look, the lens, the idle patrol) on the voice's side,
     /// front and back folded (`name` first: who the transcript says spoke);
     /// else its votes' peak (of a peak and its front/back mirror much alike,
     /// the side with a player).
@@ -897,7 +917,7 @@ impl Speakers {
             }
         }
         let peak = seg.world.peaks(NEAR_DEG, 20.0, 1).first().copied()?;
-        // Someone placed (by a look, the lens, the idle sweep) on the
+        // Someone placed (by a look, the lens, the idle patrol) on the
         // voice's side, front and back folded: the one the transcript names
         // first, else the nearest.
         let named = name.and_then(|n| cands.iter().find(|c| c.name == n)).filter(|c| side_match(std::slice::from_ref(*c), peak.0, seg.yaw0).is_some());
@@ -1111,7 +1131,7 @@ impl Speakers {
                     "distance_m": r2((s.tag[0] - head_pos[0]).hypot(s.tag[2] - head_pos[2])),
                     "age_s": r1(now.saturating_duration_since(s.at).as_secs_f32()),
                     "stale": now.saturating_duration_since(s.at) > SEEN_FOR || st.walked - s.walked > STALE_WALK_M,
-                    "placed_by": if s.bearing_only { "bearing" } else { "depth" },
+                    "placed_by": if s.bearing_only { "bearing" } else { "stereo" },
                     "glow": p.map(|p| json!({"on": p.on, "over": r3(p.over), "quiet": {"eye": p.base[0].map(r3), "orbit": p.base[1].map(r3)}})),
                 })
             })
@@ -2328,11 +2348,10 @@ mod tests {
 
     #[test]
     fn the_bot_turns_to_a_voice_only_when_idle() {
-        assert_eq!(attend_busy(false, false, false), None);
-        assert_eq!(attend_busy(true, false, false), Some("following"));
-        assert_eq!(attend_busy(true, true, true), Some("following"));
-        assert_eq!(attend_busy(false, true, false), Some("moving"));
-        assert_eq!(attend_busy(false, false, true), Some("menu"));
+        assert_eq!(attend_busy(false, false), None);
+        assert_eq!(attend_busy(true, false), Some("following"));
+        assert_eq!(attend_busy(true, true), Some("following"));
+        assert_eq!(attend_busy(false, true), Some("moving"));
     }
 
     #[test]
@@ -2484,7 +2503,7 @@ mod tests {
             assert!(c.bearing_only);
             assert!((yaw_to([0.0; 3], c.tag) - 90.0).abs() < 0.1, "{:?}", c.tag);
         }
-        // A depth place that agrees is kept; one that does not is replaced.
+        // A stereo place that agrees is kept; one that does not is replaced.
         s.place("Bob", [2.0, 0.0, -2.0]); // 45 degrees right
         s.saw_bearing("Bob", 50.0, now, None);
         assert!(!s.state.lk().players["Bob"].bearing_only);
@@ -2655,15 +2674,13 @@ fn side_match(cands: &[Cand], peak: f32, yaw0: f32) -> Option<&Cand> {
 }
 
 /// Why the bot may not turn to a voice now (`POST /v1/vr/attend`), or None
-/// when it may: only when idle. Following (or a follow paused for a move),
-/// moving, or the usual view leased (the VR menu): it stays as it is.
-pub fn attend_busy(following: bool, moving: bool, leased: bool) -> Option<&'static str> {
+/// when it may: only when idle. Following (or a follow paused for a move)
+/// or moving: it stays as it is.
+pub fn attend_busy(following: bool, moving: bool) -> Option<&'static str> {
     if following {
         Some("following")
     } else if moving {
         Some("moving")
-    } else if leased {
-        Some("menu")
     } else {
         None
     }

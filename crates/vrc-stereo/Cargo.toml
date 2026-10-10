@@ -1,0 +1,18 @@
+[package]
+name = "vrc-stereo"
+version = "0.1.0"
+description = "Stereo depth from the bot's two rendered eyes: census SGM, metric depth, point clouds"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rayon.workspace = true
+vrc-vr.workspace = true
+anyhow = { workspace = true, optional = true }
+# CUDA loaded at run time (no toolkit to build; none at run time: the CPU).
+cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-13000"], optional = true }
+
+[features]
+default = ["cuda"]
+cuda = ["dep:cudarc", "dep:anyhow"]

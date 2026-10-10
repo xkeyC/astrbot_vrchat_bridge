@@ -371,9 +371,10 @@ impl VrCore {
 
     // -- surveys and walks --------------------------------------------------------
 
-    /// Looks all around by `look` (`panolook::surveyor`: a pano frame).
-    pub fn survey(&mut self, whitelist: &[String], players: bool, look: &mut Look) -> Result<Value> {
-        let opts = SurveyOptions { players, ..Default::default() };
+    /// Looks: all around (`around`), else only ahead (and down at the feet);
+    /// by `look` (`vrc_nav::survey`: the head turned round, stereo).
+    pub fn survey(&mut self, whitelist: &[String], players: bool, around: bool, look: &mut Look) -> Result<Value> {
+        let opts = SurveyOptions { players, ahead: !around, ..Default::default() };
         let s = look(self.rig(whitelist)?, &opts, &[])?;
         if let Some(map) = &self.map {
             vrc_nav::observe(map, &s);
@@ -387,8 +388,8 @@ impl VrCore {
     }
 
     /// Walks to a place of the last look around or a bearing; `since`: the
-    /// stops when it was asked for ([`walk::stops`]). Then looks again (a
-    /// pano frame: all round).
+    /// stops when it was asked for ([`walk::stops`]). Then looks ahead (all
+    /// around with `around`).
     pub fn goto(&mut self, whitelist: &[String], input: &Value, since: u64, look: &mut Look) -> Result<Value> {
         // A place number of a look around the caller did not see (another
         // caller looked since) would lead elsewhere.
@@ -397,8 +398,17 @@ impl VrCore {
                 anyhow::ensure!(seen == self.serial, "the numbered places no longer hold (you moved, or looked again since): look again");
             }
         }
-        // A fresh survey to plan from (people move, and so may the bot).
-        let s = look(self.rig(whitelist)?, &SurveyOptions { players: false, ..Default::default() }, &[])?;
+        // A fresh survey to plan from (people move, and so may the bot): to a
+        // place or thing on the lasting map, with the beacon placing the bot
+        // on it, a look ahead (the map knows the way; no head turned round).
+        let by_name = input["to"].as_str().or(input["place"].as_str()).is_some();
+        let placed = self.map.as_ref().is_some_and(|m| m.lock().unwrap_or_else(std::sync::PoisonError::into_inner).ready());
+        let first = if by_name && placed {
+            SurveyOptions { players: false, ahead: true, down: false, ..Default::default() }
+        } else {
+            SurveyOptions { players: false, ..Default::default() }
+        };
+        let s = look(self.rig(whitelist)?, &first, &[])?;
         // How high the place is over the floor (up the stairs, not under).
         let mut target_up = None;
         // A place on the lasting map: stepped onto exactly, and faced as then.
@@ -443,7 +453,8 @@ impl VrCore {
             (Some(map), Some((goal, heading))) if report.reason.as_deref() != Some("stopped") => Some(self.settle(map, goal, heading, since)?),
             _ => None,
         };
-        let after = look(self.rig(whitelist)?, &SurveyOptions::default(), &[])?;
+        let around = input["around"].as_bool().unwrap_or(false);
+        let after = look(self.rig(whitelist)?, &SurveyOptions { ahead: !around, ..Default::default() }, &[])?;
         if let Some(map) = &self.map {
             vrc_nav::observe(map, &after);
         }
@@ -538,6 +549,57 @@ impl VrCore {
         });
         self.rig(&[])?.hmd.hold_still(false)?;
         frame
+    }
+
+    /// What the detector finds in the latest frame, placed (on the lasting
+    /// map too: map frame, when there is one). With `save`, the frame (left
+    /// eye, JPEG) and the answer go into that directory as
+    /// `<unix ms>.jpg` / `.json`: material to judge the detector by.
+    pub fn detect(&mut self, save: Option<std::path::PathBuf>) -> Result<Value> {
+        let frame = self.frame()?;
+        let rig = self.rig(&[])?;
+        let detect = rig.detect.clone().context("no detection service (it comes with the OCR's)")?;
+        let metres = match rig.osc.as_ref().map(|o| o.eye_height()) {
+            Some(Ok(h)) if h > 0.0 => h as f32 / (self.head_height - vrc_vr::remote::FLOOR_Y),
+            _ => 1.0,
+        };
+        let stereo = vrc_stereo::Stereo::from_frame(&frame, vrc_stereo::match_scale(frame.width)).context("not an 8-bit frame")?;
+        let disp = stereo.disparity(&vrc_stereo::SgmParams::default());
+        let rgb = frame.eye_rgb8(0)?;
+        let t = std::time::Instant::now();
+        let found = detect.detect_rgb(&rgb, frame.width, frame.height)?;
+        let took = t.elapsed();
+        let placed = vrc_players::objects::place(&frame, &stereo, &disp, &found);
+        let eye = [
+            (frame.views[0].pose.position[0] + frame.views[1].pose.position[0]) / 2.0,
+            (frame.views[0].pose.position[1] + frame.views[1].pose.position[1]) / 2.0,
+            (frame.views[0].pose.position[2] + frame.views[1].pose.position[2]) / 2.0,
+        ];
+        let now = std::time::Instant::now();
+        let on_map = |o: &vrc_players::ObjectSighting| {
+            let map = self.map.as_ref()?;
+            let n = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let rel = [(o.at[0] - eye[0]) * metres, (o.at[1] - vrc_vr::remote::FLOOR_Y) * metres, (o.at[2] - eye[2]) * metres];
+            Some(n.place(rel, now).map(|v| (v as f64 * 100.0).round() / 100.0))
+        };
+        let v = json!({
+            "took_ms": took.as_millis() as u64,
+            "model": detect.model,
+            "found": found.iter().map(|d| json!({"label": d.label, "confidence": (d.confidence as f64 * 100.0).round() / 100.0, "bbox": d.bbox.map(|v| v.round())})).collect::<Vec<_>>(),
+            "placed": placed.iter().map(|o| json!({
+                "label": o.label,
+                "distance_m": r2(((o.at[0] - eye[0]).hypot(o.at[2] - eye[2])) * metres),
+                "size_m": o.size.map(|v| r2(v * metres)),
+                "map": on_map(o),
+            })).collect::<Vec<_>>(),
+        });
+        if let Some(dir) = save {
+            std::fs::create_dir_all(&dir)?;
+            let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+            std::fs::write(dir.join(format!("{stamp}.jpg")), eye_jpeg(&frame, 0)?)?;
+            std::fs::write(dir.join(format!("{stamp}.json")), serde_json::to_vec_pretty(&v)?)?;
+        }
+        Ok(v)
     }
 
     /// What the position beacon says in the latest frame (both eyes), with
@@ -658,17 +720,6 @@ fn known_landmarks(landmarks: Vec<(String, &'static str, [f32; 3])>, p: [f32; 3]
         .collect()
 }
 
-/// A view out of a pano frame as JPEG: along world yaw `yaw` (the
-/// beacon's) and `pitch` (+ up), `fov` degrees wide, `width` square (as the
-/// eyes' usual view).
-pub fn view_jpeg(frame: &vrc_pano::PanoFrame, yaw: f32, pitch: f32, fov: f32, width: u32) -> Result<Vec<u8>> {
-    let w = width.clamp(64, 3840) as usize;
-    let rgb = frame.perspective(yaw, pitch, fov, w, w);
-    let mut jpeg = Vec::new();
-    jpeg_encoder::Encoder::new(&mut jpeg, 85).encode(&rgb, w as u16, w as u16, jpeg_encoder::ColorType::Rgb)?;
-    Ok(jpeg)
-}
-
 /// The left eye of `frame` as JPEG, `width` pixels wide (0: as is).
 pub fn eye_jpeg(frame: &EyeFrame, width: u32) -> Result<Vec<u8>> {
     let rgb = frame.eye_rgb8(0)?;
@@ -720,7 +771,7 @@ pub fn survey_json(serial: u64, s: &Survey) -> Value {
         let (dx, dz) = (p[0] - s.eye[0], p[2] - s.eye[2]);
         (r2(dx.hypot(dz) * s.metres), vrc_vr::scan::angle_diff(dx.atan2(-dz).to_degrees(), s.yaw).round())
     };
-    let mut v = json!({
+    let v = json!({
         "survey": serial,
         "candidates": s.candidates_json(),
         "players": s.players.iter().map(|p| {
@@ -745,14 +796,10 @@ pub fn survey_json(serial: u64, s: &Survey) -> Value {
         }).collect::<Vec<_>>(),
         "metres_per_unit": s.metres,
         "timings_ms": {
+            "scan": ms(s.timings.scan), "stereo": ms(s.timings.stereo),
             "ocr": ms(s.timings.ocr), "detect": ms(s.timings.detect), "map": ms(s.timings.map),
         },
     });
-    // Names read with nobody found under the plate: a direction alone.
-    v["named_bearings"] = json!(s.pano.bearings.iter().map(|(n, y)| json!({
-        "name": n,
-        "bearing_deg": vrc_vr::scan::angle_diff(*y, s.yaw).round(),
-    })).collect::<Vec<_>>());
     v
 }
 

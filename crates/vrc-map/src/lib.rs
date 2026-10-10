@@ -2,10 +2,9 @@
 //!
 //! Two layers, in world metres (the map's own frame, see [`nav`]):
 //!
-//! - **Seen**: depth points (the avatar's panorama) fused into columns of
-//!   voxels (10 cm across,
+//! - **Seen**: stereo points fused into columns of voxels (10 cm across,
 //!   5 cm high), each with how many points hit it (weighted by how near
-//!   they were seen: the depth's error grows with the distance)
+//!   they were seen: stereo's error grows with the square of the distance)
 //!   and how often a line of sight passed through it (a player who walked
 //!   off, a stray match: cleared). A column's runs of filled voxels give its
 //!   **surfaces**, each one a height something stands on with how much room
@@ -20,8 +19,8 @@
 //!   fell short. Marks fade: shut for a while, then doubtful (tried again
 //!   when the way round is long), then gone; walking through one clears it.
 //!
-//! Also **objects** (a sofa, a door...: a detector's boxes placed by the
-//! depth), merged by kind and place, and named **places**.
+//! Also **objects** (a sofa, a door...: a detector's boxes placed by
+//! stereo), merged by kind and place, and named **places**.
 //!
 //! [`plan`] walks the surfaces (and what was walked) by A*, [`register`]
 //! keeps the odometry on the map, [`store`] keeps a map per world on disk.
@@ -56,8 +55,8 @@ const RUN_SHARE: f32 = 0.25;
 /// Nearer than this (horizontally, world metres) to the eyes is the bot's
 /// own body and what it carries: left out (seen from farther, it is in).
 pub const SELF_RADIUS: f32 = 0.9;
-/// Points farther than this are too coarse to place (the depth's error
-/// grows with the distance: with stereo, some 0.5 m at 5 m, as first measured;
+/// Points farther than this are too coarse to place (stereo's error grows
+/// with the square of the distance: some 0.5 m at 5 m, as first measured;
 /// nearer looks fill in what lies farther as the bot walks).
 pub const MAX_RANGE: f32 = 5.0;
 /// Points this far over the eyes are left out (a ceiling far up); nearer,
@@ -188,7 +187,7 @@ impl Column {
 
     /// Its runs of filled voxels (near enough to be one thing: a floor, a
     /// wall, a table's top), lowest first; runs far weaker than the
-    /// column's strongest are the depth's strays (a floor's points scatter a
+    /// column's strongest are stereo's strays (a floor's points scatter a
     /// little up and down, and a few land together now and then), left out.
     pub fn runs(&self) -> Vec<Run> {
         let mut runs: Vec<Run> = Vec::new();
@@ -459,7 +458,7 @@ pub struct Observation {
 }
 
 impl Observation {
-    /// From tracking-space points (tracking units) of a frame: `eye` the
+    /// From tracking-space points (stereo units) of a frame: `eye` the
     /// eyes' middle, `floor` the floor's height there, `metres` world metres
     /// per unit.
     pub fn from_tracking(points: &[[f32; 3]], eye: [f32; 3], floor: f32, metres: f32, people: &[[f32; 3]], at: Instant) -> Observation {
@@ -789,7 +788,7 @@ pub(crate) mod tests {
     }
 
     /// A wall along x at `z`, from x0 to x1, from `base` up to `top`
-    /// (2.5 cm apart, about as densely as a look sees a wall a few metres off).
+    /// (2.5 cm apart, as densely as stereo sees a wall a few metres off).
     pub fn wall_x(pts: &mut Vec<[f32; 3]>, x: (f32, f32), z: f32, base: f32, top: f32) {
         let mut a = x.0 + 0.0125;
         while a < x.1 {

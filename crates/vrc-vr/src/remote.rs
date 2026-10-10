@@ -37,8 +37,8 @@ const LEFT_AT: usize = 136;
 const RIGHT_AT: usize = 256;
 
 /// The eyes' height above VRChat's floor in the tracking space with the
-/// head at Monado's default 1.6 m (measured 2026-10-05): the unit of the
-/// rest pose and the animation's distances.
+/// head at Monado's default 1.6 m (measured by stereo, see `docs/full-vr`
+/// D13): the unit of the rest pose and the animation's distances.
 pub const EYE_HEIGHT: f32 = 1.93;
 /// VRChat's floor in the tracking space: below Monado's (y = 0), where its
 /// height calibration put it for this avatar (stereo: -0.31..-0.32 with the
@@ -130,7 +130,7 @@ impl State {
     }
 
     /// Both hands raised behind the head as seen looking along `yaw_deg`:
-    /// out of that view, so only a mirror shows them.
+    /// out of that view, so only a mirror shows them (`vrc_scene::mirror`).
     pub fn hands_up_behind(&mut self, head: [f32; 3], yaw_deg: f32) {
         let (s, c) = yaw_deg.to_radians().sin_cos();
         // View frame: right = (c, 0, s), ahead = (s, 0, -c); behind is -ahead.

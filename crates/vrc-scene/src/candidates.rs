@@ -156,7 +156,7 @@ pub fn paths(map: &HeightMap, eye: [f32; 3], clearance: f32) -> (Vec<Option<u32>
     let (step, drop) = (map.params.step, map.params.drop);
 
     // Start from the cells around the eyes: the bot stands there, so they
-    // are its floor whatever the depth made of them (its own body, a coat or a
+    // are its floor whatever stereo made of them (its own body, a coat or a
     // tail reaching past `self_radius`, reads as raised ground).
     let mut dist: Vec<Option<u32>> = vec![None; n * n];
     let mut prev = vec![usize::MAX; n * n];

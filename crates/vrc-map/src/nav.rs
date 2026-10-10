@@ -54,7 +54,7 @@ const PLACE_ALL_ROUND_DEG: f32 = 5.0;
 /// A spawn within this of a known one is that one.
 const SAME_SPAWN_M: f32 = 1.5;
 /// A look is fitted only after the feet moved this far since the last one
-/// (standing, the odometry is right: a fit would only follow the depth's error,
+/// (standing, the odometry is right: a fit would only follow stereo's error,
 /// as first measured: 0.84 m of "corrections" in a look round on the spot),
 /// and by at most FIT_BASE plus FIT_SHARE of that way across (FIT_UP_SHARE
 /// up).

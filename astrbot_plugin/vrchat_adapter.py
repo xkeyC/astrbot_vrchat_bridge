@@ -279,12 +279,14 @@ def room_context(state: dict) -> str:
 
 
 VR_VIEW_DESCRIPTION = (
-    "Looks all around at once (your panorama) and shows it (its middle is where you face, its "
+    "Looks all around (a few seconds) and shows a panorama (its middle is where you face, its "
     "edges behind you) and a top-down map (you in the middle facing up; green floor, red "
     "obstacles, dark unknown), with numbered places (players found by their name tags, "
     "whitelisted friends marked; places to walk to, edges of what you have seen, raised tops to "
-    "jump onto), each with how far and which way. Look before every move.")
+    "jump onto), each with how far and which way. Look before every move. With around false: "
+    "only the view ahead (quicker).")
 VR_VIEW_PARAMS = {
+    "around": {"type": "boolean", "description": "Look all around (default true); false: only ahead."},
     "players": {"type": "boolean",
                 "description": "Read name tags to find players (default true; false is a little faster)."},
 }
@@ -293,7 +295,7 @@ VR_WALK_DESCRIPTION = (
     "short legs and looks again after each), to a place or thing on your map by name (to: "
     "however far, even out of sight: the way is planned on your map, round glass you bumped "
     "into before), or a distance a way (left, right, ahead, behind). Then shows you the view "
-    "all around.")
+    "ahead (all around with around).")
 VR_WALK_PARAMS = {
     "place": {"type": "integer", "description": "The place's number in your last view."},
     "to": {"type": "string",
@@ -305,9 +307,10 @@ VR_WALK_PARAMS = {
                 "description": "With side left or right: how far round from straight ahead (default 90)."},
     "distance": {"type": "number", "description": "With side: metres to walk (default 2)."},
     "pace": {"type": "string", "enum": ["walk", "run"], "description": "Walk (default) or run there."},
+    "around": {"type": "boolean", "description": "Look all around when there. Default: only ahead."},
 }
 # Replaces the last paragraph of ROOM_PROMPT when the voice model has the room's tools.
-ROOM_TOOLS_PROMPT = ("When you are addressed, answer briefly in the speaker's language, like a person in the room: spoken to in Chinese, say everything in Chinese, though your tools answer in English. Quick actions you do yourself with your tools, without delegating: gestures and moves of your whole body (vrchat_motion: wave, say bye, nod, shake your head, refuse with a hand, think, look around, turn round, a backflip, dance), sitting down, lying down on your back, a side or your front, and standing up again (vrchat_posture), a jump, a few steps or a turn (vrchat_step; told to run or hurry, pace run, else walk), stopping, writing in the chatbox, who is here, following someone in this room ('follow me', 'come with me') until told to stop, and while following: closer, farther, stay put ('wait here', 'don't move'), follow again. For a quick action call its tool at once, without weighing options, then say a few words (walking anywhere is not quick: it needs a look first, below). To see, vrchat_view: it looks all around and shows a panorama and a top-down map with numbered places (players by name, places to walk to, edges of what you have seen to look further from, raised tops to jump onto); its text says how far each is and which way (left or right of where you face). Before any walk (vrchat_walk_to, or vrchat_step with metres) look all around with vrchat_view and choose the way from what it shows: never walk blind. A turn on the spot, a jump or a gesture needs no look. To get somewhere, vrchat_walk_to the number nearest your goal (pace run when told to run or hurry); its result shows the view ahead: when your goal is not plainly there, vrchat_view again, then walk on, until you are there (within about 1.5 m); with someone to find, walk to their number. Exploring or finding a way (the stairs, a door, a way out, around the place): look all around, walk to the place or edge that leads furthest toward where it may be and where you have not been yet, look all around again, and go on. A wall, a corner or a dead end only means: look all around and take another way. Keep at it until you find it; give up only after about ten walks that got you no closer, and then say where you got. Words without a call end your turn and you stop where you are: until the task is done (you are there, up the stairs, out of the room), answer every result with the next call, never with a report. What you see tells you the next move, not the end: 'the stairs turn left' means turn left and go on up. Never say what you are going to do: do it. Wrong: answering '我站到沙发前，转向茶几。' or '我再转回去。' (no call: you stay where you are and nothing happens). Right: call vrchat_walk_to, then vrchat_step with turn, and only when it is all done say '好了，我在沙发前了。'. To sit on a sofa, a chair or a bench: walk right onto its seat (seats usually let you through), turn to face the way a person sitting there would (toward the table or the room: vrchat_step with turn), then vrchat_posture sit; moving again stands you up. Up stairs: walk to the highest step or landing you see (vrchat_walk_to its number, or vrchat_step forward), and at each landing look all around for where they go on. Your map remembers this world: where you walked, what stopped you (glass), places you named and things you saw (your looks list them under 'On your map'). To go to one, even far or out of sight, vrchat_walk_to with to = its name (a sofa you saw: to 'couch'); told to remember a spot ('记住这里是舞台'), vrchat_remember_place with that name. To recall when you last saw a friend, vrchat_last_seen. Told you stand on tiptoe or crouch, or to be taller or shorter, vrchat_height; your view or body stuck or wrong, vrchat_vr_reset. A mirror shows a reflection: places that seem to lie inside or behind a mirror are not real. Never walk into a portal (a frame showing another world). In a series of moves and looks write nothing between them, just the next call (no words on what you see or plan to do); speak once at the end: when you are there, or when you give up. Any text you write is spoken aloud: never write thoughts, plans or notes (not even in brackets). Do not describe what you see unless asked. Delegate real tasks (anything needing facts, lookups or work), and tell the speaker the result briefly.")
+ROOM_TOOLS_PROMPT = ("When you are addressed, answer briefly in the speaker's language, like a person in the room: spoken to in Chinese, say everything in Chinese, though your tools answer in English. Quick actions you do yourself with your tools, without delegating: gestures and moves of your whole body (vrchat_motion: wave, say bye, nod, shake your head, refuse with a hand, think, look around, turn round, a backflip, dance), sitting down, lying down on your back, a side or your front, and standing up again (vrchat_posture), a jump, a few steps or a turn (vrchat_step; told to run or hurry, pace run, else walk), stopping, writing in the chatbox, who is here, following someone in this room ('follow me', 'come with me') until told to stop, and while following: closer, farther, stay put ('wait here', 'don't move'), follow again. For a quick action call its tool at once, without weighing options, then say a few words (walking anywhere is not quick: it needs a look first, below). To see, vrchat_view: it looks all around and shows a panorama and a top-down map with numbered places (players by name, places to walk to, edges of what you have seen to look further from, raised tops to jump onto); its text says how far each is and which way (left or right of where you face). Before any walk (vrchat_walk_to, or vrchat_step with metres) look all around with vrchat_view and choose the way from what it shows: never walk blind. Walking to a place or thing on your map by its name (vrchat_walk_to with to) needs no look first: your map knows where you are and the way. A turn on the spot, a jump or a gesture needs no look. To get somewhere, vrchat_walk_to the number nearest your goal (pace run when told to run or hurry); its result shows the view ahead: when your goal is not plainly there, vrchat_view again, then walk on, until you are there (within about 1.5 m); with someone to find, walk to their number. Exploring or finding a way (the stairs, a door, a way out, around the place): look all around, walk to the place or edge that leads furthest toward where it may be and where you have not been yet, look all around again, and go on. A wall, a corner or a dead end only means: look all around and take another way. Keep at it until you find it; give up only after about ten walks that got you no closer, and then say where you got. Words without a call end your turn and you stop where you are: until the task is done (you are there, up the stairs, out of the room), answer every result with the next call, never with a report. What you see tells you the next move, not the end: 'the stairs turn left' means turn left and go on up. Never say what you are going to do: do it. Wrong: answering '我站到沙发前，转向茶几。' or '我再转回去。' (no call: you stay where you are and nothing happens). Right: call vrchat_walk_to, then vrchat_step with turn, and only when it is all done say '好了，我在沙发前了。'. To sit on a sofa, a chair or a bench: walk right onto its seat (seats usually let you through), turn to face the way a person sitting there would (toward the table or the room: vrchat_step with turn), then vrchat_posture sit; moving again stands you up. Up stairs: walk to the highest step or landing you see (vrchat_walk_to its number, or vrchat_step forward), and at each landing look all around for where they go on. Your map remembers this world: where you walked, what stopped you (glass), places you named and things you saw (your looks list them under 'On your map'). To go to one, even far or out of sight, vrchat_walk_to with to = its name (a sofa you saw: to 'couch'); told to remember a spot ('记住这里是舞台'), vrchat_remember_place with that name. To recall when you last saw a friend, vrchat_last_seen. Told you stand on tiptoe or crouch, or to be taller or shorter, vrchat_height; your view or body stuck or wrong, vrchat_vr_reset. A mirror shows a reflection: places that seem to lie inside or behind a mirror are not real. Never walk into a portal (a frame showing another world). In a series of moves and looks write nothing between them, just the next call (no words on what you see or plan to do); speak once at the end: when you are there, or when you give up. Any text you write is spoken aloud: never write thoughts, plans or notes (not even in brackets). Do not describe what you see unless asked. Delegate real tasks (anything needing facts, lookups or work), and tell the speaker the result briefly.")
 
 
 REMEMBER_DESCRIPTION = ("Remembers where you stand now, and the way you face, on your map under a name "
@@ -474,6 +477,8 @@ def vr_goto_body(a: dict) -> dict:
         raise RuntimeError("give a place number, a name on your map (to), or a side")
     if a.get("pace") in ("walk", "run"):
         body["pace"] = a["pace"]
+    if a.get("around"):
+        body["around"] = True
     return body
 
 
@@ -603,29 +608,30 @@ class VRChatPlatformAdapter(Platform):
         return {"Authorization": f"Bearer {self.token}"}
 
     async def vr_survey(self, players: bool = True, who: str = "voice",
-                        with_map: bool = True) -> tuple[dict, bytes, bytes | None]:
-        """Looks all around (one pano frame): the numbered places and players,
-        the numbered panorama (JPEG) and, ``with_map``, the map (PNG), all of
-        the same look."""
+                        around: bool = False) -> tuple[dict, bytes, bytes | None]:
+        """Looks ahead (all around with ``around``): the numbered places and
+        players, the numbered view or panorama (JPEG) and, all around, the
+        map (PNG), all of the same look."""
         async with self._moving:
-            data = await self._call("POST", "/v1/vr/survey", {"players": players}, timeout=60)
+            data = await self._call("POST", "/v1/vr/survey", {"players": players, "around": around}, timeout=60)
             self._seen[who] = data.get("survey")
-            return data, *await self._survey_pictures(with_map)
+            return data, *await self._survey_pictures(around)
 
     async def vr_goto(self, body: dict, who: str = "voice") -> tuple[dict, bytes, bytes | None]:
         """Walks to a place of the last look ``who`` saw, or by bearing and
-        distance; how it went, and the new look's panorama (no map)."""
+        distance; how it went, and the new look's pictures (ahead, or all
+        around with ``around`` in ``body``)."""
         async with self._moving:
             if "candidate" in body and self._seen.get(who) is not None:
                 body = {**body, "survey": self._seen[who]}
             data = await self._call("POST", "/v1/vr/goto", body, timeout=150)
             self._seen[who] = data["after"].get("survey")
-            return data, *await self._survey_pictures(False)
+            return data, *await self._survey_pictures(bool(body.get("around")))
 
-    async def _survey_pictures(self, with_map: bool) -> tuple[bytes, bytes | None]:
-        """The last look's panorama, and ``with_map`` its map."""
+    async def _survey_pictures(self, around: bool) -> tuple[bytes, bytes | None]:
+        """The last look's view or panorama, and all around its map."""
         pano = await self._call("GET", "/v1/vr/survey/pano.jpg")
-        return pano, (await self._call("GET", "/v1/vr/survey/map.png")) if with_map else None
+        return pano, (await self._call("GET", "/v1/vr/survey/map.png")) if around else None
 
     def _in_turn(self, method: str, path: str) -> asyncio.Lock | contextlib.nullcontext:
         """What a call to ``path`` waits for: the moves before it finished
@@ -876,7 +882,7 @@ class VRChatPlatformAdapter(Platform):
         if not turn and not meters:
             return words, None
         try:
-            data, pano, _ = await self.vr_survey(True, who=who, with_map=False)
+            data, pano, _ = await self.vr_survey(True, who=who, around=False)
         except Exception as exc:  # noqa: BLE001 - the step itself went fine
             return f"{words} (No view ahead: {exc})", None
         return f"{words} Now ahead: {survey_words(data)}", pano
@@ -978,7 +984,7 @@ class VRChatPlatformAdapter(Platform):
             return "Here: " + ", ".join(names) if names else "Nobody else is here."
 
         async def view(a: dict) -> list[dict]:
-            data, pano, top = await self.vr_survey(bool(a.get("players", True)))
+            data, pano, top = await self.vr_survey(bool(a.get("players", True)), around=bool(a.get("around", True)))
             return pictures(survey_words(data), pano, top)
 
         async def walk_to(a: dict) -> list[dict]:

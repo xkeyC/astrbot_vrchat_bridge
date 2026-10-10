@@ -130,15 +130,16 @@ class VRChatPlugin(Star):
         return mcp.types.CallToolResult(content=content)
 
     @llm_tool("vrchat_view")
-    async def vrchat_view(self, event: AstrMessageEvent, players: bool = True):
-        """看一眼四周（一帧全景，不用转头），返回全景图（中间是正前方，两边是身后）和俯视地图（你在中间、朝上；绿色地面、红色障碍、暗色未知），带编号地点（玩家按名牌认出，白名单好友标出；可走的地面、已见区域的边缘、可跳上去的高台），各带距离和方位（相对正前方，正数在右）。每次移动（vrchat_walk_to、vrchat_step）前都先用它看一圈，再按看到的选路；用 vrchat_walk_to 走到某个编号。
+    async def vrchat_view(self, event: AstrMessageEvent, around: bool = True, players: bool = True):
+        """原地环视一圈（要几秒），返回全景图（中间是正前方，两边是身后）和俯视地图（你在中间、朝上；绿色地面、红色障碍、暗色未知），带编号地点（玩家按名牌认出，白名单好友标出；可走的地面、已见区域的边缘、可跳上去的高台），各带距离和方位（相对正前方，正数在右）。每次移动（vrchat_walk_to、vrchat_step）前都先用它看一圈，再按看到的选路；用 vrchat_walk_to 走到某个编号。around 为 false 时只看正前方（快）。
 
         Args:
+            around(boolean): 是否环视一圈（默认 true；false 只看正前方）。
             players(boolean): 是否读名牌找玩家（默认 true；false 稍快）。
         """
 
         async def look(adapter):
-            data, pano, top = await adapter.vr_survey(bool(players), who="text")
+            data, pano, top = await adapter.vr_survey(bool(players), who="text", around=bool(around))
             return survey_words(data), pano, top
 
         return await self._vr(event, look)
@@ -146,8 +147,8 @@ class VRChatPlugin(Star):
     @llm_tool("vrchat_walk_to")
     async def vrchat_walk_to(self, event: AstrMessageEvent, place: int = -1, side: str = "",
                              degrees: float = 0.0, distance: float = 0.0, pace: str = "walk",
-                             to: str = ""):
-        """走到上一次 vrchat_view 的某个编号地点（绕开障碍、分段走）；或按名字走到地图上记住的地点或见过的物体（to：再远、看不见也行，按地图规划路线，绕开以前撞过的玻璃）；或按方位走一段距离。走完返回新的全景图和编号地点。出发前先用 vrchat_view 环顾四周，它的结果里"On your map"列出地图上记得的地点和物体。
+                             around: bool = False, to: str = ""):
+        """走到上一次 vrchat_view 的某个编号地点（绕开障碍、分段走）；或按名字走到地图上记住的地点或见过的物体（to：再远、看不见也行，按地图规划路线，绕开以前撞过的玻璃）；或按方位走一段距离。走完返回正前方的新画面和编号地点（around 为 true 时返回环视全景图和地图）。按编号或方位走之前先用 vrchat_view 环顾四周（按名字走到地图上的地点或物体不用先看，地图知道路），它的结果里"On your map"列出地图上记得的地点和物体。
 
         Args:
             place(number): 上一次环视里的地点编号；不按编号走时留空（-1）。
@@ -156,11 +157,12 @@ class VRChatPlugin(Star):
             degrees(number): 配合 side 为 left / right：从正前方往那边偏多少度（默认 90）。
             distance(number): 配合 side：走多少米（默认 2）。
             pace(string): walk（走，默认）或 run（跑）。
+            around(boolean): 到了以后是否环视一圈（默认 false，只看前方）。
         """
 
         async def walk(adapter):
             body = vr_goto_body({"place": place if place >= 1 else None, "to": to, "side": side, "degrees": degrees,
-                                 "distance": distance, "pace": pace})
+                                 "distance": distance, "pace": pace, "around": around})
             data, pano, top = await adapter.vr_goto(body, who="text")
             return goto_words(data) + " " + survey_words(data["after"]), pano, top
 

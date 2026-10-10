@@ -17,7 +17,7 @@ use crate::{cell_of, turn, Observation, WorldMap, CELL};
 /// Wall points: higher than this over the feet, up to a bit over the eyes.
 const WALL_FROM: f32 = 0.4;
 const WALL_OVER_EYES: f32 = 0.3;
-/// Points used: from this far to this far (the depth is fine near).
+/// Points used: from this far to this far (stereo is fine near).
 const NEAR: f32 = 1.0;
 const FAR: f32 = 4.0;
 const FLOOR_FAR: f32 = 3.5;

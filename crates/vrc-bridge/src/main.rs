@@ -31,9 +31,7 @@ mod mapping;
 mod motion;
 mod game;
 mod orbit;
-mod panolook;
-mod people;
-mod pano;
+mod patrol;
 mod sightings;
 mod social;
 mod speaker;
@@ -81,11 +79,6 @@ impl<T> Lock<T> for std::sync::Mutex<T> {
     }
 }
 
-/// The view ahead out of the panorama (degrees across): the eyes' own.
-const FORWARD_FOV_DEG: f32 = 100.0;
-/// Menu work over HTTP (hands, buttons, a screenshot of the usual view)
-/// holds the usual view this long after each call.
-const MENU_HOLD: Duration = Duration::from_secs(20);
 
 const LOG_DIR: &str =
     "~/.local/share/Steam/steamapps/compatdata/438100/pfx/drive_c/users/steamuser/AppData/LocalLow/VRChat/VRChat";
@@ -174,13 +167,6 @@ pub struct Args {
     /// mode it shows the user camera's view (`/v1/vr/usercam`).
     #[arg(long, default_value = "1280x720+0,0")]
     pub desktop_grab: String,
-    /// The avatar's panorama rig (OSC `Pano`, docs/full-vr/avatar-panorama.md,
-    /// decision D36): `auto` (the default: on while in a world, unless the
-    /// avatar shows no rig within a few seconds: asked again every minute
-    /// and on each world joined), `on` (on from the start, kept on), `off`
-    /// (the bridge turns it on only when asked: `POST /v1/vr/pano`).
-    #[arg(long, value_enum, default_value = "auto")]
-    pub pano: pano::Setting,
 }
 
 #[derive(Subcommand, Clone, Debug)]
@@ -232,15 +218,6 @@ async fn main() -> Result<()> {
         std::thread::spawn(move || anim.run(b));
     }
     {
-        let (pano, b) = (bridge.pano.clone(), bridge.clone());
-        std::thread::Builder::new().name("pano".into()).spawn(move || {
-            pano.run(move || {
-                let g = b.game.lk();
-                g.running && !g.instance.is_empty()
-            })
-        })?;
-    }
-    {
         // Every movement input goes through the user camera's lens first
         // (its flying would take the walk): the one choke point.
         let orbit = bridge.orbit.clone();
@@ -249,8 +226,8 @@ async fn main() -> Result<()> {
         std::thread::Builder::new().name("usercam-orbit".into()).spawn(move || orbit.run(b))?;
         let (orbit, b) = (bridge.orbit.clone(), bridge.clone());
         std::thread::Builder::new().name("usercam-names".into()).spawn(move || orbit.sightings(b))?;
-        let (people, b) = (bridge.people.clone(), bridge.clone());
-        std::thread::Builder::new().name("idle-sweep".into()).spawn(move || people.run(b))?;
+        let (patrol, b) = (bridge.patrol.clone(), bridge.clone());
+        std::thread::Builder::new().name("idle-patrol".into()).spawn(move || patrol.run(b))?;
     }
 
     let app = Router::new()
@@ -286,7 +263,7 @@ async fn main() -> Result<()> {
         .route("/v1/vr/usercam/sweep", post(vr_usercam_sweep))
         .route("/v1/vr/usercam/names", get(vr_usercam_names))
         .route("/v1/vr/usercam/look", post(vr_usercam_look))
-        .route("/v1/vr/people", get(vr_people))
+        .route("/v1/vr/patrol", get(vr_patrol))
         .route("/v1/speakers", get(speakers_status))
         .route("/v1/speakers/record", post(speakers_record))
         .route("/v1/motion", get(motion_status).post(motion_play))
@@ -295,9 +272,7 @@ async fn main() -> Result<()> {
         .route("/v1/vr/survey/pano.jpg", get(vr_pano))
         .route("/v1/vr/survey/map.png", get(vr_map))
         .route("/v1/vr/beacon", get(vr_beacon))
-        .route("/v1/vr/pano", get(vr_pano_status).post(vr_pano_set))
-        .route("/v1/vr/pano.jpg", get(vr_pano_jpg))
-        .route("/v1/vr/pano/points", get(vr_pano_points))
+        .route("/v1/vr/detect", post(vr_detect))
         .route("/v1/map", get(map_status))
         .route("/v1/map.png", get(map_png))
         .route("/v1/map/save", post(map_save))
@@ -536,12 +511,6 @@ async fn follow_status(State(b): State<App>) -> Json<Value> {
 }
 
 async fn follow(State(b): State<App>, Body(body): Body) -> Reply {
-    // The follow's settings (`{"settings": {"kept_s": 7}}`): changed, the
-    // follow (if any) goes on.
-    if let Some(change) = body.get("settings") {
-        b.follower.set(change)?;
-        return Ok(Json(b.follower.status()));
-    }
     if !body["stop"].as_bool().unwrap_or(false) {
         let_go_of_motion(&b).await;
     }
@@ -613,33 +582,12 @@ async fn anim_tune(State(b): State<App>, Body(body): Body) -> Reply {
     Ok(Json(serde_json::to_value(p)?))
 }
 
-/// What the bot sees ahead (JPEG): `width`, `pitch` (+ up). With the
-/// panorama on: the view ahead out of it (100 degrees, square, as the
-/// eyes'), the head left alone; `normal=1`: the eyes' usual view, the
-/// panorama put aside a moment (a lease).
+/// What the bot sees ahead (JPEG): `width`, `pitch` (+ up).
 async fn screenshot(State(b): State<App>, Query(q): Query<std::collections::HashMap<String, String>>) -> std::result::Result<Response, Fail> {
     b.require_game()?;
     let width: u32 = q.get("width").and_then(|w| w.parse().ok()).unwrap_or(0).min(3840);
     let pitch: Option<f32> = q.get("pitch").and_then(|p| p.parse().ok()).filter(|p: &f32| p.is_finite());
-    let normal = q.get("normal").is_some_and(|v| v == "1" || v == "true");
-    if !normal && b.pano.usable() {
-        let pano = b.pano.clone();
-        let made = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
-            let f = pano.frame()?;
-            vr::view_jpeg(&f, f.head.yaw, pitch.unwrap_or(0.0), FORWARD_FOV_DEG, if width == 0 { 960 } else { width })
-        })
-        .await?;
-        match made {
-            Ok(jpeg) => return Ok(([("Content-Type", "image/jpeg")], jpeg).into_response()),
-            Err(e) => tracing::info!("screenshot: no view out of the panorama ({e:#}): the eyes"),
-        }
-    }
-    if normal {
-        b.pano.hold_normal(MENU_HOLD);
-    }
-    let jpeg = on_headset(&b, move |vr, b| {
-        // The usual view asked for: the panorama off while the frame is taken.
-        let _lease = if normal { Some(b.pano.normal_view(Duration::from_secs(2))?) } else { None };
+    let jpeg = on_headset(&b, move |vr, _| {
         let frame = match pitch {
             Some(pitch) => vr.frame_looking(pitch)?,
             None => vr.frame()?,
@@ -706,11 +654,15 @@ async fn game_stop(State(_b): State<App>) -> Reply {
 async fn vr_survey(State(b): State<App>, Body(body): Body) -> Reply {
     let_go_of_motion(&b).await;
     let players = body["players"].as_bool().unwrap_or(true);
-    // (A look is one pano frame, all round: `around` is no longer asked.)
+    // All around (the default here), or only ahead.
+    let around = body["around"].as_bool().unwrap_or(true);
+    // The scan turns the head, and a follow walks where the head looks.
     b.take_over();
     let whitelist = b.social.whitelist_names();
     let result = on_headset(&b, move |vr, b| {
-        vr.survey(&whitelist, players, &mut panolook::surveyor(b))
+        let v = vr.survey(&whitelist, players, around, &mut vrc_nav::survey)?;
+        survey_to_speakers(vr, b);
+        Ok(v)
     })
     .await;
     b.idle_later();
@@ -726,6 +678,16 @@ async fn vr_survey(State(b): State<App>, Body(body): Body) -> Reply {
     Ok(Json(v))
 }
 
+/// The players a survey placed, for the speaker tracker (with the frame
+/// each was read from: their plates' glow).
+fn survey_to_speakers(vr: &vr::VrCore, b: &App) {
+    let Some(s) = vr.survey.as_ref() else { return };
+    for p in &s.players {
+        let frame = s.shots.iter().find(|shot| shot.frame.capture_ns == p.seen_ns).map(|shot| &shot.frame);
+        b.speaker.saw(std::slice::from_ref(p), frame);
+    }
+}
+
 async fn vr_goto(State(b): State<App>, Body(body): Body) -> Reply {
     let_go_of_motion(&b).await;
     b.require_game()?;
@@ -733,7 +695,9 @@ async fn vr_goto(State(b): State<App>, Body(body): Body) -> Reply {
     let whitelist = b.social.whitelist_names();
     let since = vrc_vr::walk::stops();
     let result = on_headset(&b, move |vr, b| {
-        vr.goto(&whitelist, &body, since, &mut panolook::surveyor(b))
+        let v = vr.goto(&whitelist, &body, since, &mut vrc_nav::survey)?;
+        survey_to_speakers(vr, b);
+        Ok(v)
     })
     .await;
     b.idle_later();
@@ -778,8 +742,7 @@ async fn vr_attend(State(b): State<App>, Body(body): Body) -> Reply {
     }
     let following = !b.follower.is_idle() || !b.room_state()["takeover"].is_null();
     let moving = b.mapping.moved_within(Duration::from_secs(1));
-    let leased = b.pano.status()["leases"].as_u64().unwrap_or(0) > 0;
-    if let Some(busy) = speaker::attend_busy(following, moving, leased) {
+    if let Some(busy) = speaker::attend_busy(following, moving) {
         return Ok(Json(json!({"ok": false, "reason": "busy", "busy": busy})));
     }
     let Some(src) = b.speaker.source(since, name, ended_first) else {
@@ -795,130 +758,18 @@ async fn vr_attend(State(b): State<App>, Body(body): Body) -> Reply {
 
 // -- the lasting map -----------------------------------------------------------------
 
+/// Things in the latest frame of the eyes; `{"save": true}` keeps the
+/// frame and the answer (`detect/` next to the token) to judge the detector by.
+async fn vr_detect(State(b): State<App>, Body(body): Body) -> Reply {
+    let save = body["save"].as_bool().unwrap_or(false).then(|| {
+        game::expand(&b.args.token_file).parent().map(|p| p.join("detect")).unwrap_or_else(|| "detect".into())
+    });
+    Ok(Json(on_headset(&b, move |vr, _| vr.detect(save)).await?))
+}
+
 /// The position beacon in the latest frame of the eyes.
 async fn vr_beacon(State(b): State<App>) -> Reply {
     Ok(Json(on_headset(&b, |vr, _| vr.beacon()).await?))
-}
-
-// -- the panorama rig -----------------------------------------------------------------
-
-/// The rig: wanted, sent, what the eyes showed last, the last code, the
-/// last frame decoded. Looks at the latest frame first (`?peek=1`: not).
-async fn vr_pano_status(State(b): State<App>, Query(q): Query<std::collections::HashMap<String, String>>) -> Reply {
-    if !q.get("peek").is_some_and(|v| v == "1" || v == "true") {
-        let p = b.pano.clone();
-        let looked = tokio::task::spawn_blocking(move || p.observe_now().map(|_| ())).await?;
-        if let Err(e) = looked {
-            let mut v = b.pano.status();
-            v["error"] = json!(format!("{e:#}"));
-            return Ok(Json(v));
-        }
-    }
-    Ok(Json(b.pano.status()))
-}
-
-/// `{"on": true}`: wants the rig on (off: `false`), then waits (1.5 s at
-/// most) for the eyes to show it so.
-async fn vr_pano_set(State(b): State<App>, Body(body): Body) -> Reply {
-    let on = body["on"].as_bool().context("on: true or false")?;
-    b.pano.want_pano(on);
-    let p = b.pano.clone();
-    tokio::task::spawn_blocking(move || {
-        let since = std::time::Instant::now();
-        while since.elapsed() < Duration::from_millis(1500) {
-            if let Ok((_, seen)) = p.observe_now() {
-                if seen.is_pano() == on && since.elapsed() >= Duration::from_millis(150) {
-                    break;
-                }
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    })
-    .await?;
-    Ok(Json(b.pano.status()))
-}
-
-/// The latest pano frame as JPEG: `kind` `color` (default: the
-/// equirectangular panorama, the head's heading in the middle), `depth`
-/// (the same, the depth coloured: near red, far blue, none black) or
-/// `tiles` (the six faces as the eyes hold them, colour left of depth);
-/// `width` (default 2048; tiles: 1920).
-async fn vr_pano_jpg(State(b): State<App>, Query(q): Query<std::collections::HashMap<String, String>>) -> std::result::Result<Response, Fail> {
-    let kind = q.get("kind").map_or("color", |k| k.as_str()).to_string();
-    let width: usize = q.get("width").and_then(|w| w.parse().ok()).unwrap_or(0);
-    let p = b.pano.clone();
-    let jpeg = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
-        let f = p.frame()?;
-        let (w, h, rgb) = match kind.as_str() {
-            "color" | "colour" | "depth" => {
-                let e = f.heading_equirect(if width == 0 { 2048 } else { width.clamp(256, 4096) });
-                let rgb = if kind == "depth" { vrc_pano::depth_rgb(&e.range, f.code.zmin, f.code.zmax) } else { e.pano.rgb };
-                (e.pano.width, e.pano.height, rgb)
-            }
-            "tiles" => {
-                let (w, h, rgb) = f.tiles_rgb();
-                vrc_pano::downscale(&rgb, w, h, if width == 0 { 1920 } else { width.clamp(256, w) })
-            }
-            other => bail!("kind is color, depth or tiles, not {other}"),
-        };
-        let mut jpeg = Vec::new();
-        jpeg_encoder::Encoder::new(&mut jpeg, 85).encode(&rgb, w as u16, h as u16, jpeg_encoder::ColorType::Rgb)?;
-        Ok(jpeg)
-    })
-    .await??;
-    Ok(([("Content-Type", "image/jpeg")], jpeg).into_response())
-}
-
-/// World points of the latest pano frame, every `step`-th pixel (default
-/// 16) of every face: JSON (`{"points": [[x, y, z, r, g, b], ...]}`, the
-/// map's axes: x, y, -z of Unity's) or `format=ply` (ASCII, Unity's axes
-/// as they are). At most 200k points.
-async fn vr_pano_points(State(b): State<App>, Query(q): Query<std::collections::HashMap<String, String>>) -> std::result::Result<Response, Fail> {
-    let step: u32 = q.get("step").and_then(|v| v.parse().ok()).unwrap_or(16).clamp(1, 256);
-    let ply = q.get("format").is_some_and(|f| f == "ply");
-    let p = b.pano.clone();
-    let (f, pts) = tokio::task::spawn_blocking(move || -> Result<_> {
-        let f = p.frame()?;
-        let mut pts = f.points(step);
-        pts.truncate(200_000);
-        Ok((f, pts))
-    })
-    .await??;
-    if ply {
-        let mut out = format!(
-            "ply\nformat ascii 1.0\ncomment vrc-pano: Unity's world, metres; rig yaw {:.2}\nelement vertex {}\nproperty float x\nproperty float y\nproperty float z\nproperty uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n",
-            f.code.rig_yaw,
-            pts.len()
-        );
-        for q in &pts {
-            // The UI's colour (unknown): magenta.
-            let c = q.rgb.unwrap_or([255, 0, 255]);
-            out.push_str(&format!("{:.3} {:.3} {:.3} {} {} {}\n", q.world[0], q.world[1], q.world[2], c[0], c[1], c[2]));
-        }
-        return Ok(([("Content-Type", "text/plain")], out).into_response());
-    }
-    let round = |v: f32| (v as f64 * 1000.0).round() / 1000.0;
-    let list: Vec<Value> = pts
-        .iter()
-        .map(|q| {
-            let m = q.map();
-            match q.rgb {
-                Some(c) => json!([round(m[0]), round(m[1]), round(m[2]), c[0], c[1], c[2]]),
-                // The UI's colour: unknown.
-                None => json!([round(m[0]), round(m[1]), round(m[2]), null, null, null]),
-            }
-        })
-        .collect();
-    Ok(Json(json!({
-        "tap_seq": f.tap_seq,
-        "position": f.code.position_map(),
-        "rig_yaw": f.code.rig_yaw,
-        "head_yaw": f.head.yaw,
-        "step": step,
-        "axes": "map: x, y, -z of Unity's world (metres)",
-        "points": list,
-    }))
-    .into_response())
 }
 
 async fn map_status(State(b): State<App>) -> Json<Value> {
@@ -1024,16 +875,14 @@ async fn vr_reset(State(b): State<App>) -> Reply {
     Ok(Json(json!({"ok": true, "facing_deg": yaw.round(), "head_height": cm(b.anim.params().head_height), "recentered": recentered})))
 }
 
-/// The corridor ahead as the follower sees it (tuning): `yaw` (tracking)
-/// to look along another way than the head's. From the latest pano frame.
+/// The corridor ahead as the follower sees it (tuning): `yaw` to look along
+/// another way than the head's.
 async fn vr_corridor(State(b): State<App>, Query(q): Query<std::collections::HashMap<String, String>>) -> Reply {
     let yaw: Option<f32> = q.get("yaw").and_then(|v| v.parse().ok()).filter(|y: &f32| y.is_finite());
-    let v = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
-        let (points, eye, metres, floor, head_yaw) = panolook::depth_now(&b)?;
-        Ok(follow::corridor_report(&points, eye, yaw.unwrap_or(head_yaw), metres, floor))
-    })
-    .await??;
-    Ok(Json(v))
+    let height = b.osc_query().and_then(|o| o.eye_height()).unwrap_or(0.0) as f32;
+    let metres = if height > 0.0 { height / (b.anim.params().head_height - vrc_vr::remote::FLOOR_Y) } else { 1.0 };
+    let frame = on_headset(&b, |vr, _| vr.frame()).await?;
+    Ok(Json(tokio::task::spawn_blocking(move || follow::corridor_report(&frame, yaw, metres)).await??))
 }
 
 async fn vr_pano(State(b): State<App>) -> std::result::Result<Response, Fail> {
@@ -1104,9 +953,6 @@ async fn vr_set_trackers(State(b): State<App>, Body(body): Body) -> Reply {
 /// dragged by moving the hand in small steps while it holds.
 async fn vr_hand(State(b): State<App>, Body(body): Body) -> Reply {
     let_go_of_motion(&b).await;
-    // Hands at work: the VR menu, read in the usual view (several calls:
-    // held a while).
-    b.pano.hold_normal(MENU_HOLD);
     use std::sync::atomic::Ordering;
     if body["release"].as_bool() == Some(true) {
         b.anim.manual_hands.store(false, Ordering::Relaxed);
@@ -1165,10 +1011,6 @@ async fn vr_input(State(b): State<App>, Body(body): Body) -> Reply {
         return Err(anyhow::anyhow!("name: an /input/ button").into());
     }
     let address = format!("/input/{name}");
-    if name.contains("Menu") {
-        // The VR menu: read in the usual view.
-        b.pano.hold_normal(MENU_HOLD);
-    }
     let press = Duration::from_millis(num(&body, "press_ms", 150.0).clamp(20.0, 5000.0) as u64);
     // A movement input waits at the move gate a moment (the user camera's lens).
     let sent = address.clone();
@@ -1312,12 +1154,9 @@ async fn vr_usercam(State(b): State<App>, Body(body): Body) -> Reply {
 /// `?since_ms=10000` (at most 60 s): each with its bearing from the head
 /// (world, tracking and off the head's yaw), the lens (orbit or travel)
 /// and the plate's ring score.
-/// The people near the bot (`people`, D39): name, place (world and
-/// tracking), bearing and distance from the head, when last placed and
-/// named, how; and the idle sweep's schedule.
-async fn vr_people(State(b): State<App>) -> Json<Value> {
-    let every = b.usercam.settings.lk().orbit.idle_sweep_s;
-    Json(b.people.status(every))
+/// The idle patrol (D45): when it last went, what it read, why it skipped.
+async fn vr_patrol(State(b): State<App>) -> Json<Value> {
+    Json(b.patrol.status())
 }
 
 async fn vr_usercam_names(State(b): State<App>, Query(q): Query<std::collections::HashMap<String, String>>) -> Json<Value> {

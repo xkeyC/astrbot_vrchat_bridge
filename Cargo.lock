@@ -327,6 +327,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cudarc"
+version = "0.19.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7359bf1de037ddada72729c3acec9b040f3468400c6e9e740b01ba0cd2e89562"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
 name = "data-encoding"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1879,6 +1888,10 @@ dependencies = [
  "anyhow",
  "clap",
  "png",
+ "serde_json",
+ "vrc-nav",
+ "vrc-scene",
+ "vrc-stereo",
  "vrc-vr",
 ]
 
@@ -1912,9 +1925,9 @@ dependencies = [
  "vrc-audio",
  "vrc-map",
  "vrc-nav",
- "vrc-pano",
  "vrc-players",
  "vrc-scene",
+ "vrc-stereo",
  "vrc-vr",
 ]
 
@@ -1929,20 +1942,9 @@ dependencies = [
  "anyhow",
  "serde_json",
  "vrc-map",
- "vrc-pano",
  "vrc-players",
  "vrc-scene",
- "vrc-vr",
-]
-
-[[package]]
-name = "vrc-pano"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "png",
- "rayon",
- "vrc-scene",
+ "vrc-stereo",
  "vrc-vr",
 ]
 
@@ -1953,11 +1955,28 @@ dependencies = [
  "anyhow",
  "jpeg-encoder",
  "serde_json",
+ "vrc-stereo",
+ "vrc-vr",
 ]
 
 [[package]]
 name = "vrc-scene"
 version = "0.1.0"
+dependencies = [
+ "rayon",
+ "vrc-stereo",
+ "vrc-vr",
+]
+
+[[package]]
+name = "vrc-stereo"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cudarc",
+ "rayon",
+ "vrc-vr",
+]
 
 [[package]]
 name = "vrc-vr"

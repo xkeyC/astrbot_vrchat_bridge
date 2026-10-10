@@ -1,5 +1,5 @@
 //! VRChat's own user camera as a remote eye (`/v1/vr/usercam`,
-//! `docs/full-vr/agent-vr-use.md` section 8, decision D34): placed anywhere
+//! `docs/full-vr/agent-vr-use.md` section 7, decision D34): placed anywhere
 //! in the world by OSC (`/usercamera/Pose`), it renders what the bot's
 //! avatar cameras cannot, the nameplates (VRChat draws them in its own UI
 //! camera only, and the camera's UI mask, `/usercamera/ShowUIInCamera`,
@@ -473,8 +473,6 @@ pub struct OpenOptions {
 /// hands off the animation, the headset held throughout.
 pub fn open(bridge: &Arc<Bridge>, opts: &OpenOptions) -> Result<Value> {
     let Some(_one) = RUNNING.try_lk() else { bail!("the user camera is busy (being opened, or a shot)") };
-    // The menu is found in the usual view: no panorama meanwhile.
-    let _normal = bridge.pano.normal_view(Duration::from_secs(2))?;
     crate::motion::stop_and_wait(bridge);
     bridge.take_over();
     bridge.anim.manual_hands.store(true, Ordering::Relaxed);

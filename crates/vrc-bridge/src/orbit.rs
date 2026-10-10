@@ -1,16 +1,19 @@
 //! The user camera's lens round the bot (`docs/full-vr/agent-vr-use.md`
-//! section 8, decision D35), and the nameplates it reads.
+//! section 7, decision D35), and the nameplates it reads.
 //!
-//! The avatar's own cameras never draw nameplates, and with the panorama
-//! always on (the target) the eyes are panorama tiles: the user camera's
-//! stream view, the game's desktop window, is where the names are read.
+//! The eyes see ahead (stereo, the plates over them); the user camera's
+//! stream view, the game's desktop window, is a second eye: by default it
+//! looks back over the head (decision D45), so the eyes and the lens see
+//! opposite halves round the bot, and the head and the lens look different
+//! ways when the follower searches and on the idle patrol (`patrol`).
 //!
 //! - **Standing: the front lens** (`idle: "front"`, the default since the
 //!   user found the orbit drew too much attention). The lens rests where
-//!   the travel lens would be (above and a little behind the head, looking
-//!   where the head looks, a little down) and is aimed again only when the
-//!   heading drifts `travel.reaim_deg` off it (at most every
-//!   `travel.reaim_every_ms`): one Pose, flying off 150 ms after, no
+//!   the travel lens would be (above and a little behind the head; with
+//!   `travel.rear`, the default, looking back, a little down; else looking
+//!   where the head looks) and is aimed
+//!   again only when the heading drifts `travel.reaim_deg` off it (at most
+//!   every `travel.reaim_every_ms`): one Pose, flying off 150 ms after, no
 //!   stream of Poses. A name in another direction is read by turning the
 //!   lens there a moment (`Orbit::look_at`, `Orbit::name_toward`,
 //!   `POST /v1/vr/usercam/look`), then it comes back.
@@ -53,8 +56,9 @@
 //!   the bot has stood still (its own speed too) `resume_after_s`. The gate
 //!   holds no lock while it waits and never touches the follower; no push
 //!   goes out while flying may be on.
-//! - **The quick sweep** (`Orbit::sweep`, decision D41): the follower
-//!   looking for someone lost, the idle sweep. `snap.views` fixed views
+//! - **The quick sweep** (`Orbit::sweep_views`, decisions D41, D45): the
+//!   half the head does not look at while the follower searches and on
+//!   the idle patrol. Fixed views
 //!   (the look lens's place), one Pose each; a view is taken from the
 //!   first frame that shows it (`snap.min_ms` after its Pose and unlike
 //!   the frame before it, or `snap.sure_ms` old) and the next view's Pose
@@ -78,8 +82,7 @@
 //!   camera's vertical field of view from `/usercamera/Zoom` unless
 //!   `fov_deg` says) and the plate's ring measured there. They go to the
 //!   speaker tracker (a bearing alone: `Speakers::saw_bearing`) and are
-//!   kept for any reader (`Orbit::names_since`: the follower and the
-//!   surveys, once ported to the panorama).
+//!   kept for any reader (`Orbit::names_since`: the follower, the patrol).
 
 use std::collections::VecDeque;
 use std::io::Read;
@@ -191,8 +194,8 @@ pub struct OrbitSettings {
     pub fov_deg: Option<f32>,
     /// A frame shows the pose sent this long before it (ms).
     pub lag_ms: u64,
-    /// Standing idle, the lens goes once round this often (seconds; 0:
-    /// never), names read all round placed by the panorama (`people`).
+    /// Standing idle, the patrol goes this often (seconds; 0: never): the
+    /// head round the front half, the lens round the other (`patrol`).
     pub idle_sweep_s: f32,
     /// A held lens (not the orbit) is read only once its Pose was the same
     /// this long by the frame's grab (ms), and the frame looks like the one
@@ -213,7 +216,7 @@ pub struct OrbitSettings {
     /// The quick sweep (`Orbit::sweep`, decision D41).
     pub snap: SnapSettings,
     /// The lens turns to a voice as it starts (off by default: too
-    /// abrupt; the plates over the pano eyes name who is in front, and an
+    /// abrupt; the lens behind and the eyes ahead see both halves, and an
     /// idle bot called by name turns itself, `POST /v1/vr/attend`).
     pub attend_onset: bool,
     pub attend: AttendSettings,
@@ -347,7 +350,10 @@ impl Default for SnapSettings {
 }
 
 /// The travel lens: `back_m` behind the eyes (negative: ahead), `up_m`
-/// above them, looking the way the bot goes and `pitch_deg` down. Aimed
+/// above them, looking the way the bot goes and `pitch_deg` down; with
+/// `rear` (the default since decision D45) the other way: from the same
+/// place behind the head, looking back while the eyes look ahead, so the
+/// eyes and the lens see opposite halves round the bot. Aimed
 /// again at the start of every push from standing when the way is more
 /// than `leg_deg` off its yaw, and while moving when the way drifts more
 /// than `reaim_deg` off (at most every `reaim_every_ms`). A push waits
@@ -356,6 +362,7 @@ impl Default for SnapSettings {
 #[serde(default)]
 pub struct Travel {
     pub on: bool,
+    pub rear: bool,
     pub back_m: f32,
     pub up_m: f32,
     pub pitch_deg: f32,
@@ -367,7 +374,7 @@ pub struct Travel {
 
 impl Default for Travel {
     fn default() -> Self {
-        Travel { on: true, back_m: 0.35, up_m: 0.35, pitch_deg: 12.0, leg_deg: 10.0, reaim_deg: 30.0, reaim_every_ms: 1000, settle_ms: 50 }
+        Travel { on: true, rear: true, back_m: 0.35, up_m: 0.35, pitch_deg: 12.0, leg_deg: 10.0, reaim_deg: 30.0, reaim_every_ms: 1000, settle_ms: 50 }
     }
 }
 
@@ -465,15 +472,25 @@ pub fn orbit_pose(eye: [f32; 3], angle: f32, s: &OrbitSettings) -> CamPose {
 /// The travel lens for the bot at `eye` going `way` (world yaw): above and
 /// behind, looking that way.
 pub fn travel_pose(eye: [f32; 3], way: f32, t: &Travel) -> CamPose {
+    // Behind the head (away from `way`) either way: before the face the
+    // lens was in the eyes' own view, over them, near (the stereo's wall).
     let (s, c) = way.to_radians().sin_cos();
     let position = [eye[0] - t.back_m * s, eye[1] + t.up_m, eye[2] - t.back_m * c];
-    CamPose { position, pitch: t.pitch_deg, yaw: way.rem_euclid(360.0), roll: 0.0 }
+    CamPose { position, pitch: t.pitch_deg, yaw: t.lens_way(way), roll: 0.0 }
+}
+
+impl Travel {
+    /// Where the travel (and front) lens looks for the bot heading `way`
+    /// (world yaw): that way, or the other with `rear`.
+    pub fn lens_way(&self, way: f32) -> f32 {
+        if self.rear { way + 180.0 } else { way }.rem_euclid(360.0)
+    }
 }
 
 /// The lens turned a moment to `way` (world yaw) from the eyes at `eye`
 /// (`look_at`): behind and over the head, looking that way.
 pub fn look_pose(eye: [f32; 3], way: f32, l: &LookLens) -> CamPose {
-    travel_pose(eye, way, &Travel { back_m: l.back_m, up_m: l.up_m, pitch_deg: l.pitch_deg, ..Travel::default() })
+    travel_pose(eye, way, &Travel { rear: false, back_m: l.back_m, up_m: l.up_m, pitch_deg: l.pitch_deg, ..Travel::default() })
 }
 
 /// The lens turned to a voice `way` (world yaw) from the eyes at `eye`.
@@ -678,13 +695,13 @@ pub struct NameSighting {
     /// The plate's ring score (`GlowStats::score`), and its text box.
     pub glow: Option<f32>,
     pub bbox: [f32; 4],
-    /// Where the depth found them under the plate (the panorama: the
-    /// feet, world) and how far from the head (metres); none: the bearing
-    /// is taken 2.5 m out along the ray.
+    /// Where they stand and how far from the head (metres), when something
+    /// placed them; none (the lens has no depth): the bearing is taken
+    /// 2.5 m out along the ray.
     pub feet: Option<[f32; 3]>,
     pub distance_m: Option<f32>,
     /// The lens (world) and the ray from it through the plate (world,
-    /// unit): the person stands under it (`vrc_pano::people`).
+    /// unit): the person stands under it.
     pub ray_from: [f32; 3],
     pub ray_dir: [f32; 3],
 }
@@ -857,7 +874,7 @@ impl State {
     /// travel lens).
     fn lens_off(&self, way: f32) -> f32 {
         match self.last() {
-            Some(s) if matches!(s.lens, Lens::Travel | Lens::Front) => wrap_deg(way - s.pose.yaw).abs(),
+            Some(s) if matches!(s.lens, Lens::Travel | Lens::Front) => wrap_deg(self.settings.travel.lens_way(way) - s.pose.yaw).abs(),
             _ => 180.0,
         }
     }
@@ -961,6 +978,7 @@ impl State {
     /// looking `heading` (world yaw), when it should be placed: not the
     /// lens now (after the orbit, a voice, a look, a shot), or the heading
     /// drifted `travel.reaim_deg` off it (and it is `reaim_every_ms` old).
+    #[cfg(test)]
     fn front_due(&self, now: Instant, head: &Head, heading: f32) -> Option<CamPose> {
         self.front_why(now, head, heading).map(|(pose, _)| pose)
     }
@@ -971,8 +989,10 @@ impl State {
     /// the target while the follower places them (`aim_at`, AIM_FRESH),
     /// else the heading (decision D40).
     fn front_why(&self, now: Instant, head: &Head, heading: f32) -> Option<(CamPose, &'static str)> {
-        let t = &self.settings.travel;
-        let aim = self.aim_now(now);
+        let t = &self.travel_now(now);
+        // Looking back, the lens follows the head (the eyes face the
+        // target); else it faces the target while following.
+        let aim = self.aim_now(now).filter(|_| !t.rear);
         let way = aim.unwrap_or(heading);
         let why = if aim.is_some() { "target" } else { "front" };
         let due = match self.last() {
@@ -981,12 +1001,25 @@ impl State {
                 if self.following && old >= Duration::from_secs_f32(self.settings.follow_stale_s) {
                     Some("stale")
                 } else {
-                    (wrap_deg(way - s.pose.yaw).abs() > t.reaim_deg && old >= Duration::from_millis(t.reaim_every_ms)).then_some(why)
+                    (wrap_deg(t.lens_way(way) - s.pose.yaw).abs() > t.reaim_deg && old >= Duration::from_millis(t.reaim_every_ms)).then_some(why)
                 }
             }
             _ => Some(why),
         };
         due.map(|why| (travel_pose(head.eye, way, t), why))
+    }
+
+    /// The travel (and front) lens's settings now: aimed again less often
+    /// (CALM_REAIM_DEG, CALM_REAIM_EVERY_MS) while calm (`calm_travel`) or
+    /// following: every Pose turns flying on, and the follower's next push
+    /// waits for it to go off (the walk went in jerks).
+    fn travel_now(&self, now: Instant) -> Travel {
+        let mut t = self.settings.travel.clone();
+        if self.following || self.calm_until.is_some_and(|c| now < c) {
+            t.reaim_deg = t.reaim_deg.max(CALM_REAIM_DEG);
+            t.reaim_every_ms = t.reaim_every_ms.max(CALM_REAIM_EVERY_MS);
+        }
+        t
     }
 
     /// Following: the target's world yaw from the head, while the follower
@@ -1002,7 +1035,7 @@ impl State {
 /// SWEEP_START_WITHIN after `asked`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Sweep {
-    /// Who asked: "follow" (someone lost), "idle" (the idle sweep).
+    /// Who asked: "follow" (someone lost), "idle" (the idle patrol).
     why: &'static str,
     asked: Instant,
     /// The first view's world yaw (none: the head's as it begins), and
@@ -1161,8 +1194,11 @@ impl Orbit {
                 Plan::Wait(r)
             } else {
                 // A push from standing (a walk, a leg of one) aims the lens;
-                // while moving, the orbit's thread keeps it aimed.
-                let min_off = if was_still { st.settings.travel.leg_deg } else { 180.0 };
+                // while moving, the orbit's thread keeps it aimed. Following
+                // (the legs push and let go again and again) the lens stays
+                // where it is: each aim held the push ~200 ms and the walk
+                // went in jerks (decision D45).
+                let min_off = if was_still && !st.following { st.settings.travel.leg_deg } else { 180.0 };
                 // Flying may be on after the orbit's (or a voice's, a look's)
                 // Pose: the travel lens replaces it. After the front lens
                 // (or a travel one) looking about the way, it stays.
@@ -1207,11 +1243,7 @@ impl Orbit {
         {
             let mut st = self.state.lk();
             st.anim_yaw = anim_yaw.or(st.anim_yaw);
-            let mut t = st.settings.travel.clone();
-            if st.calm_until.is_some_and(|c| now < c) {
-                t.reaim_deg = t.reaim_deg.max(CALM_REAIM_DEG);
-                t.reaim_every_ms = t.reaim_every_ms.max(CALM_REAIM_EVERY_MS);
-            }
+            let t = st.travel_now(now);
             let due = st.may_pause(now)
                 && st.last_reaim.is_none_or(|r| now.saturating_duration_since(r) >= Duration::from_millis(t.reaim_every_ms))
                 && st.last().is_none_or(|s| now.saturating_duration_since(s.t) >= Duration::from_millis(t.reaim_every_ms));
@@ -1492,7 +1524,7 @@ impl Orbit {
             }
         }
         let voice = if settings.attend_onset { bridge.speaker.voice(VOICE_WITHIN) } else { None };
-        // Someone speaks: the idle sweep gives way at once (the follower's
+        // Someone speaks: the idle patrol's sweep gives way at once (the follower's
         // goes on looking for whom it lost).
         if bridge.speaker.speaking() {
             let mut st = self.state.lk();
@@ -1645,12 +1677,6 @@ impl Orbit {
         }
     }
 
-    /// How many times the lens read (OCR) under `lens` placed at or after
-    /// `since`: a look that read and found no name there saw nobody's.
-    pub fn reads_since(&self, since: Instant, lens: Lens) -> u32 {
-        self.sights.lk().log.iter().filter(|(_, l, posed)| *l == lens && *posed >= since).count() as u32
-    }
-
     /// Turns the lens a moment to `world_yaw` (the beacon's convention) to
     /// read the name there: 0.3 m out from the head that way (the attend
     /// lens), held `hold`, then back to the idle lens. One Pose, flying off
@@ -1725,7 +1751,16 @@ impl Orbit {
     /// every movement input let go (the orbit's thread begins it on its
     /// next tick; a push meanwhile ends it). Holds nothing; not to be
     /// called with the follower's lock held.
+    #[cfg(test)]
     pub fn sweep(&self, why: &'static str, from: Option<f32>, seek: Option<&str>) -> Result<()> {
+        let views = self.state.lk().settings.snap.views;
+        self.sweep_views(why, from, seek, views)
+    }
+
+    /// [`Orbit::sweep`] of `views` views: half of `snap.views` from the way
+    /// opposite the head's is the half the eyes do not see (the head's
+    /// search and the idle patrol, decision D45).
+    pub fn sweep_views(&self, why: &'static str, from: Option<f32>, seek: Option<&str>, views: u32) -> Result<()> {
         let now = Instant::now();
         let mut st = self.state.lk();
         anyhow::ensure!(st.settings.on, "the lens is off (orbit.on)");
@@ -1733,8 +1768,8 @@ impl Orbit {
         anyhow::ensure!(st.fresh_head(now).is_some(), "no head (the position beacon)");
         anyhow::ensure!(st.released(), "moving: no sweep");
         anyhow::ensure!(st.attending.is_none(), "turned to a voice");
-        let s = &st.settings.snap;
-        let (views, max) = (s.views, Duration::from_millis(s.max_ms));
+        let max = Duration::from_millis(st.settings.snap.max_ms);
+        let views = views.clamp(1, 12);
         st.sweep = Some(Sweep { why, asked: now, from: from.map(|y| y.rem_euclid(360.0)), out: from.is_some(), views, at: 0, posed: None, taken: false, started: None, max });
         st.seek = seek.map(str::to_string);
         st.looking = None;
@@ -1744,6 +1779,7 @@ impl Orbit {
 
     /// How long a quick sweep takes at most (every view waiting its
     /// longest, and its start).
+    #[cfg(test)]
     pub fn sweep_budget(&self) -> Duration {
         let s = self.state.lk().settings.snap.clone();
         Duration::from_millis(s.max_ms) * s.views + SWEEP_START_WITHIN
@@ -1791,6 +1827,7 @@ impl Orbit {
     }
 
     /// How the last sweep ended, and when.
+    #[cfg(test)]
     pub fn sweep_end(&self) -> Option<(&'static str, Instant)> {
         self.state.lk().sweep_end
     }
@@ -2030,11 +2067,9 @@ impl Orbit {
     fn read_frame(&self, bridge: &Bridge, ocr: &OcrClient, img: &[u8], (w, h): (usize, usize), tag: &Tagged, head: &Head, t: Instant, names: &[String], settings: &OrbitSettings) -> Result<Vec<(String, [f32; 4])>> {
         let lines = ocr.lines_rgb(img, w as u16, h as u16)?;
         let fov = settings.fov_deg.or_else(|| self.state.lk().zoom.filter(|z| (10.0..=150.0).contains(z))).unwrap_or(DEFAULT_FOV_DEG);
-        // Names read: the panorama's depth places them (the bearing and
-        // distance from the head, not 2.5 m out along the ray).
-        let any = lines.iter().any(|l| vrc_players::names::best_match(&l.text, names).is_some());
-        let depth = if any && bridge.pano.usable() { bridge.pano.frame().ok().map(|f| vrc_pano::Cloud::new(&f, DEPTH_STEP)) } else { None };
-        let seen = read_names(&View::rgb(img, w, h), &lines, names, tag, head, fov, t, depth.as_ref());
+        // Names read: a bearing from the head (the plate taken 2.5 m out
+        // along the ray; the eyes' stereo places those ahead).
+        let seen = read_names(&View::rgb(img, w, h), &lines, names, tag, head, fov, t);
         for s in &seen {
             bridge.speaker.saw_bearing(&s.name, s.tracking_yaw, t, s.glow_stats);
             if s.glow_stats.is_some() && bridge.speaker.plate_lit(&s.name, LIT_WITHIN) {
@@ -2081,8 +2116,6 @@ struct PlateRead {
     sighting: NameSighting,
 }
 
-/// The panorama's depth for placing lens names: every this-th pixel.
-const DEPTH_STEP: u32 = 4;
 
 /// Whether a frame under a held lens is to be read: its Pose the same at
 /// the grab (`same`), `age` old by then (at least `settle_ms`), and, when
@@ -2117,20 +2150,11 @@ fn thumb_diff(a: &[u8], b: &[u8]) -> f32 {
     a.iter().zip(b).map(|(x, y)| (*x as f32 - *y as f32).abs()).sum::<f32>() / a.len() as f32
 }
 
-/// Where a plate seen along `dir` from the lens at `from` is, from the
-/// eyes at `eye`: the person the panorama's depth has under it (the world
-/// yaw from the eyes, the horizontal distance, the feet), else None.
-fn on_depth(depth: &vrc_pano::Cloud, from: [f32; 3], dir: [f32; 3], eye: [f32; 3]) -> Option<(f32, f32, [f32; 3])> {
-    let b = depth.person_along(from, dir, &vrc_pano::PeopleParams::default())?;
-    let (dx, dz) = (b.feet[0] - eye[0], b.feet[2] - eye[2]);
-    Some((dx.atan2(dz).to_degrees().rem_euclid(360.0), dx.hypot(dz), b.feet))
-}
-
 /// The room's players' names read in a lens frame (OCR `lines`), each with
-/// its bearing from the head and its ring; placed by the panorama's
-/// `depth` when there is one (else the bearing is taken 2.5 m out).
+/// its bearing from the head (the plate taken PLATE_RANGE_M out along its
+/// ray) and its ring.
 #[allow(clippy::too_many_arguments)]
-fn read_names(view: &View, lines: &[vrc_players::ocr::OcrLine], names: &[String], tag: &Tagged, head: &Head, fov: f32, at: Instant, depth: Option<&vrc_pano::Cloud>) -> Vec<PlateRead> {
+fn read_names(view: &View, lines: &[vrc_players::ocr::OcrLine], names: &[String], tag: &Tagged, head: &Head, fov: f32, at: Instant) -> Vec<PlateRead> {
     let (w, h) = (view.width as f32, view.height as f32);
     lines
         .iter()
@@ -2140,8 +2164,7 @@ fn read_names(view: &View, lines: &[vrc_players::ocr::OcrLine], names: &[String]
             let ray = pixel_ray(tag.yaw, tag.pitch, fov, w, h, x + bw / 2.0, y + bh / 2.0);
             let n = (ray[0] * ray[0] + ray[1] * ray[1] + ray[2] * ray[2]).sqrt().max(1e-6);
             let from = [0, 1, 2].map(|k| head.eye[k] + tag.rel[k]);
-            let placed = depth.and_then(|d| on_depth(d, from, ray.map(|v| v / n), head.eye));
-            let world = placed.map_or_else(|| yaw_from_head(tag.rel, ray, PLATE_RANGE_M).rem_euclid(360.0), |p| p.0);
+            let world = yaw_from_head(tag.rel, ray, PLATE_RANGE_M).rem_euclid(360.0);
             let elevation = ray[1].atan2(ray[0].hypot(ray[2])).to_degrees();
             let tracking = wrap_deg(world - head.offset);
             let glow = glow_stats(view, l.bbox);
@@ -2159,8 +2182,8 @@ fn read_names(view: &View, lines: &[vrc_players::ocr::OcrLine], names: &[String]
                     lens: tag.lens,
                     glow: glow.map(|g| g.score()),
                     bbox: l.bbox,
-                    feet: placed.map(|p| p.2),
-                    distance_m: placed.map(|p| p.1),
+                    feet: None,
+                    distance_m: None,
                     ray_from: from,
                     ray_dir: ray.map(|v| v / n),
                 },
@@ -2238,9 +2261,37 @@ mod tests {
         (a - b).abs() <= tol
     }
 
+    /// The lens looking the way the bot goes (most of these tests: the
+    /// travel and front lens's own working; `rear` is the default).
+    fn ahead() -> Travel {
+        Travel { rear: false, ..Travel::default() }
+    }
+
     fn orbit() -> Orbit {
         let anim = Arc::new(Anim::new(std::env::temp_dir().join(format!("vrc-orbit-test-{}", std::process::id())).join("anim.json")));
-        Orbit::new(Osc::with_ports("127.0.0.1:9", 0).unwrap(), anim)
+        let o = Orbit::new(Osc::with_ports("127.0.0.1:9", 0).unwrap(), anim);
+        o.state.lk().settings.travel = ahead();
+        o
+    }
+
+    /// Decision D45: by default the lens looks back from behind the head,
+    /// the other way from the eyes, and is aimed again when the head turns.
+    #[test]
+    fn the_lens_looks_back_while_the_eyes_look_ahead() {
+        let t = Travel::default();
+        assert!(t.rear);
+        let p = travel_pose([0.0, 1.5, 0.0], 90.0, &t);
+        assert!(close(p.yaw, 270.0, 1e-3), "{p:?}");
+        // Behind the head (-x, away from the way it faces), over it: out of
+        // the eyes' view.
+        assert!(close(p.position[0], -0.35, 1e-4) && close(p.position[1], 1.85, 1e-4), "{p:?}");
+        let mut st = State { settings: OrbitSettings::default(), ..State::default() };
+        let now = Instant::now();
+        st.record(now, p, Lens::Front, Some([0.0, 1.5, 0.0]));
+        // Facing 90 still: in place; turned to 150: aimed again (behind).
+        assert!(st.lens_off(90.0) < 1e-3 && st.lens_off(150.0) > 50.0);
+        // A look elsewhere (`look_at`) is not turned round.
+        assert!(close(look_pose([0.0, 1.5, 0.0], 30.0, &LookLens::default()).yaw, 30.0, 1e-3));
     }
 
     /// An orbit with the camera open, the head at `eye` facing yaw 0, and
@@ -2278,7 +2329,7 @@ mod tests {
 
     #[test]
     fn the_travel_lens_is_above_and_behind_looking_the_way() {
-        let p = travel_pose([0.0, 1.5, 0.0], 90.0, &Travel::default());
+        let p = travel_pose([0.0, 1.5, 0.0], 90.0, &ahead());
         // Going +x: behind is -x.
         assert!(close(p.position[0], -0.35, 1e-4) && close(p.position[2], 0.0, 1e-4) && close(p.position[1], 1.85, 1e-4), "{p:?}");
         assert!(close(p.yaw, 90.0, 1e-3) && close(p.pitch, 12.0, 1e-4));
@@ -2340,7 +2391,7 @@ mod tests {
         o.state.lk().record(t + Duration::from_millis(500), CamPose { position: [0.0; 3], pitch: 0.0, yaw: 180.0, roll: 0.0 }, Lens::Placed, None);
         assert!(o.lens_at(t + Duration::from_millis(520)).is_none());
         // The travel lens: steady until the next pose.
-        o.state.lk().record(t + Duration::from_millis(600), travel_pose([0.0, 1.5, 0.0], 90.0, &Travel::default()), Lens::Travel, Some([0.0, 1.5, 0.0]));
+        o.state.lk().record(t + Duration::from_millis(600), travel_pose([0.0, 1.5, 0.0], 90.0, &ahead()), Lens::Travel, Some([0.0, 1.5, 0.0]));
         let tr = o.lens_at(t + Duration::from_secs(3)).unwrap();
         assert!(tr.lens == Lens::Travel && close(tr.yaw, 90.0, 1e-3) && close(tr.rel[0], -0.35, 1e-4) && close(tr.rel[1], 0.35, 1e-4));
     }
@@ -2439,61 +2490,12 @@ mod tests {
         let line = |text: &str, x: f32| vrc_players::ocr::OcrLine { text: text.into(), bbox: [x - 40.0, 340.0, 80.0, 20.0], confidence: 0.9 };
         let lines = [line("xkeyC", 640.0), line("nobody here", 300.0)];
         let names = ["xkeyC".to_string(), "Ann".to_string()];
-        let read = read_names(&View::rgb(&img, 1280, 720), &lines, &names, &tag, &head, 60.0, Instant::now(), None);
+        let read = read_names(&View::rgb(&img, 1280, 720), &lines, &names, &tag, &head, 60.0, Instant::now());
         assert_eq!(read.len(), 1);
         let s = &read[0].sighting;
         assert_eq!(s.name, "xkeyC");
         assert!(close(s.world_yaw, 90.0, 0.01) && close(s.bearing_deg, 90.0, 0.01) && close(s.tracking_yaw, 60.0, 0.01), "{s:?}");
         assert!(s.elevation_deg < 0.0 && s.lens == Lens::Orbit);
-    }
-
-    /// A person 1 m from the head, at world yaw 150 (behind and right), a
-    /// cylinder of depth points (the panorama's).
-    fn someone_behind() -> (vrc_pano::Cloud, [f32; 3]) {
-        let (sn, cs) = 150f32.to_radians().sin_cos();
-        let feet = [sn, 0.0, cs];
-        let mut points = Vec::new();
-        for k in 0..36 {
-            let (a, b) = (k as f32 * 10.0).to_radians().sin_cos();
-            for j in 2..=32 {
-                points.push([feet[0] + 0.15 * a, 0.05 * j as f32, feet[2] + 0.15 * b]);
-            }
-        }
-        let fg = vec![true; points.len()];
-        (vrc_pano::Cloud { points, fg, centre: [0.0, 1.5, 0.0], floor: Some(0.0) }, feet)
-    }
-
-    #[test]
-    fn a_name_read_by_the_lens_is_placed_by_the_depth_not_2_5_m_out() {
-        // The lens orbiting at 90 degrees (0.7 m out to +x), someone 1 m
-        // away behind the bot (world yaw 150), their plate 0.35 m over
-        // their head: the ray from the lens through it.
-        let (depth, feet) = someone_behind();
-        let head = Head { at: Instant::now(), eye: [0.0, 1.5, 0.0], yaw: 0.0, offset: 0.0 };
-        let lens = [0.7, 1.5, 0.0];
-        let plate = [feet[0], 1.6 + 0.35, feet[2]];
-        let d = [0, 1, 2].map(|k| plate[k] - lens[k]);
-        let n = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-        let dir = d.map(|v| v / n);
-        // 2.5 m out along the ray, the parallax of the lens's offset puts
-        // them nearly behind (about 177 degrees): wrong by over 20.
-        let guess = yaw_from_head([0.7, 0.0, 0.0], dir, PLATE_RANGE_M).rem_euclid(360.0);
-        assert!(wrap_deg(guess - 150.0).abs() > 20.0, "{guess}");
-        // The depth: where they stand, from the head.
-        let (yaw, distance, at) = on_depth(&depth, lens, dir, head.eye).expect("placed");
-        assert!(wrap_deg(yaw - 150.0).abs() < 8.0 && (distance - 1.0).abs() < 0.2, "{yaw} {distance} {at:?}");
-        // As read_names has it: the sighting carries the distance and the feet.
-        let yaw_px = dir[0].atan2(dir[2]).to_degrees();
-        let pitch = -(dir[1].atan2(dir[0].hypot(dir[2])).to_degrees());
-        let tag = Tagged { yaw: yaw_px, pitch, rel: [0.7, 0.0, 0.0], position: lens, lens: Lens::Look, posed: Instant::now() };
-        let img = vec![40u8; 1280 * 720 * 3];
-        let lines = [vrc_players::ocr::OcrLine { text: "Ann".into(), bbox: [600.0, 350.0, 80.0, 20.0], confidence: 0.9 }];
-        let read = read_names(&View::rgb(&img, 1280, 720), &lines, &["Ann".to_string()], &tag, &head, 60.0, Instant::now(), Some(&depth));
-        let s = &read[0].sighting;
-        assert!(wrap_deg(s.world_yaw - 150.0).abs() < 8.0 && s.distance_m.is_some_and(|d| (d - 1.0).abs() < 0.2) && s.feet.is_some(), "{s:?}");
-        // No depth there: the 2.5 m guess, no distance.
-        let none = read_names(&View::rgb(&img, 1280, 720), &lines, &["Ann".to_string()], &tag, &head, 60.0, Instant::now(), None);
-        assert!(none[0].sighting.distance_m.is_none());
     }
 
     #[test]
@@ -2508,7 +2510,7 @@ mod tests {
             let eye = [0.0, 1.5, 0.1 * i as f32];
             st.note_head(Head { at: t0 + Duration::from_millis(100 * i), eye, yaw: 0.0, offset: 0.0 });
         }
-        let pose = travel_pose([0.0, 1.5, 0.0], 0.0, &Travel::default());
+        let pose = travel_pose([0.0, 1.5, 0.0], 0.0, &ahead());
         st.record(t0, pose, Lens::Front, Some([0.0, 1.5, 0.0]));
         // Between reads, and ahead of the last (at most HEAD_AHEAD).
         let at = |ms: u64| t0 + Duration::from_millis(ms);
@@ -2817,7 +2819,7 @@ mod tests {
             let st = o.state.lk();
             let last = st.last().unwrap();
             assert_eq!(last.lens, Lens::Front);
-            assert_eq!(last.pose, travel_pose(eye, 0.0, &Travel::default()));
+            assert_eq!(last.pose, travel_pose(eye, 0.0, &ahead()));
             assert!(st.active && st.flying_maybe_on && st.front_poses == 1);
         }
         // Then nothing: no stream of Poses.
@@ -2929,31 +2931,33 @@ mod tests {
         let o = standing(eye);
         let t = Instant::now();
         let head = o.state.lk().head.unwrap();
-        let every = Duration::from_millis(Travel::default().reaim_every_ms);
+        // Following, the lens is aimed again less often (CALM_*: each Pose
+        // held the follower's next push).
+        let every = Duration::from_millis(CALM_REAIM_EVERY_MS);
         // Not following: the target's way is not taken.
         o.aim_at(60.0);
         assert!(o.front(&mut o.state.lk(), &head, t));
         assert!(close(o.state.lk().last().unwrap().pose.yaw, 0.0, 1e-3));
-        // Following, the target 60 degrees right: the lens there at once.
+        // Following, the target 75 degrees right: the lens there at once.
         o.set_following(true);
-        o.aim_at(60.0);
+        o.aim_at(75.0);
         let t1 = t + every;
         assert!(o.front(&mut o.state.lk(), &head, t1));
         {
             let st = o.state.lk();
             let last = st.last().unwrap();
-            assert!(last.lens == Lens::Front && close(last.pose.yaw, 60.0, 1e-3) && st.target_poses == 1, "{last:?}");
+            assert!(last.lens == Lens::Front && close(last.pose.yaw, 75.0, 1e-3) && st.target_poses == 1, "{last:?}");
         }
-        // They stepped 10 degrees: it stays; 40: aimed again (not sooner
-        // than reaim_every_ms).
-        o.aim_at(70.0);
+        // They stepped 10 degrees: it stays; 75: aimed again (not sooner
+        // than CALM_REAIM_EVERY_MS).
+        o.state.lk().aim = Some((85.0, t1 + every));
         assert!(!o.front(&mut o.state.lk(), &head, t1 + every));
-        o.aim_at(100.0);
+        o.aim_at(150.0);
         assert!(!o.front(&mut o.state.lk(), &head, t1 + Duration::from_millis(200)));
         let t2 = t1 + every + Duration::from_millis(10);
-        o.state.lk().aim = Some((100.0, t2));
+        o.state.lk().aim = Some((150.0, t2));
         assert!(o.front(&mut o.state.lk(), &head, t2));
-        assert!(close(o.state.lk().last().unwrap().pose.yaw, 100.0, 1e-3));
+        assert!(close(o.state.lk().last().unwrap().pose.yaw, 150.0, 1e-3));
         // Nobody placed them for a while: the heading again.
         let t3 = t2 + AIM_FRESH + every + Duration::from_millis(10);
         assert!(o.front(&mut o.state.lk(), &head, t3));
@@ -3028,21 +3032,6 @@ mod tests {
                 assert_eq!(st.sweep_end.unwrap().0, how);
             }
         }
-    }
-
-    #[test]
-    fn reads_under_a_look_are_counted() {
-        let o = standing([0.0, 1.5, 0.0]);
-        let t = Instant::now();
-        {
-            let mut s = o.sights.lk();
-            s.log.push_back((t, Lens::Front, t - Duration::from_secs(9)));
-            s.log.push_back((t, Lens::Look, t + Duration::from_millis(10)));
-            s.log.push_back((t, Lens::Look, t + Duration::from_millis(10)));
-            s.log.push_back((t, Lens::Look, t - Duration::from_secs(5)));
-        }
-        assert_eq!(o.reads_since(t, Lens::Look), 2);
-        assert_eq!(o.reads_since(t, Lens::Front), 0);
     }
 
     #[test]

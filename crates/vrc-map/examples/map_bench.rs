@@ -4,7 +4,7 @@ use std::time::Instant;
 use vrc_map::{Nav, Observation, WorldMap};
 
 fn main() {
-    // A room 12 x 12 with walls, as ~70k points a look (depth, every 2nd
+    // A room 12 x 12 with walls, as ~70k points a look (stereo, every 2nd
     // pixel), six looks round.
     let mut pts = Vec::new();
     let mut x = -6.0f32;

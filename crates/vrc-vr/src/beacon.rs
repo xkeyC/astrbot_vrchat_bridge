@@ -10,8 +10,8 @@
 //! (u16 of a turn), pitch (i16, centidegrees), seq (u8), CRC-16/CCITT-FALSE
 //! of the 144 before it. Unity's world: +x right, +y up, +z ahead.
 //!
-//! The grid's reading ([`read_grid`]) is shared: the avatar's panorama rig
-//! draws its own code (magic 0x5B) the same way, right above (`vrc-pano`).
+//! The grid's reading ([`read_grid`]) is general: any code drawn the same
+//! way (another magic, at another corner) reads with it.
 
 use crate::tap::EyeFrame;
 
@@ -52,8 +52,7 @@ pub fn block_centre(w: u32, h: u32, col: usize, row: usize, flipped: bool) -> (f
 
 /// The middle of block (`col`, `row`) of a 22 x 10 grid whose bottom-left
 /// corner is `origin` (NDC, y up) in an eye `w` x `h` (pixels, top-left
-/// origin); `flipped`: the image upside down. The pano rig's code (magic
-/// 0x5B) is such a grid too, above the beacon (avatar-panorama.md 3.5).
+/// origin); `flipped`: the image upside down.
 pub fn block_centre_at(w: u32, h: u32, origin: [f32; 2], col: usize, row: usize, flipped: bool) -> (f32, f32) {
     let x = origin[0] + (col as f32 + 0.5) * BLOCK_NDC;
     let y = origin[1] + ROWS as f32 * BLOCK_NDC - (row as f32 + 0.5) * BLOCK_NDC;

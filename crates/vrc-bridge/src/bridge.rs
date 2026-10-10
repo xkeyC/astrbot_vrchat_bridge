@@ -117,10 +117,9 @@ pub struct Bridge {
     pub usercam: crate::usercam::UserCam,
     /// Its lens round the bot, and the names it reads (`orbit`).
     pub orbit: Arc<crate::orbit::Orbit>,
-    /// The avatar's panorama rig (`pano`).
-    pub pano: Arc<crate::pano::Pano>,
-    /// The people near the bot, and the idle sweep (`people`).
-    pub people: Arc<crate::people::People>,
+    /// The idle patrol: the head and the lens look different ways
+    /// (`patrol`, decision D45).
+    pub patrol: Arc<crate::patrol::Patrol>,
 }
 
 #[derive(Default)]
@@ -144,7 +143,6 @@ impl Bridge {
         let motions = Arc::new(crate::motion::Library::new(config_dir.join("motions")));
         let mapping = Mapping::new(config_dir.join("maps"));
         let speaker = Arc::new(Speakers::new(&args));
-        let pano = crate::pano::Pano::new(&args);
         let orbit = Arc::new(crate::orbit::Orbit::new(Osc::with_ports_from(&osc).expect("an OSC socket"), anim.clone()));
         let mut core = VrCore::new(&args);
         core.head_height = anim.params().head_height;
@@ -175,8 +173,7 @@ impl Bridge {
             bot_voice_until: Mutex::new(None),
             usercam: crate::usercam::UserCam::new(config_dir.join("usercam.json")),
             orbit,
-            pano,
-            people: Arc::new(crate::people::People::default()),
+            patrol: Arc::new(crate::patrol::Patrol::default()),
         });
         (bridge, chat_rx)
     }

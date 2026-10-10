@@ -38,16 +38,13 @@ const RECONNECT_EVERY: Duration = Duration::from_secs(5);
 const SPEED_EVERY: u32 = 3;
 /// The avatar's size (eye height) is read this often (ticks).
 const SIZE_EVERY: u32 = 90;
-/// Moving faster than this (world m/s), the legs walk; from RUN_FROM they
-/// run (fully by RUN_FULL).
+/// Moving faster than this (world m/s), the legs walk.
 const GAIT_FROM: f32 = 0.25;
-const RUN_FROM: f32 = 1.1;
-const RUN_FULL: f32 = 1.4;
-/// How much of the gait cycles' motion plays (strides, knee lift, the hips'
-/// bob): a little tamer than the capture; the hips' own sway and twist much
-/// tamer (the headset does not sway with them).
-const GAIT_AMPLITUDE: f32 = 1.0;
-const HIPS_AMPLITUDE: f32 = 0.45;
+/// From walking to running by the Froude number (v² over g times the legs'
+/// length, the hips' height): people change over at about 0.5; a 1.6 m
+/// avatar runs from 1.8 m/s, fully by 2.2 (the follower's 1.8 still walks).
+const RUN_FROM_FROUDE: f32 = 0.4;
+const RUN_FULL_FROUDE: f32 = 0.6;
 /// Seconds for the legs to start and stop walking, and to change pace.
 const GAIT_FADE: f32 = 0.35;
 /// Seconds for the legs to tuck up off the ground (`jump_air`), and to come
@@ -55,9 +52,80 @@ const GAIT_FADE: f32 = 0.35;
 const AIR_IN: f32 = 0.12;
 const AIR_OUT: f32 = 0.25;
 
+/// The clips' joints (`vrc_vr::motion::JOINTS`).
+const J_HIPS: usize = 0;
+const J_KNEES: [usize; 2] = [3, 4];
+const J_FEET: [usize; 2] = [5, 6];
+
+/// The share of a cycle a foot is on the ground at `v` statures a second,
+/// shorter the faster (user, 2026-10-11: the time a foot rests on the
+/// ground by the speed), as people's: walking 67% at 0.5 m/s, 62% at 1.2,
+/// 58% at 1.8; running 40% at 2.2 m/s, 35% at 3, 30% at 4 (1.6 m tall).
+fn duty(v: f32, run: f32) -> f32 {
+    let walk = (0.70 - 0.11 * v).clamp(0.56, 0.68);
+    walk + ((0.52 - 0.09 * v).clamp(0.25, 0.42) - walk) * run
+}
+/// Where a foot lands, as a share of its sweep under the hips ahead of
+/// them (the rest it goes behind, the heel coming up to reach): a foot far
+/// ahead pulled the hips down at each step, a heavy tread.
+const LAND_AHEAD: f32 = 0.4;
+/// A foot on the ground sweeps at most this far under the hips (statures):
+/// faster, the steps come quicker instead.
+const MAX_SWEEP: f32 = 0.385;
+/// The steps this much shorter than people's, and quicker by as much (user,
+/// 2026-10-11: "步子迈太开了，减少 30%，交替速度增加"; then 10% longer
+/// again, 0.7 was a little short).
+const STRIDE: f32 = 0.77;
+/// The heel comes up over this last share of the time on the ground, this
+/// high (statures), the foot pitched toes down this much (degrees); it
+/// lands toes up this much and is flat again FLAT_BY into the next.
+const HEEL_OFF: [f32; 2] = [0.25, 0.4];
+const HEEL_UP: [f32; 2] = [0.015, 0.025];
+const TOES_DOWN_DEG: [f32; 2] = [18.0, 26.0];
+const TOES_UP_DEG: [f32; 2] = [10.0, 4.0];
+const FLAT_BY: f32 = 0.15;
+/// The knees a little bent all the way (statures the hips come down), and
+/// running bent more under the body's weight mid-stance; the hips come down
+/// this share of what straight legs would need to reach the feet (the
+/// ankles and the hips' twist give the rest) and at most MAX_DROP in all:
+/// all of it bobbed the body down hard at every step (user: "步子迈太重了").
+const CROUCH: [f32; 2] = [0.005, 0.012];
+const RUN_GIVE: f32 = 0.015;
+const REACH_DROP: f32 = 0.6;
+const MAX_DROP: f32 = 0.045;
+/// The hips twist toward the leg ahead (degrees).
+const HIPS_TWIST_DEG: f32 = 4.0;
+/// Running, the feet come in toward the midline, this far off it
+/// (statures) at most.
+const RUN_FEET_X: f32 = 0.08;
+
+/// Cycles (two steps) a second at `v` statures a second: as people walk
+/// (1.75 steps a second at 1 m/s, 2.1 at 1.8; 1.7 m tall) and run (2.7 at
+/// 3 m/s, 2.9 at 4), quickened for strides STRIDE as long.
+fn cadence(v: f32, run: f32) -> f32 {
+    let walk = 0.62 + 0.4 * v;
+    (walk + (1.22 + 0.09 * v - walk) * run) / STRIDE
+}
+
+/// How high a swinging foot lifts (statures): 6-10 cm walking (1.6 m
+/// tall), running 14-21 cm with the heel kicked up behind (higher stepped
+/// heavily, user 2026-10-11).
+fn lift(v: f32, run: f32) -> f32 {
+    let walk = 0.035 + 0.025 * (v / 1.2).min(1.0);
+    walk + (0.09 + 0.04 * ((v - 1.2) / 1.5).clamp(0.0, 1.0) - walk) * run
+}
+
 /// The legs walking or running in place while the bot moves (the stick
-/// moves it): gait cycles (`walk_cycle`, `run_cycle`) at a phase that
-/// advances with the avatar's speed, so a foot on the ground stays put.
+/// moves it), stepped here: played from the captured cycles at the bot's
+/// 2-4 m/s, a cycle's stride (1.1 m running) took seven steps a second,
+/// short shuffles that slid and hardly lifted the feet, and the captured
+/// run curved 17° a cycle, swinging back each loop (user, 2026-10-11:
+/// "左右脚不协调，右脚有种在打滑的感觉，缺少抬腿的感觉"). A foot on the ground
+/// moves back exactly as fast as the floor goes by (it stays put), the
+/// stride grows with the speed (cadence as people's), the heel comes up
+/// before the foot lifts and the hips come down as far as the legs need to
+/// reach. The arms and the chest swing as captured (`walk_cycle`,
+/// `run_cycle`, their turn taken out), at the same phase.
 #[derive(Default)]
 struct Gait {
     /// Into the cycle (0..1, from a left heel strike).
@@ -68,6 +136,17 @@ struct Gait {
     run: f32,
     /// How much the legs are tucked up in the air.
     air: f32,
+    /// The feet (left, right) while walking.
+    feet: Option<[Stride; 2]>,
+}
+
+/// A foot in the gait: how far ahead of the hips (statures), whether on the
+/// ground, and where it lifted off.
+#[derive(Clone, Copy, Debug, Default)]
+struct Stride {
+    z: f32,
+    down: bool,
+    lift_z: f32,
 }
 
 impl Gait {
@@ -76,42 +155,188 @@ impl Gait {
     fn update(&mut self, motions: &crate::motion::Library, speed: f32, stature: f32, dt: f32, airborne: bool) -> Option<vrc_vr::motion::Body> {
         let walk = motions.get("walk_cycle")?;
         let run = motions.get("run_cycle")?;
-        let (ws, rs) = (walk.speed?, run.speed?);
+        let air = motions.get("jump_air");
+        self.step(&walk, &run, air.as_deref(), speed, stature, dt, airborne)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn step(
+        &mut self,
+        walk: &vrc_vr::motion::Clip,
+        run: &vrc_vr::motion::Clip,
+        air: Option<&vrc_vr::motion::Clip>,
+        speed: f32,
+        stature: f32,
+        dt: f32,
+        airborne: bool,
+    ) -> Option<vrc_vr::motion::Body> {
         let pace = speed.abs();
-        let step = (dt / GAIT_FADE).min(1.0);
-        let towards = |x: f32, to: f32| x + (to - x) * step;
+        let fade = (dt / GAIT_FADE).min(1.0);
+        let towards = |x: f32, to: f32| x + (to - x) * fade;
         self.weight = towards(self.weight, if pace > GAIT_FROM && !airborne { 1.0 } else { 0.0 });
-        let run_to = ((pace - RUN_FROM) / (RUN_FULL - RUN_FROM)).clamp(0.0, 1.0);
+        let froude = pace * pace / (9.81 * walk.standing[J_HIPS].pos[1] * stature);
+        let run_to = ((froude - RUN_FROM_FROUDE) / (RUN_FULL_FROUDE - RUN_FROM_FROUDE)).clamp(0.0, 1.0);
         self.run = towards(self.run, run_to);
         self.air = if airborne { (self.air + dt / AIR_IN).min(1.0) } else { (self.air - dt / AIR_OUT).max(0.0) };
-        let air = motions.get("jump_air");
-        let tuck = |body: vrc_vr::motion::Body| match &air {
-            Some(a) if self.air > 0.0 => vrc_vr::motion::blend(&body, &a.frames[0], ease(self.air)),
+        let tucked = self.air;
+        let tuck = |body: vrc_vr::motion::Body| match air {
+            Some(a) if tucked > 0.0 && !a.frames.is_empty() => vrc_vr::motion::blend(&body, &a.frames[0], ease(tucked)),
             _ => body,
         };
         if self.weight < 0.01 {
             self.weight = 0.0;
             self.phase = 0.0;
+            self.feet = None;
             if self.air > 0.0 {
                 return Some(tuck(walk.standing));
             }
             return None;
         }
-        // A cycle covers its speed times its length (statures): advance by
-        // the floor covered.
-        let cycle = |c: &vrc_vr::motion::Clip, s: f32| s * c.duration() * stature;
-        let dist = (cycle(&walk, ws) * (1.0 - self.run) + cycle(&run, rs) * self.run) * GAIT_AMPLITUDE;
-        if dist > 1e-3 {
-            self.phase = (self.phase + speed * dt / dist).rem_euclid(1.0);
+        let legs = self.legs(&walk.standing, speed / stature, dt);
+        // The arms and the chest as captured, at the same phase.
+        let mut body = vrc_vr::motion::blend(&cycle_pose(walk, self.phase), &cycle_pose(run, self.phase), self.run);
+        for j in [J_HIPS, J_KNEES[0], J_KNEES[1], J_FEET[0], J_FEET[1]] {
+            body[j] = legs[j];
         }
-        let (walk, run) = (walk.in_place(), run.in_place());
-        let w = walk.sample(self.phase * walk.duration());
-        let r = run.sample(self.phase * run.duration());
-        let legs = vrc_vr::motion::blend(&w, &r, self.run);
-        let mut body = vrc_vr::motion::blend(&walk.standing, &legs, self.weight * GAIT_AMPLITUDE);
-        body[0] = vrc_vr::motion::blend(&walk.standing, &legs, self.weight * HIPS_AMPLITUDE)[0];
-        Some(tuck(body))
+        Some(tuck(vrc_vr::motion::blend(&walk.standing, &body, self.weight)))
     }
+
+    /// The hips, knees and feet (body frame) a tick on at `v` statures a
+    /// second (negative: backing).
+    fn legs(&mut self, standing: &vrc_vr::motion::Body, v: f32, dt: f32) -> vrc_vr::motion::Body {
+        let run = self.run;
+        let mix = |a: [f32; 2]| a[0] + (a[1] - a[0]) * run;
+        let pace = v.abs();
+        let duty = duty(pace, run);
+        let f = cadence(pace, run).max(pace * duty / MAX_SWEEP);
+        // On the ground a foot goes back `sweep` under the hips: it lands
+        // LAND_AHEAD of that ahead.
+        let sweep = v * duty / f;
+        let swing_s = (1.0 - duty) / f;
+        let first = self.feet.is_none();
+        if !first {
+            self.phase = (self.phase + f * dt).rem_euclid(1.0);
+        }
+        // Backing, the toes land first and the heel lifts last.
+        let toes = if v < 0.0 { -1.0 } else { 1.0 };
+        let hips_y = standing[J_HIPS].pos[1];
+        let mut body = *standing;
+        let mut drop = 0.0f32;
+        let feet = self.feet.get_or_insert([Stride::default(); 2]);
+        for (i, foot) in feet.iter_mut().enumerate() {
+            let local = (self.phase + 0.5 * i as f32).rem_euclid(1.0);
+            let down = local < duty;
+            if down && (first || !foot.down) {
+                // Down: where it landed, the floor gone by since.
+                foot.z = sweep * LAND_AHEAD - v * local / f;
+            } else if down {
+                foot.z -= v * dt;
+            } else if first || foot.down {
+                foot.lift_z = if first { sweep * (LAND_AHEAD - 1.0) } else { foot.z };
+            }
+            foot.down = down;
+            foot.z = foot.z.clamp(-MAX_SWEEP, MAX_SWEEP);
+            let at = standing[J_FEET[i]].pos;
+            let side = at[0].signum();
+            let x = at[0].abs() + (at[0].abs().min(RUN_FEET_X) - at[0].abs()) * run;
+            let (z, up, pitch, grounded) = if down {
+                let s = local / duty;
+                let heel = ease(((s - (1.0 - mix(HEEL_OFF))) / mix(HEEL_OFF)).clamp(0.0, 1.0));
+                let flat = 1.0 - ease((s / FLAT_BY).min(1.0));
+                let give = RUN_GIVE * run * (std::f32::consts::PI * s).sin();
+                drop = drop.max(give);
+                (foot.z, mix(HEEL_UP) * heel, mix(TOES_DOWN_DEG) * heel - mix(TOES_UP_DEG) * flat, 1.0 - heel)
+            } else {
+                let u = ((local - duty) / (1.0 - duty)).clamp(0.0, 1.0);
+                // Leaving and landing at the floor's speed (still on it).
+                let m = -v * swing_s;
+                let z = hermite(foot.lift_z, sweep * LAND_AHEAD, m, m, u);
+                // Set down softly (slowing to the floor), not stamped.
+                let k = 0.9 - 0.3 * run;
+                let up = mix(HEEL_UP) * (1.0 - u) * (1.0 - u) + lift(pace, run) * (std::f32::consts::PI * u.powf(k)).sin().powf(1.5);
+                let pitch = mix(TOES_DOWN_DEG) + (-mix(TOES_UP_DEG) - mix(TOES_DOWN_DEG)) * ease(u);
+                (z, up, pitch, ease(((u - 0.8) / 0.2).clamp(0.0, 1.0)))
+            };
+            // A straight leg reaches that far ahead or behind only with the
+            // hips lower.
+            let leg = hips_y - at[1];
+            let reach = leg - (leg * leg - z.abs().min(leg * 0.95).powi(2)).sqrt();
+            drop = drop.max(reach * grounded * REACH_DROP);
+            let half = (toes * pitch).to_radians() / 2.0;
+            body[J_FEET[i]].pos = [side * x, at[1] + up, z];
+            body[J_FEET[i]].rot = [half.sin(), 0.0, 0.0, half.cos()];
+        }
+        let drop = (drop + mix(CROUCH)).min(MAX_DROP);
+        let hips = &mut body[J_HIPS];
+        hips.pos[1] = hips_y - drop;
+        // Twisted toward the leg ahead (the left at the cycle's start; + to
+        // the body's right is about -y).
+        let half = -(HIPS_TWIST_DEG * toes * (std::f32::consts::TAU * self.phase).cos()).to_radians() / 2.0;
+        hips.rot = [0.0, half.sin(), 0.0, half.cos()];
+        let hips_at = hips.pos;
+        for i in 0..2 {
+            body[J_KNEES[i]].pos = knee(hips_at, standing[J_KNEES[i]].pos, standing[J_FEET[i]].pos, body[J_FEET[i]].pos);
+        }
+        body
+    }
+}
+
+/// Cubic Hermite from `a` to `b` (tangents `ma`, `mb` per unit `u`).
+fn hermite(a: f32, b: f32, ma: f32, mb: f32, u: f32) -> f32 {
+    let (u2, u3) = (u * u, u * u * u);
+    (2.0 * u3 - 3.0 * u2 + 1.0) * a + (u3 - 2.0 * u2 + u) * ma + (-2.0 * u3 + 3.0 * u2) * b + (u3 - u2) * mb
+}
+
+/// Where a knee goes (body frame) for the hips at `hips` and the ankle at
+/// `foot`, bending forward: the thigh and the shin as long as standing
+/// (`knee0`, `foot0`; the hip joint level with the hips).
+fn knee(hips: [f32; 3], knee0: [f32; 3], foot0: [f32; 3], foot: [f32; 3]) -> [f32; 3] {
+    let thigh = (hips[1] - knee0[1]).max(1e-3);
+    let shin = (knee0[1] - foot0[1]).max(1e-3);
+    let (dz, dy) = (foot[2] - hips[2], foot[1] - hips[1]);
+    let d = dz.hypot(dy).clamp(1e-3, (thigh + shin) * 0.999);
+    let a = ((thigh * thigh + d * d - shin * shin) / (2.0 * thigh * d)).clamp(-1.0, 1.0).acos();
+    let (uz, uy) = (dz / d, dy / d);
+    // Turned toward ahead (+z) by `a` from the line to the ankle.
+    let (kz, ky) = (uz * a.cos() - uy * a.sin(), uz * a.sin() + uy * a.cos());
+    [knee0[0] + (foot[0] - foot0[0]) * 0.5, hips[1] + ky * thigh, hips[2] + kz * thigh]
+}
+
+/// A gait cycle's pose `phase` (0..1) through, in place and with its
+/// path's curve taken out (looped, the body swung back each cycle). Its
+/// frames are one cycle without the next one's first (`tools/motion`): the
+/// last goes on into the first.
+fn cycle_pose(c: &vrc_vr::motion::Clip, phase: f32) -> vrc_vr::motion::Body {
+    let n = c.frames.len();
+    if n == 0 {
+        return c.standing;
+    }
+    // Where the hips face (radians, + toward the body's left, +x).
+    let yaw = |b: &vrc_vr::motion::Body| {
+        let a = vrc_vr::Pose { orientation: b[J_HIPS].rot, position: [0.0; 3] }.rotate([0.0, 0.0, 1.0]);
+        a[0].atan2(a[2])
+    };
+    let wrap = |a: f32| (a + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+    let per = if n > 1 { wrap(yaw(&c.frames[n - 1]) - yaw(&c.frames[0])) / (n - 1) as f32 } else { 0.0 };
+    let mean = c.frames.iter().enumerate().map(|(i, b)| wrap(yaw(b) - per * i as f32 - yaw(&c.frames[0]))).sum::<f32>() / n as f32 + yaw(&c.frames[0]);
+    let s = c.standing[J_HIPS].pos;
+    let straight = |i: usize| {
+        let b = &c.frames[i];
+        let turn = -(per * i as f32 + mean);
+        let q = [0.0, (turn / 2.0).sin(), 0.0, (turn / 2.0).cos()];
+        let r = vrc_vr::Pose { orientation: q, position: [0.0; 3] };
+        let (dx, dz) = (b[J_HIPS].pos[0] - s[0], b[J_HIPS].pos[2] - s[2]);
+        let mut out = *b;
+        for j in out.iter_mut() {
+            let p = r.rotate([j.pos[0] - dx - s[0], 0.0, j.pos[2] - dz - s[2]]);
+            j.pos = [s[0] + p[0], j.pos[1], s[2] + p[2]];
+            j.rot = vrc_vr::pose::quat_mul(q, j.rot);
+        }
+        out
+    };
+    let x = phase.rem_euclid(1.0) * n as f32;
+    let i = (x.floor() as usize).min(n - 1);
+    vrc_vr::motion::blend(&straight(i), &straight((i + 1) % n), x - i as f32)
 }
 
 /// A foot steps to where the body would stand it once it is this far off
@@ -594,6 +819,9 @@ impl Anim {
         let mut link: Option<HmdLink> = None;
         let mut osc: Option<Osc> = None;
         let mut speed = 0.0f32;
+        // Off the body's facing the walk goes (degrees, + right): the legs
+        // step that way (`ground_motion`).
+        let mut walk_off = 0.0f32;
         let mut eye_height = 0.0f32;
         let mut airborne = false;
         let mut gait = Gait::default();
@@ -635,10 +863,10 @@ impl Anim {
                 }
                 let velocity = osc.as_ref().map(|o| (o.query("/avatar/parameters/VelocityZ"), o.query("/avatar/parameters/VelocityX")));
                 match velocity {
-                    Some((Ok(z), x)) => speed = ground_speed(z as f32, x.map_or(0.0, |x| x as f32)),
+                    Some((Ok(z), x)) => (speed, walk_off) = ground_motion(z as f32, x.map_or(0.0, |x| x as f32)),
                     _ => {
                         osc = None;
-                        speed = 0.0;
+                        (speed, walk_off) = (0.0, 0.0);
                     }
                 }
                 // Off the ground (a jump, a fall): the legs tuck up.
@@ -690,9 +918,12 @@ impl Anim {
             let stature = if eye_height > 0.0 { eye_height / 0.936 } else { 1.6 };
             let gait_on = self.trackers.lk().gait;
             let walking = if owner.still || manual || !gait_on { None } else { gait.update(&bridge.motions, speed, stature, dt, airborne) }.map(|body| {
+                // The legs step the way the bot goes (a walk at a slant, a
+                // step aside): stepping along the body's facing instead,
+                // the feet crossed.
                 let stand = vrc_vr::motion::Stand {
                     eyes: owner.state.head.position,
-                    yaw_deg: owner.state.body_yaw,
+                    yaw_deg: owner.state.body_yaw + walk_off,
                     floor_y: FLOOR_Y,
                 };
                 let parts = self.trackers.lk().parts().unwrap_or_default();
@@ -759,18 +990,29 @@ impl Anim {
     }
 }
 
-/// The gait's speed from the avatar's velocity (its own axes: `z` ahead,
-/// `x` right): over the ground, backwards when it goes back. A step aside
-/// walks the legs too (it slid with `VelocityZ` alone: the last metre onto a
-/// named place goes aside, `VrCore::settle`).
-fn ground_speed(z: f32, x: f32) -> f32 {
+/// The gait from the avatar's velocity (its own axes: `z` ahead, `x`
+/// right): the speed over the ground (backwards when it goes back) and the
+/// way off the body's facing the legs step (degrees, + right; at most
+/// WALK_OFF_MAX_DEG, a step aside walking at that slant). A step aside walks
+/// the legs too (it slid with `VelocityZ` alone, D44), and they step the
+/// way it goes (stepping ahead while going aside, the feet crossed, D46).
+fn ground_motion(z: f32, x: f32) -> (f32, f32) {
     let over = z.hypot(x);
-    if z < 0.0 && -z >= x.abs() {
-        -over
+    if over < 1e-3 {
+        return (0.0, 0.0);
+    }
+    let way = x.atan2(z).to_degrees();
+    if way.abs() <= 100.0 {
+        (over, way.clamp(-WALK_OFF_MAX_DEG, WALK_OFF_MAX_DEG))
     } else {
-        over
+        // Going back: the cycle backwards, along the way back.
+        let back = (way + 360.0) % 360.0 - 180.0;
+        (-over, back.clamp(-WALK_OFF_MAX_DEG, WALK_OFF_MAX_DEG))
     }
 }
+
+/// How far off the body's facing the legs step at most (degrees).
+const WALK_OFF_MAX_DEG: f32 = 60.0;
 
 #[cfg(test)]
 mod feet_tests {
@@ -792,11 +1034,17 @@ mod feet_tests {
     }
 
     #[test]
-    fn a_step_aside_walks_the_legs() {
-        assert_eq!(ground_speed(1.0, 0.0), 1.0);
-        assert!((ground_speed(0.0, 0.5) - 0.5).abs() < 1e-6, "aside: walking");
-        assert!((ground_speed(0.0, -0.5) - 0.5).abs() < 1e-6);
-        assert!((ground_speed(-1.0, 0.2) + 1.0198).abs() < 1e-3, "back: backwards");
+    fn a_step_aside_walks_the_legs_the_way_it_goes() {
+        assert_eq!(ground_motion(1.0, 0.0), (1.0, 0.0));
+        let (s, off) = ground_motion(1.0, 1.0);
+        assert!((s - 2f32.sqrt()).abs() < 1e-5 && (off - 45.0).abs() < 1e-3, "a slant: the legs that way");
+        let (s, off) = ground_motion(0.0, 0.5);
+        assert!((s - 0.5).abs() < 1e-6 && (off - WALK_OFF_MAX_DEG).abs() < 1e-3, "aside: at most the slant");
+        let (s, off) = ground_motion(0.0, -0.5);
+        assert!((s - 0.5).abs() < 1e-6 && (off + WALK_OFF_MAX_DEG).abs() < 1e-3);
+        let (s, off) = ground_motion(-1.0, 0.2);
+        assert!((s + 1.0198).abs() < 1e-3 && (off + 11.31).abs() < 0.05, "back: backwards, slanting the same way as the step: {off}");
+        assert_eq!(ground_motion(0.0, 0.0), (0.0, 0.0));
     }
 
     #[test]
@@ -833,6 +1081,150 @@ mod feet_tests {
             for f in &now {
                 assert!(turn_between(yaw_of(f), turn).abs() < STEP_TURN_DEG + 1.0, "turn {turn}: a foot at {}", yaw_of(f));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod gait_tests {
+    use super::*;
+
+    /// A cycle of `n` frames standing, the hips turning `turn_deg` over it
+    /// (+ left).
+    fn clip(n: usize, turn_deg: f32) -> vrc_vr::motion::Clip {
+        let standing = serde_json::json!({"hips":[0,0.53,0],"chest":[0,0.72,0],"head":[0,0.868,0],"l_leg":[0.0955,0.285,0],"r_leg":[-0.0955,0.285,0],"l_foot":[0.0955,0.039,0],"r_foot":[-0.0955,0.039,0],"l_forearm":[0.16,0.6,0],"r_forearm":[-0.16,0.6,0],"l_hand":[0.18,0.45,0],"r_hand":[-0.18,0.45,0]});
+        let frames: Vec<Vec<f32>> = (0..n)
+            .map(|i| {
+                let a = (turn_deg * i as f32 / n as f32).to_radians() / 2.0;
+                let mut row = Vec::new();
+                for (k, j) in vrc_vr::motion::JOINTS.iter().enumerate() {
+                    let p = standing[j].as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect::<Vec<_>>();
+                    let rot = if k == J_HIPS { [0.0, a.sin(), 0.0, a.cos()] } else { [0.0, 0.0, 0.0, 1.0] };
+                    row.extend([p[0], p[1], p[2] + 0.03 * i as f32]);
+                    row.extend(rot);
+                }
+                row
+            })
+            .collect();
+        let json = serde_json::json!({"name": "cycle", "fps": 30.0, "loop": true, "root": "in_place", "joints": vrc_vr::motion::JOINTS, "standing": standing, "frames": frames, "speed": 0.7});
+        vrc_vr::motion::Clip::parse(json.to_string().as_bytes()).unwrap()
+    }
+
+    /// The legs walking `secs` at `speed` (m/s, 1.6 m tall): each tick's
+    /// body.
+    fn walk(speed: f32, secs: f32) -> Vec<vrc_vr::motion::Body> {
+        let c = clip(32, 0.0);
+        let mut g = Gait::default();
+        (0..(secs / 0.022) as usize).filter_map(|_| g.step(&c, &c, None, speed, 1.6, 0.022, false)).collect()
+    }
+
+    #[test]
+    fn a_foot_on_the_ground_stays_put() {
+        for speed in [1.0, 2.2, 4.0] {
+            let bodies = walk(speed, 5.0);
+            let floor = 0.039;
+            let mut held = 0;
+            for w in bodies[150..].windows(2) {
+                for f in J_FEET {
+                    let (a, b) = (w[0][f].pos, w[1][f].pos);
+                    // Flat on the floor both ticks: it moved back as fast as
+                    // the floor went by.
+                    if a[1] < floor + 1e-4 && b[1] < floor + 1e-4 {
+                        let moved = b[2] - a[2];
+                        assert!((moved + speed / 1.6 * 0.022).abs() < 1e-3, "{speed} m/s: moved {moved}");
+                        held += 1;
+                    }
+                }
+            }
+            assert!(held > 20, "{speed} m/s: {held}");
+        }
+    }
+
+    #[test]
+    fn the_feet_lift_take_turns_and_step_as_people_do() {
+        for (speed, high, most) in [(1.2, 0.045, 1.6), (4.0, 0.08, 2.4)] {
+            let bodies = walk(speed, 6.0);
+            let ups: Vec<[f32; 2]> = bodies[150..].iter().map(|b| J_FEET.map(|f| b[f].pos[1] - 0.039)).collect();
+            for side in 0..2 {
+                let top = ups.iter().map(|u| u[side]).fold(0.0, f32::max);
+                assert!(top > high, "{speed} m/s, foot {side}: lifts {top}");
+            }
+            if speed < 2.0 {
+                // Walking, one foot is always on the floor.
+                assert!(ups.iter().all(|u| u[0].min(u[1]) < 0.03), "{speed} m/s: both feet up");
+            }
+            // Cycles a second: the left foot's lifts.
+            let lifts = ups.windows(2).filter(|w| w[0][0] < 0.03 && w[1][0] >= 0.03).count() as f32;
+            let secs = ups.len() as f32 * 0.022;
+            assert!(lifts / secs > 1.0 && lifts / secs < most, "{speed} m/s: {} cycles a second", lifts / secs);
+        }
+    }
+
+    #[test]
+    fn the_toes_point_down_as_the_foot_leaves_and_up_as_it_lands() {
+        let bodies = walk(1.5, 4.0);
+        let toes = |b: &vrc_vr::motion::Body, f: usize| vrc_vr::Pose { orientation: b[f].rot, position: [0.0; 3] }.rotate([0.0, 0.0, 1.0])[1];
+        let mut seen = (false, false);
+        for w in bodies[100..].windows(2) {
+            let (a, b) = (w[0][J_FEET[0]].pos[1], w[1][J_FEET[0]].pos[1]);
+            if a < 0.039 + 0.02 && b >= 0.039 + 0.02 {
+                assert!(toes(&w[1], J_FEET[0]) < -0.15, "leaving: {}", toes(&w[1], J_FEET[0]));
+                seen.0 = true;
+            }
+            if a > 0.039 + 1e-4 && b <= 0.039 + 1e-4 {
+                assert!(toes(&w[1], J_FEET[0]) > 0.1, "landing: {}", toes(&w[1], J_FEET[0]));
+                seen.1 = true;
+            }
+        }
+        assert!(seen.0 && seen.1, "{seen:?}");
+    }
+
+    #[test]
+    fn the_knees_bend_forward_and_the_legs_reach() {
+        for b in &walk(2.0, 4.0)[100..] {
+            for i in 0..2 {
+                let (hips, knee, foot) = (b[J_HIPS].pos, b[J_KNEES[i]].pos, b[J_FEET[i]].pos);
+                // Ahead of the line from the hip to the ankle.
+                let t = (knee[1] - hips[1]) / (foot[1] - hips[1]);
+                assert!(knee[2] >= hips[2] + (foot[2] - hips[2]) * t - 1e-3, "{knee:?} {hips:?} {foot:?}");
+                let reach = (foot[2] - hips[2]).hypot(foot[1] - hips[1]);
+                assert!(reach < 0.53 - 0.039 + 0.05, "{reach}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_feet_rest_on_the_ground_shorter_the_faster() {
+        let c = clip(32, 0.0);
+        let mut last = 1.0;
+        for speed in [0.6, 1.2, 1.8, 3.0, 4.0] {
+            let mut g = Gait::default();
+            let mut down = 0;
+            for t in 0..400 {
+                g.step(&c, &c, None, speed, 1.6, 0.022, false);
+                if t >= 150 && g.feet.unwrap()[0].down {
+                    down += 1;
+                }
+            }
+            let share = down as f32 / 250.0;
+            assert!(share < last, "{speed} m/s: {share} on the ground, slower {last}");
+            last = share;
+        }
+        assert!(last < 0.36, "{last}");
+    }
+
+    #[test]
+    fn the_captured_turn_is_taken_out() {
+        let c = clip(24, 17.0);
+        let yaw = |b: &vrc_vr::motion::Body| {
+            let a = vrc_vr::Pose { orientation: b[J_HIPS].rot, position: [0.0; 3] }.rotate([0.0, 0.0, 1.0]);
+            a[0].atan2(a[2]).to_degrees()
+        };
+        for k in 0..50 {
+            let b = cycle_pose(&c, k as f32 / 50.0);
+            assert!(yaw(&b).abs() < 0.5, "{k}: {}", yaw(&b));
+            // In place: the hips where they stand.
+            assert!(b[J_HIPS].pos[2].abs() < 1e-4 && b[J_HIPS].pos[0].abs() < 1e-4);
         }
     }
 }

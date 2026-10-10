@@ -1,5 +1,5 @@
-//! A 2.5D grid over the ground around the bot, from the panorama's depth
-//! points in the tracking space. Each cell keeps a histogram of the heights of its points
+//! A 2.5D grid over the ground around the bot, from stereo points in the
+//! tracking space. Each cell keeps a histogram of the heights of its points
 //! (up to a bit over the eyes; ceilings are left out), and from it:
 //!
 //! - its ground: the lowest height enough of its points rest on (a floor,
@@ -11,10 +11,10 @@
 //! walking between neighbouring cells is decided by their height difference
 //! (see `candidates::reachable`), not by one floor for the whole map.
 //!
-//! Distances are tracking units (world metres times a constant per avatar
-//! height: `vrc_pano::Tracking::metres`); `MapParams::in_units` turns world
-//! thresholds into them. Depth is sparse far away, so a cell needs several
-//! points, and a share of them, to call anything.
+//! Distances are the stereo's units (see `vrc_stereo`: world metres times a
+//! constant per avatar height); `MapParams::in_units` turns world thresholds
+//! into them. Stray matches are common far away and on flat colours, so a
+//! cell needs several points, and a share of them, to call anything.
 
 /// What a cell holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,7 +73,7 @@ impl Default for MapParams {
 
 impl MapParams {
     /// These parameters with the world-metre ones (`step`, `drop`, `jump`,
-    /// `self_radius`) given in world metres, turned into tracking units at
+    /// `self_radius`) given in world metres, turned into stereo units at
     /// `metres` world metres per unit.
     pub fn in_units(self, metres: f32) -> MapParams {
         MapParams {
@@ -171,7 +171,7 @@ impl HeightMap {
     }
 
     /// Marks the cells within `radius` of (x, z) as obstacles: something
-    /// stopped a walk there that the depth did not show (glass, an invisible wall).
+    /// stopped a walk there that stereo did not see (glass, an invisible wall).
     pub fn mark_blocked(&mut self, x: f32, z: f32, radius: f32) {
         let k = (radius / self.params.cell).ceil() as i32;
         for dr in -k..=k {

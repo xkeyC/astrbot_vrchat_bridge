@@ -1,6 +1,6 @@
 # agent-vr-use：代理怎样操作 VRChat 的 VR 界面（2026-10-06）
 
-> 给以后的代理（和人）用：怎样通过 bridge 的调试接口打开快捷菜单、进完整设置、用射线点按钮、做全身校准，打开用户相机（第 8 节，2026-10-08），以及全景的调试接口（第 7 节）。数字都是 2026-10-06 在服务器上实测的（每只眼 1920×1920、视场 100°，xrizer + Monado remote 驱动模拟 Index 手柄）。
+> 给以后的代理（和人）用：怎样通过 bridge 的调试接口打开快捷菜单、进完整设置、用射线点按钮、做全身校准，打开用户相机（第 7 节，2026-10-08）。数字都是 2026-10-06 在服务器上实测的（每只眼 1920×1920、视场 100°，xrizer + Monado remote 驱动模拟 Index 手柄）。
 
 ## 1. 接口
 
@@ -23,12 +23,12 @@ sudo sh bapi.sh METHOD PATH [JSON] [OUTFILE]   # BRIDGE=http://host:port 可改�
 | `POST /v1/vr/attend {"pause_s":8,"since_ms":4000,"name":"xkeyC"}` | 转向正在说话（或刚说过话）的人，三项都可省；`name` 先找这个人的话，`since_ms` 先找刚说完的；暂停跟随 `pause_s` 秒；中央名牌亮着才 `confirmed`（[speaker.md](speaker.md) 2.7） |
 | `GET /v1/speakers` | 说话人追踪：已定位的玩家、最近的语音段和归属 |
 | `POST /v1/speakers/record {"seconds":60}` | 录制校准数据（两耳音频、每 10 ms 的检测和投票、名牌截图），目录在 token 旁的 `speakers/` |
-| `POST /v1/vr/usercam {"open":true}` | 打开用户相机并设好（第 8 节）：`stow`（默认开：把取景器拖进身体）、`check`（默认开：验证桌面显示相机）、`keep_open`（默认开：游戏重启或换世界后自己再打开）、`stow_delta`；`{"close":true}` 关掉；`"orbit"`：true、false 或要改的镜头设置（第 8 节"镜头绕圈"），可以单独发 |
+| `POST /v1/vr/usercam {"open":true}` | 打开用户相机并设好（第 7 节）：`stow`（默认开：把取景器拖进身体）、`check`（默认开：验证桌面显示相机）、`keep_open`（默认开：游戏重启或换世界后自己再打开）、`stow_delta`；`{"close":true}` 关掉；`"orbit"`：true、false 或要改的镜头设置（第 7 节"镜头绕圈"），可以单独发 |
 | `POST /v1/vr/usercam {"stow":true}` | 相机已经开着时把取景器收进身体：取景器停在追踪空间里上次的位置，只有打开时才出现在右手边已知的位置，所以先关掉相机（`/usercamera/Close`），再按上面的步骤重新打开并拖进身体（游戏会保存相机的设置）。回复同打开，多一个 `reopened` |
 | `GET /v1/vr/usercam` | 相机状态（OSCQuery 读到的 `Mode`、飞行模式、UI 遮罩）、设置、上次打开的报告和位姿；`orbit`：镜头在绕圈还是为什么没有、移动输入、最近的 Pose、计数、读名牌的情况 |
 | `GET /v1/vr/usercam/names?since_ms=10000` | 镜头最近读到的名牌（最多 60 s）：名字、相对头的方位、镜头（orbit / travel / front / attend / look）、光环分数（[speaker.md](speaker.md) 2.4） |
-| `GET /v1/vr/people` | 身边的人（D39）：名字、位置（世界、追踪空间）、相对头的方位和距离、最后看到、来源（`overlay` / `lens` / `asked` / `sweep` / `kept`），和闲时镜头一圈的安排（`idle_sweep`） |
-| `POST /v1/vr/usercam/look {"bearing_deg": 40}` | 镜头看一眼那个方向读名字，然后回到朝前（第 8 节） |
+| `GET /v1/vr/patrol` | 闲时巡视（D45）：次数、上次多久以前、用时、眼睛读到的名字（`eyes`）、镜头读到的（`lens`）、为什么跳过 |
+| `POST /v1/vr/usercam/look {"bearing_deg": 40}` | 镜头看一眼那个方向读名字，然后回到身后（第 7 节） |
 | `POST /v1/vr/usercam/shot` | 放好相机并返回它看到的画面（JPEG，位姿在 `X-Usercam-Pose`）：`{"pose":[x,y,z,俯仰,偏航,横滚]}`（世界坐标），或绕头 `{"bearing_deg":0,"distance_m":0,"height_m":0.3,"look":"out"/"back","pitch_deg":0}` |
 | `POST /v1/vr/usercam/sweep {"views":6}` | 绕头一圈，拼成一张图（每行 3 张、每张 640×360，从正前方顺时针，方位在 `X-Usercam-Bearings`） |
 
@@ -191,69 +191,14 @@ HOST=user@server D=0.65 OUT=/tmp/x sh tools/agent-vr/aim.sh U V click    # 悬�
 
 ## 6. 当前画质设置（2026-10-06）
 
-- 每只眼 **1920×1920**（Monado `config_v0.json` 的 `w_pixels` 3840、`h_pixels` 1920，原来是 1280，备份为 `.pre-res-*`）。（2026-10-09 起深度来自化身全景，眼睛分辨率只影响画在眼睛上的名牌能不能读清。）
+- 每只眼 **1920×1920**（Monado `config_v0.json` 的 `w_pixels` 3840、`h_pixels` 1920，原来是 1280，备份为 `.pre-res-*`）。双目匹配按约 640 宽进行（`vrc_stereo::match_scale`），换分辨率不影响避障。
 - 桌面窗口 640×360（注册表 `Screenmanager Resolution*`，备份为 `user.reg.bak-*`）。
 - 游戏内图形设置：镜子渲染分辨率 100%（原 25%），抗锯齿 X4（原 X2），细节层次 高（原 低），阴影 低。追踪器显示外观 方向轴。
 - GPU 占用约 34%，显存约 4.6 GB（原来约 10%、3.6 GB）。
 
-## 7. 全景（化身的 6 台相机，2026-10-08；默认开，2026-10-09）
+## 7. 用户相机：远程的眼睛（2026-10-08；D45 起默认看身后）
 
-化身的 `Pano` 参数打开后，两只眼整个被全景占满：左眼是 6 个面的彩色，右眼同位置是深度（E1C），左下角保留区里有 PosBeacon 和全景条码 0x5B（协议见 avatar-panorama.md，决策见 [decisions.md](decisions.md) D33、D36）。`--pano` 默认 `auto`：在世界里就开，化身 3 s 内没有 0x5B 就回退到普通视角。看眼睛的功能都已移植：有全景帧时，环视、跟随、目击、说话人视觉、截图都从全景读，名字来自用户相机的镜头（第 8 节）和 VRChat 画在眼睛上的名牌；没有时照旧。
-
-有全景时各功能的样子：
-
-- **环视**（`/v1/vr/survey`、`goto`）：一帧全景，不转头（D42 起没有别的方式；没有全景时报错）；玩家带 `distance_m`、`bearing_deg`；另有 `named_bearings`（读到名字、名牌下面没找到人：只有方位）。没读到名字的人形不列出，镜头也不去看（"也许有人"已关，见 D36）。
-- **跟随**：`GET /v1/follow` 的 `seen_by`：`named`（这次眼睛上的名牌读到了名字）、`lens`（镜头读到了名字，D40）、`kept`（按位置接着认）。没有全景时（化身没带、普通视角租给菜单）跟随原地等待，日志 "follow: no panorama: waiting for it"（D42）。跟丢时先用镜头找、身体不动（D37、D41）：镜头快拍一圈（`search_stage: "lens_ring"`，6 个固定视角，第一个对着最后读到名字的地方、没有就最后定位的地方，其余左右交替往外 ±60°、±120°、180°，每拍到一张就切下一个，约 1 s；读到他的名字镜头立刻切过去，日志 "usercam lens: the sweep read whom it looked for: the lens to them"），再不行身体转向最后读到名字的方向、再转向最后的位置（`body_turn`，日志 "follow: lost them (panorama)"），第二次找起再转 4 个方向（`scan`）。全景时 1 s 没看到（站着、走着都一样）就算跟丢、腿站住、开始快拍。
-- **按位置接着认的期限和确认**（D40）：只在最后一次读到名字 `kept_s`（默认 7 s）以内按位置接着认；1 s 没读到名字（D41，原来 2.5 s），镜头看一眼被认的那个（停 1.5 s，至少隔 3 s，日志 "follow: kept by position, no name a while: the lens looks"）：读到他的名字算确认，读到别人的名字、或读了 3 次都没有名字，就丢掉、立刻找（日志 "follow: the one kept by position is not them: lost"）。镜头（任何时候、任何方向）读到他的名字，跟随马上用那个位置（深度里的人，或方位加上次的距离，`seen_by: "lens"`，日志 "follow: the lens read their name: there"）。`GET /v1/follow` 的 `confirm`：`unnamed_s`（多久没读到名字）、`asking`（正在看的方向）、`looks`、`confirmed`、`drops`、`last`（`named` / `other name` / `no name` / `expired` / `unanswered`）、`last_ago_s`；`head_pitch_deg`（看他的俯仰：按名牌高度，平滑，±30°）；`settings.kept_s`。改：`POST /v1/follow {"settings": {"kept_s": 6}}`（3–30，不存盘，跟随照常）。
-- **跟随时的镜头**（D40）：站着（或刚停下）时朝前的镜头朝目标（`GET /v1/vr/usercam` 的 `orbit.following`、`orbit.aim`），目标偏 30° 重瞄（`counts.target_poses`），20 s 没放过就重放（`follow_stale_s`，`counts.stale_poses`）；走路时照旧是行进镜头。
-- **跟随绕障**（D37）：`GET /v1/follow` 的 `avoid`：
-  - `why`：这一段在绕什么（`wall` 沿墙、`map` 按地图、`jump` 要跳、`detour` 卡住后转向；不在绕是 null），`age_s` 绕了多久，`progress_age_s` 上次离目标近 0.5 m 是多久以前；
-  - `timeout_s`（30）、`stall_s`（15）、`unseen_s`（6）：整段超时、没进展、看不见的门限；
-  - `replans`（跟着目标现在的位置重新规划的次数）、`relocates`（重新定位的次数）、`in_row`（连续几次，到 3 就站 8 s，`resting_s` 还剩多久）、`last_relocate`（`stalled` / `timeout` / `lost`）、`lens_looks`（绕的时候镜头看目标的次数）。
-  - `avoiding` 是这一帧的动作，多了 `relocate`（停下重新找）、`rest`（站着等）。日志："follow: going round got nowhere: re-locating"、"follow: going round, not seen: lost"、"follow: going round again and again: standing a while"。
-- **截图**：`GET /v1/screenshot` 是全景里朝头的方向的 100° 视图（`pitch` 抬低视线，头不动）；`normal=1` 借普通视角拍眼睛。
-- **普通视角**：校准、打开用户相机借租约（关全景、等到一帧普通画面，结束 3 s 后开回去）；`/v1/vr/hand`、菜单按钮（`/v1/vr/input`，名字带 Menu）、`screenshot?normal=1` 让普通视角保持 20 s，所以 `tools/agent-vr/` 里一步步操作菜单的脚本照常能用（截图要加 `normal=1`）。
-
-| 接口 | 作用 |
-|---|---|
-| `GET /v1/vr/pano` | 状态：`setting`（启动参数）、`wanted`（想不想开）、`effective`（现在该不该开：有普通视角租约、租约结束 3 s 内、`auto` 回退期间都不开）、`sent`（最后发出的 OSC 和多久以前）、`observed`（最近一帧是 `pano`、`unusable` 还是 `normal`，`unusable` 时 `why` 说原因）、`last_code`（最后一个条码：相机中心的世界坐标、`rig_yaw`、seq、age、layout、route、code、深度范围，和同一帧 PosBeacon 的头）、`fallback`（开了 0.5 s 还没看到 0x5B：化身没有全景装置）、`frame`（最后解码的一帧：解码耗时、标定残差、`calibration_cells_out`（被界面盖住、被剔除的标定格数）、`vignette`、`check`（E1C 校验在深度像素上的两项残差的 50%、99% 分位，单位是"一个字节值多少级"，和被当成界面遮掉的比例；用来调 `check_rg`、`check_b`）、`depth_ordinal`、眼睛尺寸）。默认先读一帧再报；`?peek=1` 不读帧 |
-| `POST /v1/vr/pano {"on":true}` | 想开（`false` 想关），发 OSC `/avatar/parameters/Pano`，然后最多等 1.5 s，看到眼睛变成全景（或变回普通画面）就返回状态。之前判过 `fallback` 的，这里会重新问一次 |
-| `GET /v1/vr/pano.jpg?kind=color&width=2048` | 最新一帧全景：`color` 是以头的朝向居中的 equirect（前方在中间，向右为正，宽 256–4096，高是宽的一半）；`depth` 是同一张的深度（近红远蓝，没有深度是黑）；`tiles` 是 6 个面在眼睛里的样子，彩色在左、深度在右（默认宽 1920）。不是全景时 409，报原因 |
-| `GET /v1/vr/pano/points?step=16` | 每隔 `step` 个像素取一个点（每个面），世界坐标换成地图坐标 `[x, y, -z, r, g, b]`（米），最多 20 万个；`&format=ply` 返回 ASCII PLY（Unity 世界坐标原样），可以拿 MeshLab 之类打开看 |
-
-用法和注意：
-
-- 看一眼：`GET /v1/vr/pano.jpg?kind=color` 和 `kind=depth`（`auto` 时本来就开着）。VRChat 的界面（名牌、取景器）盖在全景上：深度里那块是空的，颜色里那块（右移最多 50 px 的视差）是别的面补的或黑的。
-- 条码检查不过的帧（刚打开 age < 2、两只眼不一致、seq 和 PosBeacon 对不上、layout 不认识）一律不用，状态里 `observed.mode` 是 `unusable`。
-- 校准（`POST /v1/vr/calibrate`）会先借用普通视角：关掉全景、等到一帧普通画面，结束 3 s 后再开回去。全景从没开过时这一步不读帧，没有代价。
-- 启动参数：`--pano auto`（默认：在世界里就开，每 5 s 重发；化身 3 s 内没出 0x5B 就回退，60 s 后或下次进世界时再问）、`--pano on`（一直开）、`--pano off`（只有上面的接口能开）。状态里 `in_world`、`held_normal_ms`（菜单操作保持普通视角还剩多久）。
-- 实测（VRChat Home，第一版 rig）：向下那面中心 1.18 m（眼高 1.176 m），标定残差 0.13–0.17 级；本机解一帧 4 线程约 10 ms。
-- 深度只读 E1C（decisions.md D33 补充）：条码 code 不是 2 的帧是 `unusable`（`why`："the depth is not E1C"），说明化身上还是旧的全景装置，要重新上传。VRChat 自己的界面（名牌、取景器）盖在全景上：右眼校验不过的像素没有深度、左眼对应的位置（往右最多 50 px 的视差）没有颜色；`pano.jpg?kind=color` 里那里是别的面补的颜色或黑色，`/v1/vr/pano/points` 里颜色是 null（PLY 里是品红）。解一帧本机 4 线程约 22 ms。
-
-### 待测（全景默认，D36；每项 10 分钟以内）
-
-1. **默认开**：重启 bridge、进世界，30 s 内 `GET /v1/vr/pano` 的 `effective` 为 true、`observed.mode` 为 `pano`、`last_code.depth_code` 为 2、`frame.check` 的 99% 分位在 6 和 10 以内。换一个化身（没有全景装置）：3 s 后 `fallback` 为 true，`/v1/vr/survey` 回复 `source: "head scan"`。
-2. **环视**：请一位好友站在 bot 前方 2–3 m，再到右侧、身后各一次，每次 `POST /v1/vr/survey`：`players` 里有他、`distance_m` 和实际差 0.3 m 以内、`bearing_deg` 对；编号全景图以朝向居中；俯视图里地面、墙对。好友站在 bot 身后、镜头和眼睛都没读到他的名字时，他不出现在 `players`（只在房间名单里）。
-3. **跟随**：`POST /v1/follow {"name": "<好友>"}`，好友慢走、转弯、绕过家具，看 `GET /v1/follow` 的 `seen_by` 在 `named`、`kept` 之间、`distance_m` 合理；好友躲到墙后：bot 转向他最后读到名字的方向，镜头也转过去。两个人交叉走过时，看会不会跟错人（`seen_by` 为 `kept` 时）。
-4. **说话的人**：好友在 bot 前方说话，`GET /v1/speakers` 里他的 `placed_by` 是 `depth`（全景深度定位）、光环在眼睛上的名牌上量到（`glow_onset`）；在身后说话，镜头转过去（第 8 节）。
-5. **截图和菜单**：`GET /v1/screenshot` 是前方 100° 的视图；`tools/agent-vr/` 的菜单脚本（截图加 `normal=1`）照常能点；`POST /v1/vr/calibrate` 照常。
-6. **目击**：好友在房间里、不跟随时等 10 s，`GET /v1/sightings` 有他、`/v1/sightings/image` 是朝他那边的视图。
-7. **跟随绕障和找人**（D37，10 分钟以内）：
-   1. `POST /v1/follow {"name": "<好友>"}`，好友走到一面墙或一排家具后面（bot 和他之间被挡住），在后面慢慢走动。每 2 s `GET /v1/follow`：`avoid.why` 是 `wall` 或 `map`，`replans` 随他走动增加，`seen_by` 在 `named` / `kept` 之间；他 3 s 没读到名字时 `lens_looks` 加一（镜头看他一眼，走路停一下）。
-   2. 好友站在 bot 绕不过去的地方（例如玻璃后面、围栏另一边）：15 s 左右 `relocates` 加一、`last_relocate` 为 `stalled`，bot 停下、镜头看他，然后换一边绕；连续 3 次后 `avoiding` 为 `rest`、`avoid.resting_s` 倒数 8 s，bot 面向他站着，不会一直转圈。
-   3. 好友躲到 bot 看不见的地方：6 s 内 `last_relocate` 为 `lost`、`state` 为 `searching`；`search_stage` 先是 `lens_ring`（镜头快拍一圈，身体不动，`GET /v1/vr/usercam` 的 `orbit.sweeping`），读到他的名字就停（`orbit.sweep_end.how` 为 `found`），跟随接着走；读不到才 `body_turn`（身体转）。
-   4. 找人的镜头一圈中途推一下摇杆或说句话：`orbit.sweep_end.how` 为 `move` / `voice`，镜头一圈立刻停。
-8. **按位置接着认的期限、镜头确认、镜头找到就用上**（D40，10 分钟以内；部署后先 `POST /v1/follow {"name": "xkeyC"}`）：
-   1. 好友站在 bot 前方 1.5–2 m，`GET /v1/follow` 的 `seen_by` 为 `named` 或 `lens`、`confirm.unnamed_s` 小；`GET /v1/vr/usercam` 的 `orbit.following` 为 true、`orbit.aim.faced` 为 true，`orbit.last_pose.pose.yaw` 和 `orbit.aim.world_yaw` 差 30° 以内。
-   2. 好友绕到 bot 侧面 60° 左右站住（bot 不动时）：几秒内镜头转过去（`counts.target_poses` 加一，直播画面里是他）。
-   3. **广告牌**：好友站到一块广告牌、柜子之类人形大小的东西旁边，然后快步躲到墙后。`seen_by` 变 `kept` 后约 1 s（D41），`confirm.asking` 出现、镜头看向被认的东西；约 1–2 s 后 `confirm.last` 为 `no name`（或 `other name`）、`drops` 加一，`state` 变 `searching`、`search_stage` 是 `lens_ring`（快拍的第一张对着他最后读到名字的地方，D41）。全程 `seen_by: "kept"` 不超过 `kept_s`（7 s）。
-   4. **镜头找到就用上**：好友从墙后走出来、站到 bot 侧后方：镜头读到名字后（`GET /v1/vr/usercam/names?since_ms=3000` 有他），`GET /v1/follow` 马上是 `seen_by: "lens"`、`state: "following"`，bot 转身朝他。
-   5. **俯仰**：好友站到台子上或楼梯上面、或坐下：`head_pitch_deg` 相应变正、变负（±30° 以内），`GET /v1/screenshot` 里他的身子和眼睛上的名牌都在画面里。
-   6. 好友停着不动 20 s 以上：`counts.stale_poses` 会涨（每 20 s 一次）；推一下摇杆后行进镜头照常。
-
-## 8. 用户相机：远程的眼睛（2026-10-08）
-
-化身上的相机看不到名牌（只有 VRChat 自己的 UI 相机画名牌），用户相机打开 UI 遮罩后能看到。它可以用 OSC 放到世界里任何位置；直播模式下桌面窗口显示相机画面。以后全景常开（第 7 节），眼睛里只有全景拼块，所以**用户相机的直播画面就是名牌的来源**：bot 站着时镜头绕着它转一圈圈地看，走路时镜头朝前进方向看。决定见 decisions.md D34、D35。
+化身上的相机看不到名牌（只有 VRChat 自己的 UI 相机画名牌），用户相机打开 UI 遮罩后能看到。它可以用 OSC 放到世界里任何位置；直播模式下桌面窗口显示相机画面，**它是 bot 的第二只眼**：眼睛（双目、眼睛上的名牌）看前方，镜头默认越过头顶看身后（D45），两边各管一半；跟丢找人、闲时巡视时头和镜头分头看。决定见 decisions.md D34、D35、D45。
 
 ### 自动：`POST /v1/vr/usercam {"open":true}`（`crates/vrc-bridge/src/usercam.rs`）
 
@@ -277,10 +222,10 @@ HOST=user@server D=0.65 OUT=/tmp/x sh tools/agent-vr/aim.sh U V click    # 悬�
 
 起初用户要求镜头一直绕着 bot 转（下面"站着：绕圈"）。2026-10-08 晚用户改主意：绕圈太引人注意，**默认改成站着时镜头静止朝前**（`idle: "front"`），绕圈留作选项（`idle: "orbit"`）。
 
-- **站着：朝前**（`idle` 默认 `front`）。镜头停在行进镜头的位置（两眼后方 `travel.back_m`、上方 `travel.up_m`，朝头的朝向，向下 `travel.pitch_deg`）。只在头（或身体）的朝向偏离镜头超过 `travel.reaim_deg`（30°）、离上次放置至少 `travel.reaim_every_ms`（1 s）时重放：一个 `Pose`，150 ms 后关飞行。没有连续的 `Pose`，别人看不出什么。转向说话的人、看一眼某个方向、拍照之后，回到朝前。朝前时照样读名牌；朝前就和行进镜头一样，站着时往前走不用重放镜头（只等飞行关掉）。**跟随时**（D40）朝前的镜头朝目标（跟随每次定位给的方向，3 s 内有效），目标偏 30° 重瞄，20 s（`follow_stale_s`）没放过就重放；所有输入都松开就可以放（不用站够 `resume_after_s`，绕圈仍要等）。
-- **快拍一圈**（`Orbit::sweep`，D37，D41 起不再连续转）：跟随跟丢、闲时一圈时，镜头依次放到 `snap.views`（6）个固定视角（看一眼的位置 `look`，各一个 `Pose`，不管 `idle`），每个视角**拍到第一张显示它的画面**就放下一个：抓帧时刻离 `Pose` 至少 `snap.min_ms`（100 ms），而且和放 `Pose` 前的最后一帧不一样（灰度缩略图平均差 ≥ `snap.diff`），或者已经 `snap.sure_ms`（350 ms）；`snap.max_ms`（700 ms）还没拍到就跳过。OCR 在单独的线程里读，不等它就放下一个视角，最多 `snap.in_flight`（3）个同时在读；每张按它自己那个视角的 `Pose` 定位。跟随找人时第一个视角对着最后看到他的方向，其余左右交替往外（0、+60、−60、+120、−120、180）；闲时一圈从头的朝向顺时针。找人时某张读到他的名字：这一圈立刻停（`found`），镜头 `look_at` 他那个方向 2.5 s，深度沿读名的射线把他放好。一圈约 1 s（每个视角约 150 ms）。`sweep_end.how`：`done` 拍完、`found` 找到了、`stopped` 跟随放弃了、`move` 被一推打断、`voice` 有人开口、`not begun` 2 s 内没开始。只在所有移动输入都松开时开始（不等 `resume_after_s`；跟随会等腿松开最多 0.5 s）；一推（移动闸门）立刻停，所以不会在飞行模式可能开着时推。不动的镜头（看一眼、朝前）换了 `Pose` 后第一张稳了的画面立刻读，不等 OCR 的节拍。
+- **默认看身后**（D45，`travel.rear` 默认 true）：眼睛看前方（双目、眼睛上的名牌），镜头看身后，两边各管一半。站着时镜头停在头的后上方（离两眼 `travel.back_m`、高 `travel.up_m`，不在 bot 自己眼睛的视野里），朝**头的反方向**看，向下 `travel.pitch_deg`。头（或身体）转过 `travel.reaim_deg`（30°）、离上次放置至少 `travel.reaim_every_ms`（1 s）就重放：一个 `Pose`，150 ms 后关飞行。走路时行进镜头同样朝反方向（往前走就看身后），每段起步和方向偏 30° 重瞄（走路停约 200 ms）；绕障时少重瞄（`calm_travel`）。转向说话的人、看一眼某个方向、拍照、快拍之后，回到身后。`travel.rear` 设成 false 就是原来的朝前镜头（跟随时朝目标，`follow_stale_s` 没放过就重放）。所有输入都松开就可以放（不用站够 `resume_after_s`，绕圈仍要等）。
+- **快拍**（`Orbit::sweep_views`，D41、D45）：头巡视前半圈时，镜头同时巡视后半圈。跟随跟丢时（`follow.rs` 的 `search`）头从最后看到他的方向起左右交替看 3 个方向（0、±60°），镜头同时快拍对面的 3 个方向（180°、180±60°），两边合起来 6 个方向一圈；镜头读到他的名字，这一轮快拍立刻停（`found`），镜头 `look_at` 他那边 2.5 s，头转过去用双目定位。闲时巡视（`patrol.rs`）同样：头看前半圈 3 个方向（双目 + 名牌），镜头快拍身后 3 个方向。每个视角各一个 `Pose`（看一眼的位置 `look`），**拍到第一张显示它的画面**就放下一个：抓帧时刻离 `Pose` 至少 `snap.min_ms`（100 ms），而且和放 `Pose` 前的最后一帧不一样（灰度缩略图平均差 ≥ `snap.diff`），或者已经 `snap.sure_ms`（350 ms）；`snap.max_ms`（700 ms）还没拍到就跳过。OCR 在单独的线程里读，最多 `snap.in_flight`（3）个同时在读；每张按它自己那个视角的 `Pose` 定位。3 个视角约 0.5 s。`sweep_end.how`：`done` 拍完、`found` 找到了、`stopped` 放弃了、`move` 被一推打断、`voice` 有人开口（闲时巡视那一轮）、`not begun` 2 s 内没开始。只在所有移动输入都松开时开始；一推（移动闸门）立刻停。不动的镜头换了 `Pose` 后第一张稳了的画面立刻读，不等 OCR 的节拍。
 - **绕障时少重瞄**（`Orbit::calm_travel`，D37）：跟随绕障时行进镜头偏离超过 60°、至少隔 3 s 才重瞄（平时 30°、1 s），`calm_ms` 是还剩多久。
-- **看一眼某个方向读名字**（`look`）：`POST /v1/vr/usercam/look {"bearing_deg": 40}`（相对头的朝向，向右为正；`tol_deg` 默认 15，`wait_ms` 默认 1500、最多 5000）。那个方向 1 s 内读到过名字就直接回答；否则镜头放到头外 0.3 m 朝那边看（同转向说话的人的镜头），等到读到名字或超时，然后回到朝前。走路时和重瞄一样，两个轴先松开一下。代码里是 `Orbit::look_at`、`Orbit::name_toward`：跟随、环视给全景里的人认名字时用。
+- **看一眼某个方向读名字**（`look`）：`POST /v1/vr/usercam/look {"bearing_deg": 40}`（相对头的朝向，向右为正；`tol_deg` 默认 15，`wait_ms` 默认 1500、最多 5000）。那个方向 1 s 内读到过名字就直接回答；否则镜头放到头外 0.3 m 朝那边看（同转向说话的人的镜头），等到读到名字或超时，然后回到身后。走路时和重瞄一样，两个轴先松开一下。代码里是 `Orbit::look_at`、`Orbit::name_toward`。
 - **站着：绕圈**（`idle: "orbit"`）。每秒 `rate_hz`（30）个 `/usercamera/Pose`：以两眼中点（位置角标，每秒读一次）为圆心，半径 `radius_m`（0.7 m，在头外面）、高 `height_m`（0，和眼睛一样高）加上一圈两次的起伏 `bob_m`（0.04 m），朝外、向下 `pitch_deg`（8°），`period_s`（3 s）一圈：每个 `Pose` 转 4°（镜头移 5 cm），差不多一帧一个，看起来是连续的（20 个/秒时是 6°）。从头的朝向开始，停下再接着上次的角度转。飞行模式开着，bot 站着不碍事。竖直视场 60° 的 16:9 画面横向约 91°，一个名牌每圈在画面里约 0.75 s，每秒读 4 次就有约 3 次机会。
 - **移动前的互锁**：所有移动输入（跟随的腿、`/v1/step`、`goto`、摇杆、跳、`/v1/vr/input` 的 Move*）都经过同一个关口，`vrc_vr::osc` 的移动闸门（`set_move_gate`，所有 `Osc` 发 `/input/Vertical`、`Horizontal`、`Jump`、`MoveForward/Backward/Left/Right` 之前都先过它）：
   1. 站着时来了一次推（不为 0 的值）：停止绕圈；把镜头放到**行进镜头**的位置（`travel`：两眼后方 `back_m` 0.35 m、上方 `up_m` 0.35 m，朝这次推的方向 = 头的朝向 + 摇杆的方向，向下 `pitch_deg` 12°），和镜头现在的朝向差不到 `leg_deg`（10°）就不重放；
@@ -290,14 +235,14 @@ HOST=user@server D=0.65 OUT=/tmp/x sh tools/agent-vr/aim.sh U V click    # 悬�
 - **恢复绕圈**：所有移动输入都松开、并且 bot 自己的速度（里程计）也停了 `resume_after_s`（1.5 s）之后。某个移动输入 30 s 都没松开、bot 又一动不动（发送的任务死了），也当成停了。
 - **相机关着**（每 2 s 读一次 `Mode`）：什么都不做；自动重开（`keep_open`）或手动打开之后自己接着绕。设置里 `on: false` 也停。
 - **不绕的时候**：最后一个 `Pose` 之后 150 ms 自己关一次飞行模式，300 ms 后用 OSCQuery 看一眼，还开着就再发（最多 3 次）。
-- **有人开口：镜头转过去**（`attend_onset`，**2026-10-09 起默认关**：每段话一开口镜头就甩过去太突兀。全景眼睛上 VRChat 照样画出前方的名牌；bot 闲着、被叫到时它自己转过去（`POST /v1/vr/attend`，跟随、走动、菜单时不转，[speaker.md](speaker.md) 2.7）。打开这项就恢复下面的做法）。说话人追踪开了一段新的话（不是 bot 自己的回声），并且有了方位（归属的玩家的方位，或者投票的峰：20 个有效频点就够先看一眼）：
+- **有人开口：镜头转过去**（`attend_onset`，**2026-10-09 起默认关**：每段话一开口镜头就甩过去太突兀。眼睛看前方、镜头看身后，两边的名牌都在读；bot 闲着、被叫到时它自己转过去（`POST /v1/vr/attend`，跟随、走动、菜单时不转，[speaker.md](speaker.md) 2.7）。打开这项就恢复下面的做法）。说话人追踪开了一段新的话（不是 bot 自己的回声），并且有了方位（归属的玩家的方位，或者投票的峰：20 个有效频点就够先看一眼）：
   1. 停止绕圈，镜头放到头外 `attend.out_m`（0.3 m）处、和眼睛一样高，沿那个方位看、向下 5°；150 ms 后关飞行模式（随时可能要走路）。
   2. 这期间每秒读 `attend.ocr_hz`（5）次名牌，两次读之间的每一帧（10 帧/秒）都在上次读到的文字框上重新量光环：光环的起亮时刻能精确到一帧，名字和方位也一起交给说话人追踪（[speaker.md](speaker.md) 2.4）。
   3. 0.4 s（`mirror_after_ms`）内那边没有名牌亮、而投票的前后镜像差不多强：转去看镜像那边（只转一次）。说话人追踪后来把这段话归给了某个已定位的玩家、方位又不同：转去看他。
   4. 一直看到这段话结束后 `hold_s`（1 s，光环的尾巴是 0.9 s）；中途同一方向（30° 以内）又有人开口就接着看；另一个方向有人开口就转过去（最多每 0.5 s 一次）。之后接着绕圈。
   5. 走路时：前进方向和那个方位差不到 `travel_off_deg`（60°）就不管，行进镜头不动；差得多才转过去（和重瞄一样，走路停顿约 200 ms），这期间行进镜头不重瞄；看完再回到行进镜头。
   - 拍照、扫一圈时也让开。`GET /v1/vr/usercam` 的 `orbit.attending`：段号、方位（世界、相对头）、`why`（`direction` / `candidate`）、还没看的镜像、看了多久、亮过没有、还要看多久。
-- **读名牌**：镜头绕圈、在行进位置或转向说话的人时，抓桌面窗口读名牌，交给说话人追踪（[speaker.md](speaker.md) 2.4）。定位（D38）：镜头的位置是 `Pose` 给的位置加上从那以后 bot（头）走过的位移（"玩家位置"跟随只平移不转）；不动的镜头等 `Pose` 稳了 `settle_ms` 并且画面不再变才读；读到名字时沿名牌射线在全景深度里找人，方位和距离（`GET /v1/vr/usercam/names` 的 `distance_m`、`feet`）按人相对头的位置算，深度里没有人才按射线上离头 2.5 m 的点算。
+- **读名牌**：镜头在身后、行进位置、快拍或转向说话的人时，抓桌面窗口读名牌，交给说话人追踪（[speaker.md](speaker.md) 2.4）。定位（D38）：镜头的位置是 `Pose` 给的位置加上从那以后 bot（头）走过的位移（"玩家位置"跟随只平移不转）；不动的镜头等 `Pose` 稳了 `settle_ms` 并且画面不再变才读；镜头没有深度，方位按名牌射线上离头 2.5 m 的点算（`GET /v1/vr/usercam/names` 的 `distance_m`、`feet` 为空）。跟随时镜头读到目标而眼睛没看到，就按这个方位、上次的距离定位，转身让眼睛接上（`seen_by: "lens"`）。
 - **CPU**：x11grab 抓 1280×720、15 帧/秒（D41 起，快拍每个视角少等一帧）、原始 RGB 走管道（约 41 MB/s），ffmpeg 不编码，估计占一个核的几个百分点；bridge 这边每帧只拷一次、OCR 在 infra 的 GPU 上。服务器上还没量（见"待测"）。
 
 设置存在 `usercam.json` 的 `orbit` 里，`POST /v1/vr/usercam {"orbit": {...}}` 改哪项给哪项（会检查范围），`{"orbit": false}` 关掉：
@@ -308,17 +253,17 @@ HOST=user@server D=0.65 OUT=/tmp/x sh tools/agent-vr/aim.sh U V click    # 悬�
 | `idle` | `front` | 站着时：`front` 静止朝前（用行进镜头的 `back_m`、`up_m`、`pitch_deg`、`reaim_deg`、`reaim_every_ms`），`orbit` 绕圈 |
 | `radius_m`、`period_s`、`height_m`、`bob_m`、`pitch_deg`、`rate_hz` | 0.7、3、0、0.04、8、30 | 绕圈（0.3–3 m、2–60 s、5–60 Hz） |
 | `resume_after_s` | 1.5 | 停稳多久后接着绕 |
-| `travel` | `{"on":true,"back_m":0.35,"up_m":0.35,"pitch_deg":12,"leg_deg":10,"reaim_deg":30,"reaim_every_ms":1000,"settle_ms":50}` | 行进镜头 |
+| `travel` | `{"on":true,"rear":true,"back_m":0.35,"up_m":0.35,"pitch_deg":12,"leg_deg":10,"reaim_deg":30,"reaim_every_ms":1000,"settle_ms":50}` | 行进镜头和站着时的镜头；`rear`：朝头的反方向看（D45 默认），false：朝前 |
 | `sightings`、`grab_fps`、`ocr_hz`、`ocr_hz_hot`、`fov_deg`、`lag_ms` | true、15、4、5、null、70 | 读名牌：抓帧率、OCR 频率（有人说话时）、竖直视场（null：读 `/usercamera/Zoom`，读不到用 60°）、画面比 `Pose` 晚多少 |
-| `idle_sweep_s` | 60 | 闲着时镜头每隔这么久快拍一圈读四周的名牌（0 关，10–3600；D39，`GET /v1/vr/people`） |
-| `snap` | `{"views":6,"min_ms":100,"diff":6,"sure_ms":350,"max_ms":700,"in_flight":3}` | 快拍一圈（D41）：视角数（3–12）、拍一张至少离 `Pose` 多久、和放 `Pose` 前那帧至少差多少、多久以后不比画面、一个视角最多等多久、最多几个 OCR 同时在读（1–4） |
+| `idle_sweep_s` | 60 | 闲着时每隔这么久巡视一次：头看前半圈、镜头快拍后半圈（0 关，10–3600；D45，`GET /v1/vr/patrol`） |
+| `snap` | `{"views":6,"min_ms":100,"diff":6,"sure_ms":350,"max_ms":700,"in_flight":3}` | 快拍（D41；找人和巡视时只拍半圈 3 个）：一整圈的视角数（3–12）、拍一张至少离 `Pose` 多久、和放 `Pose` 前那帧至少差多少、多久以后不比画面、一个视角最多等多久、最多几个 OCR 同时在读（1–4） |
 | `settle_ms`、`settle_diff` | 150、8 | 不动的镜头（不含绕圈）稳了才读：`Pose` 至少这么久没换（到抓帧时），且和上一帧的灰度缩略图平均差不超过这个值（0 不比，D38） |
-| `settle_sure_ms` | 600 | `Pose` 放了这么久以后不再比画面（早已生效）：跟着 bot 走的行进镜头、视频广告牌前也照常读（0–5000，D40） |
-| `follow_stale_s` | 20 | 跟随时镜头这么久没放过就重放一次（5–300，D40） |
+| `settle_sure_ms` | 600 | `Pose` 放了这么久以后不再比画面（早已生效）：跟着 bot 走的行进镜头、视频广告牌前也照常读（0–5000） |
+| `follow_stale_s` | 20 | 跟随时镜头这么久没放过就重放一次（5–300） |
 | `look` | `{"back_m":0.15,"up_m":0.25,"pitch_deg":2}` | 看一眼某个方向时镜头的位置：离开那个方向 `back_m`、比眼睛高 `up_m`、向下 `pitch_deg`（D38） |
 | `attend_onset`、`attend` | false、`{"out_m":0.3,"height_m":0,"pitch_deg":5,"hold_s":1,"mirror_after_ms":400,"reaim_deg":30,"reaim_every_ms":500,"travel_off_deg":60,"ocr_hz":5}` | 有人开口时镜头转过去 |
 
-`GET /v1/vr/usercam` 的 `orbit`：`active`（站着时的镜头在位：朝前或在绕）、`idle_lens`（`front` / `orbit`）、`idle`（不在位的原因：`moving`、`camera closed`、`busy`、`off`、`no head (the position beacon)`、`not in a world`、`attending`、`looking`）、`angle_deg`、`axes`、`flying_maybe_on`、`last_pose`（`lens`：orbit / travel / front / attend / look / snap / placed）、`counts`（绕圈的 Pose、朝前的 Pose、互锁、行进镜头、重瞄、转向说话的人、看一眼、转一圈、关飞行的次数）、`sweeping`（快拍一圈：`why`：`follow` / `idle`、`seek` 找谁、`from` 第一个视角的世界偏航、`out` 是否左右交替、`view` / `views` 拍到第几个、拍了多久）、`reading`（正在读的快拍张数）、`counts.snap_poses`、`sweep_end`（上一圈怎么结束：`done` / `found` / `stopped` 跟随放弃 / `move` / `voice` / `not begun`，多久以前）、`calm_ms`、`following`（有跟随在跑）、`aim`（跟随最后给的目标方向：`world_yaw`、`bearing_deg`、`age_ms`、`faced` 镜头是否朝它，D40）、`counts.target_poses`、`counts.stale_poses`、`attending`、`looking`（看一眼的方位、还要看多久）、`sightings`（抓帧、读了几次、两次读之间量的光环、没对上位姿的帧、错误、最近读到的名字）。`idle` 多了 `attending`。
+`GET /v1/vr/usercam` 的 `orbit`：`active`（站着时的镜头在位：朝前或在绕）、`idle_lens`（`front` / `orbit`）、`idle`（不在位的原因：`moving`、`camera closed`、`busy`、`off`、`no head (the position beacon)`、`not in a world`、`attending`、`looking`）、`angle_deg`、`axes`、`flying_maybe_on`、`last_pose`（`lens`：orbit / travel / front / attend / look / snap / placed）、`counts`（绕圈的 Pose、朝前的 Pose、互锁、行进镜头、重瞄、转向说话的人、看一眼、转一圈、关飞行的次数）、`sweeping`（快拍一圈：`why`：`follow` / `idle`、`seek` 找谁、`from` 第一个视角的世界偏航、`out` 是否左右交替、`view` / `views` 拍到第几个、拍了多久）、`reading`（正在读的快拍张数）、`counts.snap_poses`、`sweep_end`（上一圈怎么结束：`done` / `found` / `stopped` 跟随放弃 / `move` / `voice` / `not begun`，多久以前）、`calm_ms`、`following`（有跟随在跑）、`aim`（跟随最后给的目标方向：`world_yaw`、`bearing_deg`、`age_ms`、`faced` 镜头是否朝它；`travel.rear` 为 false 时才朝它）、`counts.target_poses`、`counts.stale_poses`、`attending`、`looking`（看一眼的方位、还要看多久）、`sightings`（抓帧、读了几次、两次读之间量的光环、没对上位姿的帧、错误、最近读到的名字）。`idle` 多了 `attending`。
 
 ### 手动（实测，2026-10-08，VRChat Home）
 
@@ -391,5 +336,6 @@ HOST=user@server D=0.65 OUT=/tmp/x sh tools/agent-vr/aim.sh U V click    # 悬�
 6. 服务器上 ffmpeg x11grab 连续抓 15 帧/秒的 CPU 占用（`top` 看 ffmpeg 和 vrc-bridge）。
 7. 转向说话的人：有人开口后镜头多快转过去（`orbit.attending`）、方位对不对、镜像那一步、光环的起亮时刻在 `GET /v1/speakers` 的候选里是不是 `glow_onset`；说完 1 s 后接着绕。3 s 一圈看起来是否连续（不连续就把 `rate_hz` 调到 60）。
 8. **身后的人**（D38，10 分钟以内）：好友站在 bot 正后方 1 m，再到右后方 1.5 m。`POST /v1/vr/usercam/look {"bearing_deg": 180}`（再试 150）：镜头在头后上方（`orbit.last_pose.pose`：比眼睛高约 0.25 m），名牌在直播画面中间；`GET /v1/vr/usercam/names?since_ms=5000` 里他的 `bearing_deg` 和实际差 10° 以内、`distance_m` 差 0.3 m 以内。bot 走动时（例如跟随）看 `orbit.sightings.unsettled` 在涨（刚转的帧被扔掉），`bearing_deg` 不再跳。
-9. **闲时一圈和身边的人**（D39，10 分钟以内）：bot 站着不动、不跟随，房间里有两位好友站在 bot 四周。等 60 s 多一点：`GET /v1/vr/usercam` 的 `orbit.sweeping.why` 为 `idle`（快拍一圈约 1 s，D41）、之后 `orbit.last_pose.lens` 回到 `front`；`GET /v1/vr/people` 的 `idle_sweep.sweeps` 加一、`last_names` 大于 0，`people` 里有两人，`distance_m`、`bearing_deg` 和实际对得上（0.3 m、10° 以内），`source` 为 `sweep`。之后好友走动：`source` 变成 `kept`、位置跟着变。一圈转的时候推一下摇杆或说句话：`orbit.sweep_end.how` 为 `move` / `voice`，镜头立刻停。说话时（`GET /v1/speakers` 有进行中的一段）到点：`idle_sweep.skipped` 是 "someone is speaking"，不转。
-10. **快拍一圈**（D41，10 分钟以内；部署后先 `POST /v1/vr/usercam {"orbit": {"grab_fps": 15}}`（`usercam.json` 里存的还是 10），再 `POST /v1/follow {"name": "xkeyC"}`）：好友在 bot 前面被跟着，然后快步躲到 bot 身后或侧面的柱子后面再露出来。约 1 s 后 `GET /v1/follow` 的 `state` 为 `searching`、`search_stage` 为 `lens_ring`；`GET /v1/vr/usercam` 的 `orbit.sweeping` 的 `from` 接近他最后的方向、`view` 很快往上涨（每个视角约 150 ms），`reading` 不超过 3；读到他的名字时 `orbit.sweep_end.how` 为 `found`、`last_pose.lens` 为 `look`（镜头切到他那边）、`state` 回到 `following`，从跟丢到找到 3 s 以内。他不在任何视角里时一圈约 1 s 拍完（`done`），然后 `body_turn`。闲时一圈（第 9 项）也是这样快拍。
+9. **镜头看身后**（D45，5 分钟以内）：bot 站着，`GET /v1/vr/usercam` 的 `orbit.last_pose.lens` 为 `front`、`pose.yaw` 和头的朝向差约 180°；好友站到 bot 身后 1–2 m：`GET /v1/vr/usercam/names` 里有他，`bearing_deg` 约 ±180°；让 bot 转 90°（`POST /v1/step {"turn": 90}`），镜头跟着重放、仍在头的反方向。
+10. **跟丢后头和镜头分头找**（D45，10 分钟以内；部署后先 `POST /v1/follow {"name": "xkeyC"}`）：好友在 bot 前面被跟着，然后快步绕到 bot 身后。约 1 s 后 `GET /v1/follow` 的 `state` 为 `searching`；头看前半圈 3 个方向的同时，`orbit.sweeping` 的 `views` 为 3、`from` 在头的反方向；镜头读到他：日志 "follow: searching, the lens read their name: turning there"，头转过去，`seen_by` 先是 `lens` 再是 `stereo`，`state` 回到 `following`。
+11. **闲时巡视**（D45，5 分钟以内）：bot 闲着、房间里有两位好友，一前一后。等 60 s 多一点：`GET /v1/vr/patrol` 的 `count` 加一，`eyes` 里有前面那位、`lens` 里有后面那位；`GET /v1/speakers` 两人都有方位。巡视中推一下摇杆或说句话：镜头那一半立刻停（`orbit.sweep_end.how` 为 `move` / `voice`）。

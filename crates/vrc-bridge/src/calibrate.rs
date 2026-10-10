@@ -106,8 +106,6 @@ static RUNNING: Mutex<()> = Mutex::new(());
 /// headset held throughout.
 pub fn now(bridge: &Arc<Bridge>, force: bool) -> Result<Value> {
     let Some(_one) = RUNNING.try_lk() else { bail!("a calibration is running") };
-    // The menu is found in the usual view: no panorama meanwhile.
-    let _normal = bridge.pano.normal_view(Duration::from_secs(2))?;
     crate::motion::stop_and_wait(bridge);
     if !bridge.anim.trackers.lk().on {
         let mut settings = bridge.anim.trackers.lk().clone();
