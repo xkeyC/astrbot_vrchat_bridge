@@ -246,6 +246,58 @@ def instance_kind(instance: str) -> str:
     return "public"
 
 
+def player_label(player: dict) -> str:
+    """A player as the voice model is told of them: friends and whitelisted
+    friends marked."""
+    if player.get("whitelist"):
+        return f"{player['name']} (your whitelisted friend #{player['whitelist']})"
+    if player.get("friend"):
+        return f"{player['name']} (your friend)"
+    return player.get("name", "")
+
+
+def room_place(state: dict) -> str:
+    """Where the avatar is and who else is there, as one clause:
+    ``the room Home (friends only); others here: Alice (your friend)``."""
+    if not state.get("running"):
+        return "no room (VRChat is not running)"
+    world = state.get("world") or ""
+    if not world:
+        return "no room yet (loading the next one)"
+    players = sorted(state.get("players", []),
+                     key=lambda p: (p.get("whitelist") or 1_000_000, p.get("name", "")))
+    here = ", ".join(player_label(p) for p in players) or "nobody"
+    return f"the room {world} ({instance_kind(state.get('instance') or '')}); others here: {here}"
+
+
+def room_events(old: dict, new: dict) -> list[str]:
+    """What happened between two game states, for the voice model: the bot
+    came into another room or left one, or (in the same room) players came
+    and went."""
+    def room(state: dict) -> tuple:
+        if not state.get("running") or not state.get("world"):
+            return ()
+        return (state.get("world"), state.get("instance"))
+
+    if room(old) != room(new):
+        if room(new):
+            return [f"You came into {room_place(new)}."]
+        if room(old):
+            return [f"You left the room {old.get('world')}; you are now in {room_place(new)}."]
+        return []
+    if not room(new):
+        return []
+    before = {p["id"] for p in old.get("players", [])}
+    after = {p["id"] for p in new.get("players", [])}
+    return [
+        f"{player_label(p)} joined the room."
+        for p in new.get("players", []) if p["id"] not in before
+    ] + [
+        f"{player_label(p)} left the room."
+        for p in old.get("players", []) if p["id"] not in after
+    ]
+
+
 def room_context(state: dict) -> str:
     """The room as the voice model is told of it: where the avatar is, who
     else is there (friends and whitelisted friends marked, by priority) and
@@ -255,17 +307,9 @@ def room_context(state: dict) -> str:
     world = state.get("world") or ""
     if not world:
         return "(Room now: you are between rooms, loading the next one.)"
-    people = []
     players = sorted(state.get("players", []),
                      key=lambda p: (p.get("whitelist") or 1_000_000, p.get("name", "")))
-    for player in players:
-        if player.get("whitelist"):
-            people.append(f"{player['name']} (your whitelisted friend #{player['whitelist']})")
-        elif player.get("friend"):
-            people.append(f"{player['name']} (your friend)")
-        else:
-            people.append(player.get("name", ""))
-    here = ", ".join(people) if people else "nobody"
+    here = ", ".join(player_label(p) for p in players) or "nobody"
     text = f"Room now: {world} ({instance_kind(state.get('instance') or '')}). Others here: {here}."
     follow = state.get("follow") or {}
     if follow.get("target") and follow.get("state", "idle") != "idle":
@@ -728,6 +772,10 @@ class VRChatPlatformAdapter(Platform):
         if kind == "speaker":
             self._on_speaker(data)
         elif kind == "state":
+            old_state = self.state
+            # A session started by this state (warm-up) is told of the room
+            # when it joins; one already on is told what changed.
+            told = self.session
             old = {p["id"] for p in self.state.get("players", [])}
             had_world = bool(self.state.get("running") and self.state.get("world"))
             was_running = bool(self.state.get("running"))
@@ -744,6 +792,11 @@ class VRChatPlatformAdapter(Platform):
             if joined:
                 logger.info("VRChat: %s joined %s", ", ".join(joined), self.state.get("world"))
             self._refresh_context()
+            if told is not None and told is self.session and hasattr(told, "event"):
+                for text in room_events(old_state, self.state):
+                    task = asyncio.get_running_loop().create_task(told.event(text))
+                    self._tasks.add(task)
+                    task.add_done_callback(self._tasks.discard)
             if set(new) != old or bool(self.state.get("running") and self.state.get("world")) != had_world:
                 self._people_changed()
         elif kind in ("alert", "auth_required", "join_failed"):
@@ -1172,6 +1225,9 @@ class VRChatPlatformAdapter(Platform):
         if "on_wake" in inspect.signature(VoiceSession).parameters:
             # Called by name: turn to whoever spoke.
             extra["on_wake"] = self._attend
+        if "joined" in inspect.signature(VoiceSession).parameters:
+            # The bot's joining, its first event: where it is and who is there.
+            extra["joined"] = f"You joined the voice conversation in VRChat: {room_place(self.state)}."
         session = new_voice_session(
             key=ROOM_SESSION,
             scope_id=f"{self.meta().id}:voice:{ROOM_SESSION}",
